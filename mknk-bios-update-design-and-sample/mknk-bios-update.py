@@ -3,7 +3,7 @@
 
   python3 mknk-bios-update.py          機種とLVFS安定版の候補を確認
   python3 mknk-bios-update.py --apply  更新を確認し、対話承認後に予約
-  python3 mknk-bios-update.py --status 現在の実機版とfwupdの履歴を表示
+  python3 mknk-bios-update.py --status 現在の実機版、EFIの予約、fwupdの履歴を表示
 
 対象はUbuntu 24.04 / Linux Mint 22系のUEFI機。fwupd 2.0.20のCLIを基準にする。
 通常ユーザーで端末から実行する。保護されたUEFI属性・起動区画の読み取りには必要時のみsudoを使う。
@@ -21,6 +21,8 @@ import json
 import os
 import re
 import shutil
+import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -28,15 +30,17 @@ import unicodedata
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from urllib.error import URLError
-from urllib.parse import urljoin, urlsplit
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+from urllib.parse import unquote, urljoin, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 FWUPDMGR = "/usr/bin/fwupdmgr"
 ESRT = Path("/sys/firmware/efi/esrt/entries")
 EFIVARS = Path("/sys/firmware/efi/efivars")
 DMI = Path("/sys/class/dmi/id")
+SUPPORT_PROFILE = Path("/etc/mknk-bios-update.json")
+MODEL_FIELDS = ("sys_vendor", "product_name", "product_sku", "board_name", "board_version")
 POWER = Path("/sys/class/power_supply")
 BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
 LOCK_DIR = Path("/dev/shm")
@@ -46,8 +50,13 @@ LSBLK = "/usr/bin/lsblk"
 EFI_GLOBAL = "8be4df61-93ca-11d2-aa0d-00e098032b8c"
 FWUPDATE_GUID = "0abba7dc-e516-4167-bbf5-4d9d1c739416"
 ESP_TYPE = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+FMP_CAPSULE = uuid.UUID("6dcbd5ed-e82d-4c44-bda1-7194199ad92a").bytes_le
 PROTOCOL = "org.uefi.capsule"
 REMOTE = "lvfs"
+LVFS_METADATA_URIS = frozenset({"https://cdn.fwupd.org/downloads/firmware.xml.xz",
+                               "https://cdn.fwupd.org/downloads/firmware.xml.zst"})
+LVFS_CAB_BASE_URIS = ("https://cdn.fwupd.org/downloads/", "https://fwupd.org/downloads/")
+REMOTE_URI_FIELDS = ("MetadataUri", "MetadataUriSig", "FirmwareBaseUri")
 STATES = {1: "予約中", 2: "成功", 3: "失敗", 4: "起動操作待ち", 5: "一時的な失敗"}
 
 
@@ -145,11 +154,81 @@ def inventory():
     return guid, device, devices
 
 
-def stable_remote():
+def read_settings():
+    try:
+        fd = os.open(SUPPORT_PROFILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                raise Hold("対応情報はroot所有で、一般ユーザーが書き込めない通常ファイルにしてください。")
+            raw = stream.read(64 * 1024 + 1)
+            if len(raw) > 64 * 1024:
+                raise Hold("対応情報のファイルが大きすぎます。")
+            profile = json.loads(raw)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise Hold(f"検証済みの機種別対応情報を {SUPPORT_PROFILE} から読めません。") from exc
+    if not isinstance(profile, dict):
+        raise Hold(f"{SUPPORT_PROFILE} はJSONオブジェクトで指定してください。")
+    return profile
+
+
+def support_profile(settings, guid, device):
+    if "dmi" not in settings:
+        raise Hold(f"更新を予約するには {SUPPORT_PROFILE} に検証済みの機種別対応情報が必要です。")
+    model = {}
+    for field in MODEL_FIELDS:
+        try:
+            model[field] = (DMI / field).read_text().strip()
+        except FileNotFoundError:
+            model[field] = ""
+    if not model["sys_vendor"] or not model["product_name"]:
+        raise Hold("カプセルの検証に必要な機種情報を確認できません。")
+    versions = settings.get("bios_versions")
+    if (settings.get("dmi") != model or settings.get("esrt_guid") != guid
+            or not isinstance(versions, list) or device["Version"] not in versions):
+        raise Hold("実機の機種、ESRT GUID、現在のBIOS版が検証済みの対応情報と一致しません。")
+    return settings
+
+
+def https_origin_path(url):
+    if not isinstance(url, str) or not url.isascii() or re.search(r"[\x00-\x20\x7f\\?#]", url):
+        raise Hold("配布先には認証情報やクエリを含まないHTTPSのURIが必要です。")
+    try:
+        parsed = urlsplit(url)
+        port = 443 if parsed.port is None else parsed.port
+        path = unquote(parsed.path, errors="strict")
+    except ValueError as exc:
+        raise Hold("配布先のURIを解釈できません。") from exc
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username is not None or port == 0
+            or not path.startswith("/") or "//" in path or {".", ".."}.intersection(path.split("/"))
+            or re.search(r"%(?![0-9a-f]{2})|%2f", parsed.path, re.IGNORECASE)
+            or re.search(r"[\x00-\x1f\x7f%\\?#;]", path)):
+        raise Hold("配布先のHTTPSホスト・ポート・パスを確定できません。")
+    return parsed.hostname, port, path
+
+
+def stable_remote(settings):
     remotes = [r for r in rows(["get-remotes"], "Remotes") if r.get("Id") == REMOTE]
     if len(remotes) != 1 or remotes[0].get("Enabled") is not True or remotes[0].get("Kind") != "download":
         raise Hold("LVFSの安定版配布元 lvfs が有効なダウンロード元になっていません。fwupdmgr get-remotes で確認してください。")
-    return remotes[0]
+    remote = remotes[0]
+    mirrors = settings.get("stable_metadata_uris", [])
+    if not isinstance(mirrors, list) or not all(isinstance(uri, str) for uri in mirrors):
+        raise Hold("安定版ミラーのメタデータURIを確認できません。")
+    uri = remote.get("MetadataUri")
+    host, _, _ = https_origin_path(uri)
+    if uri not in LVFS_METADATA_URIS and (uri not in mirrors or host in ("cdn.fwupd.org", "fwupd.org")):
+        raise Hold("lvfs のメタデータURIが公開安定版または検証済み安定版ミラーと一致しません。")
+    if remote.get("Username") or remote.get("Password"):
+        raise Hold("このサンプルでは認証情報を含まないHTTPSの安定版配布元を指定してください。")
+    return remote
+
+
+def compare_remote(previous, current):
+    if any(previous.get(key) != current.get(key) for key in REMOTE_URI_FIELDS):
+        raise Hold("照会後にLVFSの取得先が変化しました。配布元を再確認してください。")
 
 
 def strong_hash(release):
@@ -163,15 +242,40 @@ def strong_hash(release):
     raise Hold("候補のCAB全体のSHA-256またはSHA-512を確認できません。")
 
 
+def fwupd_query(operation, argument):
+    try:
+        import gi
+        gi.require_version("Fwupd", "2.0")
+        from gi.repository import Fwupd, GLib
+    except (ImportError, ValueError) as exc:
+        raise Hold("更新候補の照会には python3-gi と gir1.2-fwupd-2.0 が必要です。") from exc
+
+    # 適用時に対話モードの fwupdmgr local-install が処理する操作を、照会接続にも伝える。
+    feature = Fwupd.FeatureFlags
+    flags = (feature.REQUESTS | feature.REQUESTS_NON_GENERIC | feature.DETACH_ACTION
+             | feature.UPDATE_ACTION | feature.ALLOW_AUTHENTICATION | feature.FDE_WARNING
+             | feature.SHOW_PROBLEMS)
+    client = Fwupd.Client.new()
+    try:
+        if not client.set_feature_flags(flags, None):
+            raise Hold("fwupdに対話操作の機能を登録できません。")
+    except GLib.Error as exc:
+        raise Hold("fwupdに対話操作の機能を登録できません。 " + visible(exc.message)) from exc
+    try:
+        items = getattr(client, operation)(argument, None)
+        result = [json.loads(item.to_json_string(Fwupd.CodecFlags.NONE)) for item in items]
+    except GLib.Error as exc:
+        if (operation == "get_upgrades" and exc.domain == "FwupdError"
+                and exc.code == Fwupd.Error.NOTHING_TO_DO):
+            return []
+        raise Hold("fwupdの照会が成立しません。 " + visible(exc.message)) from exc
+    if not all(isinstance(item, dict) for item in result):
+        raise Error("fwupdの照会結果を解釈できません。")
+    return result
+
+
 def candidate(device):
-    results = rows(["get-updates", device["DeviceId"]], allow_empty=True)
-    if not results:
-        return None
-    if len(results) != 1 or results[0].get("DeviceId") != device["DeviceId"]:
-        raise Hold("更新候補のDevice IDが指定したBIOSと一致しません。")
-    releases = results[0].get("Releases", [])
-    if not isinstance(releases, list) or not all(isinstance(r, dict) for r in releases):
-        raise Error("更新候補の一覧を解釈できません。")
+    releases = fwupd_query("get_upgrades", device["DeviceId"])
     branch = device.get("Branch") or "default"
     eligible = [r for r in releases if r.get("RemoteId") == REMOTE
                 and (r.get("Branch") or "default") == branch
@@ -238,42 +342,100 @@ def power_field(item, name):
         return ""
 
 
-def check_esp():
+def mount_points():
     mounts = {}
     for line in MOUNTINFO.read_text().splitlines():
         before, after = line.split(" - ", 1)
         fields = before.split()
         mounts[fields[4]] = (fields[2], fields[3], after.split()[0])
+    return mounts
+
+
+def require_efivarfs(mounts):
     if mounts.get(str(EFIVARS), (None,) * 3)[1:] != ("/", "efivarfs"):
         raise Hold("EFI変数領域（efivarfs）のマウントを確認できません。")
-    p = subprocess.run([LSBLK, "--json", "--list", "--output", "MAJ:MIN,PARTTYPE"],
+
+
+def find_esp(mounts):
+    p = subprocess.run([LSBLK, "--json", "--list", "--output", "MAJ:MIN,PARTTYPE,PARTUUID"],
                        capture_output=True, text=True, check=True)
-    parts = {row["maj:min"] for row in json.loads(p.stdout)["blockdevices"]
+    devices = json.loads(p.stdout)["blockdevices"]
+    parts = {row["maj:min"]: row.get("partuuid") for row in devices
              if str(row.get("parttype", "")).lower() == ESP_TYPE}
     if len(parts) != 1:
         raise Hold(f"GPTのEFIシステム区画を{len(parts)}件検出しました。更新先を一つに確定できません。")
-    number = parts.pop()
+    number, partition_id = parts.popitem()
+    try:
+        esp_guid = str(uuid.UUID(partition_id or ""))
+    except ValueError as exc:
+        raise Hold("EFIシステム区画の区画GUIDを確認できません。") from exc
+    matching = {row["maj:min"] for row in devices if str(row.get("partuuid", "")).lower() == esp_guid}
+    if matching != {number}:
+        raise Hold("EFIシステム区画の区画GUIDが接続中の複数の区画と一致します。")
     for mount in ESP_MOUNTS:
-        if mounts.get(str(mount)) != (number, "/", "vfat"):
-            continue
-        update_dir = mount / "EFI/UpdateCapsule"
-        try:
-            occupied = next(update_dir.iterdir(), None) is not None
-        except FileNotFoundError:
-            occupied = False
-        except PermissionError:
-            # 既知のマウント位置だけを読み取り、未作成と読取不能を区別する。
-            args = ["/usr/bin/find", "-P", str(mount), "-xdev", "-maxdepth", "3",
-                    "-ipath", str(update_dir / "*"), "-printf", "x", "-quit"]
-            occupied = bool(readonly_sudo(args, "EFI起動区画の既存更新ファイル確認"))
-        if occupied:
-            raise Hold("EFI/UpdateCapsule に既存の更新ファイルがあります。配送指示が空でも、新規予約は保留します。")
-        return
+        if mounts.get(str(mount)) == (number, "/", "vfat"):
+            return mount, esp_guid
     raise Hold("唯一のEFIシステム区画を /boot/efi、/efi、/boot のいずれにも確認できません。")
 
 
-def check_nvram_queue():
+def disk_capsules(mount):
+    update_dir = mount / "EFI/UpdateCapsule"
+    try:
+        return next(update_dir.iterdir(), None) is not None
+    except FileNotFoundError:
+        return False
+    except PermissionError:
+        # 既知のマウント位置だけを読み取り、未作成と読取不能を区別する。
+        args = ["/usr/bin/find", "-P", str(mount), "-xdev", "-maxdepth", "3",
+                "-ipath", str(update_dir / "*"), "-printf", "x", "-quit"]
+        return bool(readonly_sudo(args, "EFI起動区画の既存更新ファイル確認"))
+
+
+def read_efi_variable(path):
+    try:
+        return path.read_bytes()
+    except PermissionError:
+        return readonly_sudo(["/usr/bin/cat", "--", str(path)], "EFI変数の読み取り")
+
+
+def boot_load_option(data):
+    # efivarfs属性4バイト、EFI_LOAD_OPTIONの属性4バイト、デバイスパス長2バイト。
+    for end in range(10, len(data) - 1, 2):
+        if data[end:end + 2] != b"\0\0":
+            continue
+        start = end + 2
+        length = int.from_bytes(data[8:10], "little")
+        if start + length <= len(data):
+            try:
+                return data[10:end].decode("utf-16-le"), data[start:start + length]
+            except UnicodeDecodeError:
+                break
+        break
+    raise Hold("既存のEFI起動登録の内容を解釈できません。")
+
+
+def check_boot_entries(esp_guid, profile):
+    allowed = profile.get("boot_entry_sha256", [])
+    if not isinstance(allowed, list):
+        raise Hold("検証済みのEFI起動登録の一覧を読み取れません。")
+    pattern = re.compile(r"Boot[0-9a-f]{4}-" + EFI_GLOBAL, re.IGNORECASE)
+    for variable in EFIVARS.iterdir():
+        if not pattern.fullmatch(variable.name):
+            continue
+        data = read_efi_variable(variable)
+        description, path = boot_load_option(data)
+        if description not in ("Linux Firmware Updater", "Linux-Firmware-Updater"):
+            continue
+        # GPTの短縮HD()パスで、現物のESPと一致し、ローダーと引数を含む全バイトを照合できる場合だけ再利用する。
+        if (path[:4] != b"\x04\x01\x2a\x00" or path[40:42] != b"\x02\x02"
+                or str(uuid.UUID(bytes_le=path[24:40])) != esp_guid
+                or hashlib.sha256(data).hexdigest() not in allowed):
+            raise Hold(f"{variable.name[:8]} の更新用起動登録をこのOSのものと確認できません。")
+
+
+def nvram_reservations():
     # fwupd-efi v1.4のFWUP_UPDATE_INFO v7、先頭4バイトはefivarfsの属性。
+    pending = []
     for var in EFIVARS.iterdir():
         if not var.name.lower().endswith("-" + FWUPDATE_GUID):
             continue
@@ -282,17 +444,38 @@ def check_nvram_queue():
             continue
         if not name.startswith("fwupd-"):
             raise Hold("fwupd用EFI名前空間に用途を確認できない既存登録があります。")
-        try:
-            with var.open("rb") as f:
-                header = f.read(56)
-        except PermissionError:
-            header = readonly_sudo(["/usr/bin/cat", "--", str(var)], "fwupdのEFI予約の読み取り")[:56]
-        if (len(header) != 56 or int.from_bytes(header[4:8], "little") != 7
-                or int.from_bytes(header[52:56], "little") != 2):
-            raise Hold("fwupd-efiに実行待ち、または状態を確定できない更新登録があります。")
+        header = read_efi_variable(var)[:56]
+        if len(header) != 56 or int.from_bytes(header[4:8], "little") != 7:
+            raise Hold("fwupd-efiの更新登録を解釈できません。")
+        status = int.from_bytes(header[52:56], "little")
+        if status & 1:  # fwupd-efiが処理するATTEMPT_UPDATE
+            pending.append(str(uuid.UUID(bytes_le=header[8:24])))
+        elif status != 2:  # 既知のATTEMPTED
+            raise Hold("fwupd-efiに状態を確定できない更新登録があります。")
+    return pending
 
 
-def check_ready(device, devices, history):
+def boot_next():
+    try:
+        data = read_efi_variable(EFIVARS / f"BootNext-{EFI_GLOBAL}")
+    except FileNotFoundError:
+        return None
+    if len(data) != 6:
+        raise Hold("次回起動先（BootNext）を解釈できません。")
+    return int.from_bytes(data[4:], "little")
+
+
+def disk_delivery_requested():
+    try:
+        data = read_efi_variable(EFIVARS / f"OsIndications-{EFI_GLOBAL}")
+    except FileNotFoundError:
+        return False
+    if len(data) != 12:
+        raise Hold("ディスク経由カプセルの配送指示（OsIndications）を解釈できません。")
+    return bool(int.from_bytes(data[4:], "little") & 4)
+
+
+def check_ready(device, devices, history, settings):
     flags = set(strings(device, "Flags"))
     problems = strings(device, "Problems")
     if problems or "updatable" not in flags or "emulated" in flags:
@@ -305,48 +488,76 @@ def check_ready(device, devices, history):
         if dev.get("DeviceId") in attached and (dev.get("UpdateState") in (1, 4)
                 or {"update-pending", "update-in-progress"}.intersection(strings(dev, "Problems"))):
             raise Hold("fwupdに進行中または起動待ちの更新があります。 " + visible(dev.get("Name", "")))
-    check_esp()
-    check_nvram_queue()
-    try:
-        (EFIVARS / f"BootNext-{EFI_GLOBAL}").stat()
-    except FileNotFoundError:
-        pass
-    else:
+    mounts = mount_points()
+    require_efivarfs(mounts)
+    esp, esp_guid = find_esp(mounts)
+    if disk_capsules(esp):
+        raise Hold("EFI/UpdateCapsule に既存の更新ファイルがあります。配送指示が空でも、新規予約は保留します。")
+    if nvram_reservations():
+        raise Hold("fwupd-efiに実行待ちの更新登録があります。")
+    if boot_next() is not None:
         raise Hold("別の次回起動先（BootNext）が設定されています。その用途を確認してください。")
-    try:
-        indications = (EFIVARS / f"OsIndications-{EFI_GLOBAL}").read_bytes()
-    except FileNotFoundError:
-        pass
-    else:
-        if len(indications) != 12 or int.from_bytes(indications[4:], "little") & 4:
-            raise Hold("既存のディスク経由カプセル配送指示、または判定不能なEFI変数があります。")
+    check_boot_entries(esp_guid, settings)
+    if disk_delivery_requested():
+        raise Hold("既存のディスク経由カプセル配送指示があります。")
     check_power()
 
 
-def fetch_cab(release, remote, dest):
+def cab_bases(settings):
+    configured = settings.get("cab_base_uris", [])
+    if not isinstance(configured, list):
+        raise Hold("CABの許可済み配布先は cab_base_uris の配列で指定してください。")
+    bases = [https_origin_path(url) for url in (*LVFS_CAB_BASE_URIS, *configured)]
+    if not all(path.endswith("/") for _, _, path in bases):
+        raise Hold("CABの許可済み配布先は / で終わるディレクトリURIで指定してください。")
+    return bases
+
+
+def require_cab_url(url, bases):
+    host, port, path = https_origin_path(url)
+    if not any(host == h and port == p and path.startswith(prefix) for h, p, prefix in bases):
+        raise Hold("CABの取得先が許可されたHTTPSのホスト・ポート・パスの範囲外です。")
+
+
+class CabRedirectHandler(HTTPRedirectHandler):
+    def __init__(self, bases):
+        self.bases = bases
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        require_cab_url(newurl, self.bases)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def fetch_cab(release, remote, dest, settings):
     algo, expected = strong_hash(release)
+    bases = cab_bases(settings)
+    opener = build_opener(CabRedirectHandler(bases))
     errors = []
     for location in strings(release, "Locations"):
-        scheme = urlsplit(location).scheme
-        if scheme and scheme != "https":
-            continue
-        base = remote.get("FirmwareBaseUri")
-        if scheme == "https":
-            url = location
-        elif base:
-            url = urljoin(base.rstrip("/") + "/", location.rsplit("/", 1)[-1])
-        else:
-            url = urljoin(remote.get("MetadataUri", ""), location)
-        if urlsplit(url).scheme != "https" or not urlsplit(url).hostname:
+        try:
+            parsed = urlsplit(location)
+            base = remote.get("FirmwareBaseUri")
+            if parsed.scheme or parsed.netloc:
+                url = location
+            elif base:
+                url = urljoin(base.rstrip("/") + "/", location.rsplit("/", 1)[-1])
+            else:
+                url = urljoin(remote["MetadataUri"], location)
+            require_cab_url(url, bases)
+        except (Hold, ValueError):
             continue
         try:
             req = Request(url, headers={"User-Agent": "mknk-bios-update/1.0"})
-            with urlopen(req, timeout=60) as src, dest.open("wb") as dst:
-                if urlsplit(src.geturl()).scheme != "https":
-                    raise Error("CABの取得先がHTTPS以外に変わりました。")
+            with opener.open(req, timeout=60) as src, dest.open("wb") as dst:
                 shutil.copyfileobj(src, dst, length=1024 * 1024)
-        except (URLError, TimeoutError, ConnectionError, HTTPException) as exc:
-            errors.append(visible(exc))
+        except Hold as exc:
+            errors.append(str(exc))
+            continue
+        except HTTPError as exc:
+            errors.append(f"HTTP {exc.code}")
+            continue
+        except (URLError, TimeoutError, ConnectionError, HTTPException, ValueError) as exc:
+            errors.append(type(exc).__name__)
             continue
         with dest.open("rb") as stream:
             digest = hashlib.new(algo)
@@ -356,11 +567,11 @@ def fetch_cab(release, remote, dest):
             raise Hold("ダウンロードしたCABのハッシュがLVFSの配布情報と一致しません。")
         dest.chmod(0o400)
         return
-    raise Error("CABをHTTPSで取得できません。 " + (errors[-1] if errors else "配布先を確認してください。"))
+    raise Error("CABを取得できません。 " + (errors[-1] if errors else "許可範囲内のHTTPS配布先がありません。"))
 
 
-def cab_manifest_version(path, app_id):
-    """署名・ハッシュ照合後のCABを読み取り、単一リリースの版の原文を取得する。"""
+def read_cab_files(path, payload_name=None):
+    """照合済みCABからメタデータ、または指定されたペイロードだけを読み取る。"""
     # libarchive.so.13はUbuntu 24.04のfwupdパッケージの依存ライブラリ。
     lib = ctypes.CDLL("libarchive.so.13")
     ptr = ctypes.c_void_p
@@ -378,7 +589,9 @@ def cab_manifest_version(path, app_id):
     archive = lib.archive_read_new()
     if not archive:
         raise Error("CAB解析用のメモリを確保できません。")
-    versions = []
+    files = {}
+    seen = set()
+    remaining = 2 * 1024 * 1024 if payload_name is None else 128 * 1024 * 1024
     try:
         if (lib.archive_read_support_format_cab(archive) != 0
                 or lib.archive_read_open_filename(archive, os.fsencode(path), 65536) != 0):
@@ -391,31 +604,114 @@ def cab_manifest_version(path, app_id):
                 break
             if code != 0:
                 raise Hold("CAB内のメタデータを列挙できません。")
-            name = lib.archive_entry_pathname(entry) or b""
-            if not name.lower().endswith(b".metainfo.xml"):
+            name = os.fsdecode(lib.archive_entry_pathname(entry) or b"")
+            name = name.replace("\\", "/").rsplit("/", 1)[-1]
+            if not name or name in seen:
+                raise Hold("CAB内のファイル名を一意に解決できません。")
+            seen.add(name)
+            selected = name.endswith(".metainfo.xml") if payload_name is None else name == payload_name
+            if not selected:
                 continue
             data = bytearray()
             while True:
                 size = lib.archive_read_data(archive, buf, len(buf))
                 if size == 0:
                     break
-                if size < 0 or len(data) + size > 2 * 1024 * 1024:
-                    raise Hold("CABメタデータを上限内で読み取れません。")
+                if size < 0 or size > remaining:
+                    raise Hold("CAB内の対象ファイルを上限内で読み取れません。")
+                remaining -= size
                 data.extend(buf.raw[:size])
-            try:
-                xml = ET.fromstring(data)
-            except ET.ParseError as exc:
-                raise Hold("CABのAppStreamメタデータを解釈できません。") from exc
-            for node in xml.iter():
-                node.tag = node.tag.rsplit("}", 1)[-1]
-            for component in xml.iter("component"):
-                if component.findtext("id") == app_id:
-                    versions.extend(r.get("version") for r in component.findall("releases/release"))
+            files[name] = data
     finally:
         lib.archive_read_free(archive)
-    if len(versions) != 1 or not versions[0]:
-        raise Hold("CAB内の署名対象と単一の目標版を対応付けられません。")
-    return versions[0]
+    return files
+
+
+def firmware_payload_name(release):
+    # fwupd 2.0.20のFuCabinetはsource artifact、content checksum、既定名の順に解決する。
+    source = release.find("artifacts/artifact[@type='source']")
+    if source is not None:
+        filename = source.findtext("filename")
+    else:
+        checksum = release.find("checksum[@target='content']")
+        filename = checksum.get("filename") if checksum is not None else None
+    if filename is None:
+        return "firmware.bin"
+    if not filename or filename != filename.strip() or "\\" in filename:
+        raise Hold("CABのペイロードのファイル名を確定できません。")
+    basename = filename.rsplit("/", 1)[-1]
+    if basename in ("", ".", ".."):
+        raise Hold("CABのペイロードのファイル名を確定できません。")
+    return basename
+
+
+def cab_manifest(path, app_id):
+    components = []
+    for data in read_cab_files(path).values():
+        try:
+            xml = ET.fromstring(data)
+        except ET.ParseError as exc:
+            raise Hold("CABのAppStreamメタデータを解釈できません。") from exc
+        components.extend(node for node in xml.iter("component") if node.findtext("id") == app_id)
+    if len(components) != 1:
+        raise Hold("CAB内の署名対象と更新コンポーネントを一意に対応付けられません。")
+    releases = components[0].findall("releases/release")
+    names = {firmware_payload_name(release) for release in releases}
+    if len(names) != 1:
+        raise Hold("CAB内のリリースに対応するペイロードを1件に絞れません。")
+    raw_version = releases[0].get("version") if len(releases) == 1 else None
+    return names.pop(), raw_version
+
+
+def capsule_header_size(payload, offset):
+    if len(payload) - offset < 28:
+        raise Hold("UEFIカプセルのヘッダーが途切れています。")
+    header_size, _, total_size = struct.unpack_from("<III", payload, offset + 16)
+    if not 28 <= header_size <= total_size or total_size != len(payload) - offset:
+        raise Hold("UEFIカプセルのヘッダーと実体のサイズが一致しません。")
+    return header_size
+
+
+def fmp_target(payload, guid):
+    """標準FMPと、ESRT GUIDの外装が1つ付いた標準FMPを検査する。"""
+    offset = 0
+    esrt_guid = uuid.UUID(guid).bytes_le
+    if payload.startswith(esrt_guid):
+        offset = capsule_header_size(payload, 0)
+        if payload.startswith(esrt_guid, offset):
+            raise Hold("複数の外装が付いたUEFIカプセルは適用先を確定できません。")
+    if not payload.startswith(FMP_CAPSULE, offset):
+        return None
+    body = offset + capsule_header_size(payload, offset)
+    if len(payload) - body < 16:
+        raise Hold("FMPカプセルの項目表を読み取れません。")
+    version, drivers, images, image_offset = struct.unpack_from("<IHHQ", payload, body)
+    if version != 1 or drivers != 0 or images != 1:
+        raise Hold("FMPカプセルは対応形式で、ドライバーなし・更新画像1件に限ります。")
+    image = body + image_offset
+    if image_offset < 16 or len(payload) - image < 32:
+        raise Hold("FMP画像の範囲を確定できません。")
+    version, image_type, index, size, vendor_size = struct.unpack_from("<I16sB3xII", payload, image)
+    header_size = {1: 32, 2: 40, 3: 48}.get(version)
+    if header_size is None or index == 0 or size == 0 or header_size + size + vendor_size != len(payload) - image:
+        raise Hold("FMP画像の形式、画像インデックス、サイズのいずれかを確定できません。")
+    instance = struct.unpack_from("<Q", payload, image + 32)[0] if version >= 2 else 0
+    return {"image_type_id": str(uuid.UUID(bytes_le=image_type)), "image_index": index,
+            "hardware_instance": instance}
+
+
+def check_capsule_scope(payload, guid, profile):
+    target = fmp_target(payload, guid)
+    if target is not None:
+        verified = profile.get("fmp")
+        if (verified != target or type(verified.get("image_index")) is not int
+                or type(verified.get("hardware_instance")) is not int):
+            raise Hold("FMP画像の種類・インデックス・インスタンスが検証済みのBIOS宛先と一致しません。")
+        return "FMP画像1件"
+    hashes = profile.get("vendor_payload_sha256", [])
+    if isinstance(hashes, list) and hashlib.sha256(payload).hexdigest() in hashes:
+        return "検証済みのメーカー形式（システムBIOS資源1件）"
+    raise Hold("メーカー形式のカプセルと単一の書き込み先の対応を確認できません。")
 
 
 def esrt_version(raw, fmt):
@@ -440,8 +736,8 @@ def esrt_version(raw, fmt):
     return ".".join(map(str, parts[fmt]))
 
 
-def verify_cab(path, release, guid, device, devices):
-    parts = rows(["get-details", str(path)])
+def verify_cab(path, release, guid, device, devices, profile):
+    parts = fwupd_query("get_details", str(path))
     if len(parts) != 1:
         raise Hold(f"CABに{len(parts)}件の更新コンポーネントがあります。BIOS単体として予約できません。")
     part = parts[0]
@@ -464,12 +760,18 @@ def verify_cab(path, release, guid, device, devices):
         raise Hold("CAB内のコンポーネント・版が候補と一致しません。")
     if "trusted-payload" not in strings(content[0], "Flags"):
         raise Hold("fwupdでCAB内の更新データの署名を確認できません。")
+    payload_name, raw_version = cab_manifest(path, release["AppstreamId"])
     version = content[0].get("Version")
     if not version:
-        raw = cab_manifest_version(path, release["AppstreamId"])
-        version = esrt_version(raw, device.get("VersionFormat"))
+        if not raw_version:
+            raise Hold("CAB内の署名対象と単一の目標版を対応付けられません。")
+        version = esrt_version(raw_version, device.get("VersionFormat"))
     if version != release["Version"]:
         raise Hold("CAB内の目標版がLVFSの更新候補と一致しません。")
+    payload = read_cab_files(path, payload_name).get(payload_name)
+    if not payload or len(payload) < 16:
+        raise Hold("CAB内のペイロードを読み取れません。")
+    return check_capsule_scope(payload, guid, profile)
 
 
 def marker_path():
@@ -478,7 +780,7 @@ def marker_path():
 
 def check_marker(path):
     if path.exists():
-        raise Hold("このLinux起動中に既に予約を依頼しています。--status で実機版と履歴を確認してください。")
+        raise Hold("このLinux起動中に既に予約を依頼しています。--status で実機版とEFIの予約を確認してください。")
 
 
 def send_once(path, device, release, cab):
@@ -502,7 +804,8 @@ def send_once(path, device, release, cab):
         raise
     if code:
         raise Error(f"fwupdの終了コードは{code}です。依頼後の状態は未確定です。"
-                    " --status で確認してください。同じ起動での再送は保留します。")
+                    " 予約が残っていると次回起動で適用され得ます。--status でEFIの予約を確認してください。"
+                    " 同じ起動での再送は保留します。")
 
 
 def describe(device):
@@ -517,6 +820,45 @@ def describe(device):
     print("機種     ", " / ".join(fields) or visible(device.get("Name", "不明")))
     print("現在のBIOS", visible(device["Version"]))
     print("Device ID ", device["DeviceId"])
+
+
+def show_reservations(guid):
+    try:
+        mounts = mount_points()
+        require_efivarfs(mounts)
+    except (Hold, OSError, ValueError) as exc:
+        print("EFI予約　 確認不能", visible(exc))
+        return
+    try:
+        pending = nvram_reservations()
+        if pending:
+            print(f"fwupd-efi  実行待ち{len(pending)}件（BIOS対象{pending.count(guid)}件）")
+        else:
+            print("fwupd-efi  実行待ち登録なし")
+    except (Hold, OSError) as exc:
+        print("fwupd-efi  確認不能", visible(exc))
+
+    try:
+        next_entry = boot_next()
+        print("次回起動先 ", "指定なし" if next_entry is None else f"Boot{next_entry:04X}")
+    except (Hold, OSError) as exc:
+        print("次回起動先  確認不能", visible(exc))
+
+    try:
+        esp, _ = find_esp(mounts)
+        files = disk_capsules(esp)
+        delivery = disk_delivery_requested()
+        if delivery and files:
+            message = "配送指示とカプセルあり（次回通常起動で適用される可能性あり）"
+        elif delivery:
+            message = "配送指示あり。対象ファイルが見つからず予約を確認できません"
+        elif files:
+            message = "カプセルあり。標準の配送指示なし"
+        else:
+            message = "標準の配送指示とカプセルなし"
+        print("ディスク配送 ", message)
+    except (Hold, OSError, ValueError, subprocess.CalledProcessError) as exc:
+        print("ディスク配送  確認不能", visible(exc))
 
 
 def show_history(device, history):
@@ -540,30 +882,38 @@ def main():
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--check", action="store_true", help="LVFS安定版の更新候補を確認（既定）")
     modes.add_argument("--apply", action="store_true", help="内容を確認してBIOS更新を予約")
-    modes.add_argument("--status", action="store_true", help="実機版と履歴を表示。配布元への通信なし")
+    modes.add_argument("--status", action="store_true", help="実機版、EFIの予約、履歴を表示。配布元への通信なし")
+    parser.add_argument("--device-id", metavar="ID", help="--apply で照合するシステムBIOSのDevice ID")
     opt = parser.parse_args()
+    if opt.device_id is not None and (not opt.apply or not re.fullmatch(r"[0-9a-fA-F]{40}", opt.device_id)):
+        parser.error("--device-id は --apply と組み合わせ、40桁の16進数で指定してください。")
     if not os.path.isfile(FWUPDMGR):
         raise Error("fwupdmgr が見つかりません。Ubuntu / Mintでは sudo apt install fwupd で導入できます。")
     if opt.apply and not (sys.stdin.isatty() and sys.stdout.isatty()):
         raise Hold("--apply はfwupdの確認に応答できる対話端末で実行してください。")
     if opt.status:
-        _, device, _ = inventory()
+        guid, device, _ = inventory()
         describe(device)
+        show_reservations(guid)
         show_history(device, rows(["get-history"], allow_empty=True))
         if marker_path().exists():
-            print("この起動でスクリプトが更新依頼を開始しています。上記の実機版・履歴と併せて確認してください。")
+            print("この起動で更新を依頼しています。実機版、EFIの予約、履歴を併せて確認してください。")
         return
     if not ESRT.is_dir():
         raise Hold("UEFIのESRTを取得できません。この方法で更新できるBIOSを特定できません。")
-    remote = stable_remote()
+    settings = read_settings()
+    remote = stable_remote(settings)
     command(["refresh"], allow_empty=True)  # 2は、直近にカタログを更新済みの場合も返る。
     guid, device, devices = inventory()
+    if opt.device_id is not None and opt.device_id.lower() != device["DeviceId"]:
+        raise Hold("指定したDevice IDが実機のシステムBIOSと一致しません。")
     describe(device)
     if opt.apply:
         marker = marker_path()
         check_marker(marker)
-        check_ready(device, devices, rows(["get-history"], allow_empty=True))
+        check_ready(device, devices, rows(["get-history"], allow_empty=True), settings)
     release = candidate(device)
+    compare_remote(remote, stable_remote(settings))
     if not release:
         if device.get("UpdateError"):
             print("fwupd    ", visible(device["UpdateError"]))
@@ -577,12 +927,14 @@ def main():
     if not opt.apply:
         print("予約する場合は --apply を付けて実行してください。")
         return
+    profile = support_profile(settings, guid, device)
     with tempfile.TemporaryDirectory(prefix="mknk-bios-") as work:
         cab = Path(work) / "firmware.cab"
         print("配布ファイルを取得し、署名・ハッシュ・対象を照合します。", flush=True)
-        fetch_cab(release, remote, cab)
-        verify_cab(cab, release, guid, device, devices)
+        fetch_cab(release, remote, cab, settings)
+        scope = verify_cab(cab, release, guid, device, devices, profile)
         print("対象     ", visible(release["AppstreamId"]))
+        print("適用範囲  ", scope)
         print("CAB      ", *strong_hash(release))
         print("AC電源を維持してください。他のツールで起動待ちの更新を予約済みなら、ここで終了してください。")
         print("予約後は次の通常起動で適用され得ます。再起動のタイミングは利用者が選びます。")
@@ -594,7 +946,11 @@ def main():
             print("取り消しました。")
             return
         # 承認後も、配布元、対象、現在版、承認した配布物、予約と給電を読み直す。
-        active_remote = stable_remote()
+        active_settings = read_settings()
+        if active_settings != settings:
+            raise Hold("承認後に安定版配布元または機種別対応情報が変更されました。再確認してください。")
+        active_remote = stable_remote(active_settings)
+        compare_remote(remote, active_remote)
         new_guid, current, peers = inventory()
         if new_guid != guid or any(current.get(k) != device.get(k) for k in ("DeviceId", "Version", "Branch", "CompositeId")):
             raise Hold("承認後に機器情報が変化しました。再確認してください。")
@@ -602,8 +958,13 @@ def main():
         if (not updated or any(updated.get(k) != release.get(k) for k in ("Version", "AppstreamId", "RemoteId"))
                 or strong_hash(updated) != strong_hash(release)):
             raise Hold("承認後に配布候補が変わりました。再確認してください。")
-        verify_cab(cab, updated, guid, current, peers)
-        check_ready(current, peers, rows(["get-history"], allow_empty=True))
+        active_profile = support_profile(active_settings, guid, current)
+        verify_cab(cab, updated, guid, current, peers, active_profile)
+        check_ready(current, peers, rows(["get-history"], allow_empty=True), active_profile)
+        if read_settings() != active_settings:
+            raise Hold("送信準備中に設定が変更されました。再確認してください。")
+        active_remote = stable_remote(active_settings)
+        compare_remote(remote, active_remote)
         check_admin_policy(active_remote, updated)
         send_once(marker, current, updated, cab)
     print("fwupdが更新依頼を受け付けました。BIOSへの適用結果は次の起動後に確認します。")
@@ -620,7 +981,7 @@ def main():
             print("適用に必要な起動操作は、fwupdとメーカーの案内を確認してください。")
     except (Error, Hold, OSError) as exc:
         print("予約後の起動手順は未確認です。", visible(exc))
-    print("起動後の実機版と履歴は --status で確認できます。")
+    print("実機版、EFIの予約、履歴は --status で確認できます。")
 
 
 if __name__ == "__main__":
