@@ -3,8 +3,9 @@ import json
 import os
 import pwd
 import subprocess
-from pathlib import Path
 from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
 
 from gi.repository import Gio, GLib
 
@@ -24,6 +25,17 @@ GUI = "/usr/bin/mknk-bios-update"
 WORKER = Path(__file__).with_name("worker.py")
 
 
+@dataclass(frozen=True)
+class BusProcess:
+    uid: int
+    pid: int
+    start: str
+
+    @property
+    def proc(self):
+        return Path("/proc") / str(self.pid)
+
+
 class Platform:
     observe = staticmethod(hardware.observe)
     preflight = staticmethod(hardware.preflight)
@@ -31,10 +43,18 @@ class Platform:
     recovery_required = staticmethod(hardware.recovery_required)
     cabinet = staticmethod(fw.open_cabinet)
 
-    def __init__(self, bus):
+    def __init__(self, bus, *, portable=False):
         self.bus = bus
+        self.portable = portable
         self.bus_id = self.call(DBUS, DBUS_PATH, DBUS, "GetId")[0]
-        self.worker_user = pwd.getpwnam("mknk-bios")
+        try:
+            self.worker_user = pwd.getpwnam("mknk-bios")
+        except KeyError:
+            if not portable:
+                raise
+            self.worker_user = pwd.getpwnam("nobody")
+        if self.worker_user.pw_uid == 0 or self.worker_user.pw_gid == 0:
+            raise Conflict("配布情報を検証する非特権アカウントを確認できません。")
 
     def call(self, name, path, iface, method, signature=None, args=()):
         params = GLib.Variant(signature, args) if signature else None
@@ -44,17 +64,27 @@ class Platform:
     def session_props(self, path):
         return self.call(LOGIN, path, DBUS + ".Properties", "GetAll", "(s)", (LOGIN + ".Session",))[0]
 
-    def actor(self, sender):
+    def connection_process(self, sender):
         creds = self.call(DBUS, DBUS_PATH, DBUS, "GetConnectionCredentials", "(s)", (sender,))[0]
         uid, pid = creds["UnixUserID"], creds["ProcessID"]
-        proc = Path("/proc") / str(pid)
-        start = (proc / "stat").read_text().rsplit(")", 1)[1].split()[19]
+        stat = (Path("/proc") / str(pid) / "stat").read_bytes()
+        return BusProcess(uid, pid, stat.rsplit(b")", 1)[1].split()[19].decode("ascii"))
+
+    def genuine_gui(self, sender, process):
+        try:
+            return os.path.samefile(process.proc / "exe", GUI)
+        except OSError:
+            return False
+
+    def actor(self, sender):
+        process = self.connection_process(sender)
+        uid, pid = process.uid, process.pid
         direct = True
         try:
             path = self.call(LOGIN, MANAGER, LOGIN + ".Manager", "GetSessionByPID", "(u)", (pid,))[0]
         except GLib.Error:
             direct = False
-            if f"/user.slice/user-{uid}.slice/user@{uid}.service/" not in (proc / "cgroup").read_text():
+            if f"/user.slice/user-{uid}.slice/user@{uid}.service/" not in (process.proc / "cgroup").read_text():
                 raise Conflict("ローカル画面との対応を確認できません。")
             sessions = self.call(LOGIN, MANAGER, LOGIN + ".Manager", "ListSessions")[0]
             active = [row[4] for row in sessions if row[1] == uid and self.session_is_local(self.session_props(row[4]), uid)]
@@ -71,11 +101,8 @@ class Platform:
             desktop = "gnome"
         else:
             desktop = ""
-        try:
-            genuine = os.path.samefile(proc / "exe", GUI)
-        except OSError:
-            genuine = False
-        return Actor(sender, uid, path, self.bus_id, direct and genuine, desktop, f"{pid}:{start}")
+        genuine = self.genuine_gui(sender, process)
+        return Actor(sender, uid, path, self.bus_id, direct and genuine, desktop, f"{pid}:{process.start}")
 
     @staticmethod
     def session_is_local(props, uid):
@@ -124,17 +151,29 @@ class Platform:
                 if other.get("Class") in ("user", "user-early") and other.get("State") != "closing":
                     raise Conflict("別のログインセッションで作業中です。保存してログアウトしてください。")
 
+    def execute_worker(self, command, request, **options):
+        return subprocess.run(command, input=request, capture_output=True, timeout=240, check=False, **options)
+
     def run_worker(self, mode, guid, files=(), **args):
         account = self.worker_user
         desc = [f.fileno() for f in files]
         env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": "/nonexistent",
                "MKNK_FWUPD_ONLY_PQ": read_trust_policy()}
+        python = ["/usr/bin/python3", "-I"]
+        if self.portable:
+            # These locations belong to the root-extracted payload. The worker never
+            # searches the original AppImage mount or the desktop user's environment.
+            stage = WORKER.resolve().parent.parent
+            env.update(LD_LIBRARY_PATH=str(stage / "lib"), GI_TYPELIB_PATH=str(stage / "typelibs"))
+            python.append("-S")
+            args["profile"] = fw.read_settings()
         request = json.dumps(dict(mode=mode, guid=guid, fds=desc, **args)).encode()
-        result = subprocess.run(["/usr/bin/python3", "-I", str(WORKER)], input=request, capture_output=True,
-                                pass_fds=tuple(desc), user=account.pw_uid, group=account.pw_gid, extra_groups=[],
-                                cwd="/", env=env, timeout=240, check=False)
+        result = self.execute_worker([*python, str(WORKER)], request, pass_fds=tuple(desc),
+                                     user=account.pw_uid, group=account.pw_gid, extra_groups=[], cwd="/", env=env)
         if result.returncode or len(result.stdout) > 256 * 1024:
             raise Conflict("配布情報の検証プロセスを完了できません。")
+        if self.portable and args["profile"] != fw.read_settings():
+            raise Conflict("検証中に機種別の設定が変化しました。配布情報を再確認してください。")
         data = json.loads(result.stdout)
         if not isinstance(data, dict):
             raise Conflict("配布情報の検証結果を確認できません。")

@@ -11,7 +11,7 @@
 #define LOGIN_PATH "/org/freedesktop/login1"
 
 typedef struct {
-    GDBusConnection *system, *session;
+    GDBusConnection *system, *session, *control;
     char *service_owner, *request, *manager, *login, *client;
     gboolean cinnamon, reboot, finished, sent, query_ok;
     guint signal, watch, deadline, query_generation;
@@ -25,6 +25,7 @@ static void power_clear(gpointer data)
     Power *p = data;
     g_clear_object(&p->system);
     g_clear_object(&p->session);
+    g_clear_object(&p->control);
     g_free(p->service_owner);
     g_free(p->request);
     g_free(p->manager);
@@ -130,7 +131,7 @@ static gboolean checks(Power *p, GError **error)
     gboolean inhibited;
     g_variant_get(blocked, "(b)", &inhibited);
     if (inhibited) return unavailable(error, "デスクトップで終了を妨げる作業が進行中です。");
-    g_autoptr(GVariant) fresh = call(p->system, p->service_owner, BIOS_PATH, BIOS_BUS,
+    g_autoptr(GVariant) fresh = call(p->control, p->service_owner, BIOS_PATH, BIOS_BUS,
                                      "RecheckPower", g_variant_new("(s)", p->request),
                                      G_VARIANT_TYPE_UNIT, error);
     return fresh != NULL;
@@ -306,11 +307,12 @@ static void registered(GObject *source, GAsyncResult *result, gpointer data)
     g_task_run_in_thread(task, check_thread);
 }
 
-void session_request_power(GDBusConnection *system, const char *service_owner,
+void session_request_power(GDBusConnection *system, GDBusConnection *control, const char *service_owner,
                            const char *request, const char *desktop, const char *action,
                            PowerNotice notice, PowerDone done, gpointer data)
 {
-    if (!g_dbus_is_unique_name(service_owner) || !*request ||
+    if ((system == control ? !service_owner || !g_dbus_is_unique_name(service_owner) : service_owner != NULL) ||
+        !*request ||
         (!g_str_equal(desktop, "gnome") && !g_str_equal(desktop, "cinnamon")) ||
         (!g_str_equal(action, "reboot") && !g_str_equal(action, "shutdown"))) {
         done(TRUE, "このデスクトップの終了経路を確認できません。", data);
@@ -318,6 +320,7 @@ void session_request_power(GDBusConnection *system, const char *service_owner,
     }
     Power *p = g_atomic_rc_box_new0(Power);
     p->system = g_object_ref(system);
+    p->control = g_object_ref(control);
     p->service_owner = g_strdup(service_owner);
     p->request = g_strdup(request);
     p->cinnamon = g_str_equal(desktop, "cinnamon");

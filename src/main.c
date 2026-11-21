@@ -8,28 +8,33 @@
 #include <json-glib/json-glib.h>
 
 #include "session.h"
+#include "portable.h"
 
 #define UNKNOWN "確認できません"
 #define FWUPD "org.freedesktop.fwupd"
 
-/* The process has one window and one system-bus connection. Desktop actions
- * launch a fresh process so a status-only instance cannot acquire write rights. */
+/* fwupd and logind use the GUI's system bus. Portable app methods use a
+ * separate root-authenticated peer with no D-Bus destination name. */
 static struct {
     GtkApplication *app;
     GtkWindow *window;
     GtkWidget *model, *current, *stack, *page, *history, *history_text, *notice;
     GtkWidget *approve, *recovery, *actions;
-    GDBusConnection *bus;
+    GDBusConnection *bus, *control;
+    GCancellable *startup;
     JsonObject *view;
     char *owner, *stage, *previous_state, *deferred_plan;
-    guint watch, changes, timer;
+    guint watch, changes, timer, startup_timeout;
+    gulong closed;
+    int appdir_fd;
     guint64 generation;
     gboolean opening, busy, reading, fresh, read_only, explicit_plan, closing, first_status, login;
-    gboolean preparing, abandon_prepare;
+    gboolean preparing, abandon_prepare, portable;
 } ui;
 
 typedef struct {
     guint64 generation;
+    GDBusConnection *control, *system;
     char *owner;
     char *id;
     char *fwupd, *device, *target, *checksum, *sha512, *remote, *component;
@@ -39,6 +44,8 @@ static Request *request_new(const char *id)
 {
     Request *r = g_new0(Request, 1);
     r->generation = ui.generation;
+    r->control = g_object_ref(ui.control);
+    r->system = g_object_ref(ui.bus);
     r->owner = g_strdup(ui.owner);
     r->id = g_strdup(id);
     return r;
@@ -46,6 +53,8 @@ static Request *request_new(const char *id)
 
 static void request_free(Request *r)
 {
+    g_object_unref(r->control);
+    g_object_unref(r->system);
     g_free(r->owner);
     g_free(r->id);
     g_free(r->fwupd);
@@ -58,6 +67,11 @@ static void request_free(Request *r)
     g_free(r);
 }
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(Request, request_free)
+
+static gboolean same_service(Request *r)
+{
+    return r->control == ui.control && r->system == ui.bus && g_strcmp0(r->owner, ui.owner) == 0;
+}
 
 static const char *field(const char *key)
 {
@@ -155,7 +169,7 @@ static void error_notice(const char *context, GError *error)
 
 static gboolean writable(void)
 {
-    return !ui.read_only && ui.owner && ui.fresh && !ui.busy && !ui.reading && !ui.closing;
+    return !ui.read_only && ui.control && ui.fresh && !ui.busy && !ui.reading && !ui.closing;
 }
 
 static gboolean can_approve(void)
@@ -226,8 +240,15 @@ static void render(void)
     gtk_stack_set_visible_child(GTK_STACK(ui.stack), page);
     if (old) gtk_stack_remove(GTK_STACK(ui.stack), old);
     identity();
-    const char *heading = *field("title") ? field("title") : "端末の状態を確認";
+    const char *heading = *field("title") ? field("title") :
+                          ui.portable && !ui.control ? "この PC の BIOS 情報" : "端末の状態を確認";
     append(page, label(heading, "title-2"));
+    if (ui.portable && !ui.control) {
+        const char *explanation = ui.read_only
+            ? "この画面では、端末から読み取った機種と BIOS 版を表示します。更新情報を確認するには、通常モードで開き直してください。"
+            : "更新情報を確認するには管理者認証が必要です。認証後にこの PC の更新計画を読み取り、計画がない場合は配布元を確認します。";
+        append(page, label(ui.opening ? "管理者認証と端末サービスへの接続を待っています。" : explanation, NULL));
+    }
     if (*field("detail")) append(page, label(field("detail"), NULL));
     if (*field("target")) {
         if (state("review")) {
@@ -271,14 +292,19 @@ static void render(void)
         append(page, label(shutdown ? "予約は保持されます。次の電源投入時に PC が適用を試みます。"
                                     : "予約は保持されます。次の通常の再起動で PC が適用を試みます。", NULL));
     }
-    if (ui.read_only && !strstr(field("detail"), "ランチャー"))
+    if (ui.read_only && !ui.portable && !strstr(field("detail"), "ランチャー"))
         append(page, label("閲覧用に開いています。更新を行うには、アプリのランチャーから「更新計画を開く」を選んでください。", NULL));
     if (ui.stage) append(page, label(ui.stage, "heading"));
     /* The device and action bar remain in place as the central details scroll. */
     GtkWidget *child;
     while ((child = gtk_widget_get_first_child(ui.actions)) != NULL)
         gtk_flow_box_remove(GTK_FLOW_BOX(ui.actions), child);
-    if (ui.preparing) {
+    if (ui.portable && !ui.control) {
+        GtkWidget *open = ui.read_only
+            ? button(ui.actions, "通常モードで開き直す", "ReopenPortable", FALSE)
+            : button(ui.actions, "更新情報を確認", "OpenPortable", TRUE);
+        gtk_widget_set_sensitive(open, !ui.opening && !ui.busy && !ui.closing);
+    } else if (ui.preparing) {
         GtkWidget *cancel = button(ui.actions, "今回は見送る", "AbandonPrepare", FALSE);
         gtk_widget_set_sensitive(cancel, !ui.abandon_prepare);
     } else if (!ui.read_only && state("review") && *field("plan") && flag("can_approve")) {
@@ -309,7 +335,9 @@ static void render(void)
     if (!ui.read_only && can_check())
         gtk_widget_set_sensitive(button(ui.actions, "配布情報を再確認", "Check", FALSE), writable());
     const char *history = field("history");
-    set_text(ui.history_text, *history ? history : (ui.view ? "表示できる履歴はありません。" : "履歴を取得できません。"));
+    set_text(ui.history_text, *history ? history : ui.view ? "表示できる履歴はありません。" :
+             ui.portable && !ui.read_only ? "「更新情報を確認」で端末の更新履歴を読み取れます。" :
+             ui.portable ? "更新履歴は通常モードで管理者認証を行うと確認できます。" : "履歴を取得できません。");
     if (focus && transition && *focus_state) gtk_widget_grab_focus(focus);
 #if GTK_CHECK_VERSION(4, 14, 0)
     if (transition && *focus_state)
@@ -336,19 +364,26 @@ static gboolean receive_view(GVariant *reply)
 }
 
 static void schedule_status(void);
+static void clear_control(void);
 
 static void status_done(GObject *source, GAsyncResult *result, gpointer data)
 {
     g_autoptr(Request) r = data;
     g_autoptr(GError) error = NULL;
     g_autoptr(GVariant) reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), result, &error);
+    if (!same_service(r)) return;
     ui.reading = FALSE;
-    if (r->generation != ui.generation || g_strcmp0(r->owner, ui.owner) != 0) {
+    if (r->generation != ui.generation) {
         schedule_status();
         render();
         return;
     }
     if (!reply || !receive_view(reply)) {
+        if (ui.portable && !ui.busy) {
+            g_dbus_connection_close(ui.control, NULL, NULL, NULL);
+            clear_control();
+            ui.first_status = FALSE;
+        }
         ui.fresh = FALSE;
         g_clear_pointer(&ui.view, json_object_unref);
         error_notice("端末サービスから現在の状態を取得できません。", error);
@@ -372,15 +407,16 @@ static void status_done(GObject *source, GAsyncResult *result, gpointer data)
 static void refresh(void)
 {
     if (ui.reading || ui.closing) return;
-    if (!ui.bus || !ui.owner) {
-        connect_service();
+    if (!ui.control) {
+        if (ui.portable) render();
+        else connect_service();
         return;
     }
     ui.reading = TRUE;
     ui.fresh = FALSE;
     ++ui.generation;
     render();
-    g_dbus_connection_call(ui.bus, ui.owner, BIOS_PATH, BIOS_BUS, "Status", NULL,
+    g_dbus_connection_call(ui.control, ui.owner, BIOS_PATH, BIOS_BUS, "Status", NULL,
                            G_VARIANT_TYPE("(s)"), G_DBUS_CALL_FLAGS_NO_AUTO_START, 30000,
                            NULL, status_done, request_new(NULL));
 }
@@ -389,54 +425,121 @@ static gboolean delayed_status(gpointer data)
 {
     (void) data;
     ui.timer = 0;
-    if (ui.owner) refresh();
+    if (ui.control) refresh();
     return G_SOURCE_REMOVE;
 }
 
 static void schedule_status(void)
 {
-    if (!ui.timer && ui.owner && !ui.closing)
+    if (!ui.timer && ui.control && !ui.closing)
         ui.timer = g_timeout_add(120, delayed_status, NULL);
 }
 
 static void changed(GDBusConnection *bus, const char *sender, const char *path,
                     const char *iface, const char *name, GVariant *args, gpointer data)
 {
-    (void) bus; (void) path; (void) iface; (void) name; (void) args; (void) data;
-    if (g_strcmp0(sender, ui.owner) != 0) return;
+    (void) path; (void) iface; (void) name; (void) args; (void) data;
+    if (bus != ui.control || g_strcmp0(sender, ui.owner) != 0) return;
     ++ui.generation;
     ui.fresh = FALSE;
     render();
     schedule_status();  /* local reconciliation only, never catalog refresh */
 }
 
+static void clear_control(void)
+{
+    ++ui.generation;
+    if (ui.changes) g_dbus_connection_signal_unsubscribe(ui.control, ui.changes);
+    if (ui.closed) g_signal_handler_disconnect(ui.control, ui.closed);
+    ui.changes = 0;
+    ui.closed = 0;
+    ui.reading = FALSE;
+    ui.fresh = FALSE;
+    g_clear_handle_id(&ui.timer, g_source_remove);
+    g_clear_object(&ui.control);
+    g_clear_pointer(&ui.owner, g_free);
+    g_clear_pointer(&ui.view, json_object_unref);
+}
+
+static void private_closed(GDBusConnection *bus, gboolean remote, GError *error, gpointer data)
+{
+    (void) remote; (void) error; (void) data;
+    if (bus != ui.control) return;
+    clear_control();
+    g_clear_object(&ui.bus);
+    ui.first_status = FALSE;
+    notice("端末サービスとの接続が終了しました。更新計画は「更新情報を確認」から読み直せます。");
+    render();
+}
+
+static void use_control(GDBusConnection *bus, const char *owner)
+{
+    clear_control();
+    ui.control = g_object_ref(bus);
+    ui.owner = g_strdup(owner);
+    ui.opening = FALSE;
+    ui.changes = g_dbus_connection_signal_subscribe(bus, owner, BIOS_BUS, "Changed", BIOS_PATH, NULL,
+                                                  G_DBUS_SIGNAL_FLAGS_NONE, changed, NULL, NULL);
+    if (ui.portable) {
+        ui.closed = g_signal_connect(bus, "closed", G_CALLBACK(private_closed), NULL);
+        if (g_dbus_connection_is_closed(bus)) {
+            private_closed(bus, TRUE, NULL, NULL);
+            return;
+        }
+    }
+    notice(NULL);
+    refresh();
+}
+
 static void appeared(GDBusConnection *bus, const char *name, const char *owner, gpointer data)
 {
     (void) name; (void) data;
-    g_free(ui.owner);
-    ui.owner = g_strdup(owner);
-    ++ui.generation;
-    ui.opening = FALSE;
-    if (ui.changes) g_dbus_connection_signal_unsubscribe(bus, ui.changes);
-    ui.changes = g_dbus_connection_signal_subscribe(bus, owner, BIOS_BUS, "Changed", BIOS_PATH, NULL,
-                                                  G_DBUS_SIGNAL_FLAGS_NONE, changed, NULL, NULL);
-    notice(NULL);
-    refresh();
+    if (bus == ui.bus && !ui.closing) use_control(bus, owner);
 }
 
 static void vanished(GDBusConnection *bus, const char *name, gpointer data)
 {
     (void) name; (void) data;
-    ++ui.generation;
+    if (bus && bus != ui.bus) return;
+    clear_control();
     ui.opening = FALSE;
-    ui.fresh = FALSE;
-    if (ui.changes && bus) g_dbus_connection_signal_unsubscribe(bus, ui.changes);
-    ui.changes = 0;
-    g_clear_pointer(&ui.owner, g_free);
-    g_clear_pointer(&ui.view, json_object_unref);
     notice("端末サービスに接続できません。この PC から読み取れた機種と BIOS 版を表示しています。");
     render();
     if (ui.login) g_application_quit(G_APPLICATION(ui.app));
+}
+
+static void finish_startup(void)
+{
+    g_clear_handle_id(&ui.startup_timeout, g_source_remove);
+    g_clear_object(&ui.startup);
+    ui.opening = FALSE;
+}
+
+static gboolean startup_expired(gpointer data)
+{
+    (void) data;
+    ui.startup_timeout = 0;
+    g_cancellable_cancel(ui.startup);
+    return G_SOURCE_REMOVE;
+}
+
+static void portable_ready(GObject *source, GAsyncResult *result, gpointer data)
+{
+    (void) data;
+    g_autoptr(GError) error = NULL;
+    g_autoptr(GDBusConnection) peer = portable_connect_finish(result, &error);
+    finish_startup();
+    if (ui.closing || G_DBUS_CONNECTION(source) != ui.bus) return;
+    if (!peer || g_dbus_connection_is_closed(peer)) {
+        g_clear_object(&ui.bus);
+        ui.first_status = FALSE;
+        error_notice(g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)
+                     ? "管理者認証または接続が時間内に完了しませんでした。「更新情報を確認」でやり直せます。"
+                     : "更新計画を開けませんでした。機種と現在の BIOS 版は引き続き確認できます。", error);
+        render();
+        return;
+    }
+    use_control(peer, NULL);
 }
 
 static void bus_ready(GObject *source, GAsyncResult *result, gpointer data)
@@ -444,8 +547,9 @@ static void bus_ready(GObject *source, GAsyncResult *result, gpointer data)
     (void) source; (void) data;
     g_autoptr(GError) error = NULL;
     g_autoptr(GDBusConnection) bus = g_bus_get_finish(result, &error);
+    if (ui.closing) return;
     if (!bus) {
-        ui.opening = FALSE;
+        finish_startup();
         error_notice("システムバスに接続できません。", error);
         render();
         if (ui.login) g_application_quit(G_APPLICATION(ui.app));
@@ -453,6 +557,10 @@ static void bus_ready(GObject *source, GAsyncResult *result, gpointer data)
     }
     g_set_object(&ui.bus, bus);
     g_dbus_connection_set_exit_on_close(ui.bus, FALSE);
+    if (ui.portable) {
+        portable_connect_async(bus, ui.appdir_fd, ui.startup, portable_ready, NULL);
+        return;
+    }
     ui.watch = g_bus_watch_name_on_connection(bus, BIOS_BUS, G_BUS_NAME_WATCHER_FLAGS_AUTO_START,
                                               appeared, vanished, NULL, NULL);
 }
@@ -461,9 +569,14 @@ static void connect_service(void)
 {
     if (ui.opening) return;
     ui.opening = TRUE;
+    if (ui.portable) {
+        if (ui.bus && g_dbus_connection_is_closed(ui.bus)) g_clear_object(&ui.bus);
+        ui.startup = g_cancellable_new();
+        ui.startup_timeout = g_timeout_add_seconds(180, startup_expired, NULL);
+    }
     if (ui.watch) g_bus_unwatch_name(ui.watch);
     ui.watch = 0;
-    g_bus_get(G_BUS_TYPE_SYSTEM, NULL, bus_ready, NULL);
+    g_bus_get(G_BUS_TYPE_SYSTEM, ui.startup, bus_ready, NULL);
     render();
 }
 
@@ -493,14 +606,15 @@ static void view_done(GObject *source, GAsyncResult *result, gpointer data)
     g_autoptr(Request) r = data;
     g_autoptr(GError) error = NULL;
     g_autoptr(GVariant) reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), result, &error);
-    gboolean same = r->generation == ui.generation && g_strcmp0(r->owner, ui.owner) == 0;
+    gboolean attached = same_service(r);
+    gboolean same = r->generation == ui.generation && attached;
     if (ui.preparing) {
         ui.preparing = FALSE;
         gboolean abandon = ui.abandon_prepare;
         ui.abandon_prepare = FALSE;
         /* Dismiss only the draft returned by this Prepare, even if an unrelated
          * observation arrived during the download. Dismiss cannot issue a permit. */
-        if (abandon && reply && g_strcmp0(r->owner, ui.owner) == 0) {
+        if (abandon && reply && attached) {
             const char *json;
             g_variant_get(reply, "(&s)", &json);
             g_autoptr(JsonParser) parser = json_parser_new();
@@ -515,6 +629,11 @@ static void view_done(GObject *source, GAsyncResult *result, gpointer data)
             }
         }
     }
+    if (!attached) {
+        schedule_status();
+        end();
+        return;
+    }
     if (!reply) {
         error_notice("操作の結果を確認できません。端末の記録を読み直します。", error);
         ui.fresh = FALSE;
@@ -528,15 +647,15 @@ static void view_done(GObject *source, GAsyncResult *result, gpointer data)
 
 static void send_view(const char *method, GVariant *args)
 {
-    g_dbus_connection_call(ui.bus, ui.owner, BIOS_PATH, BIOS_BUS, method, args,
+    g_dbus_connection_call(ui.control, ui.owner, BIOS_PATH, BIOS_BUS, method, args,
                            G_VARIANT_TYPE("(s)"), G_DBUS_CALL_FLAGS_NO_AUTO_START |
                            G_DBUS_CALL_FLAGS_ALLOW_INTERACTIVE_AUTHORIZATION, 600000,
                            NULL, view_done, request_new(NULL));
 }
 
-static void report(GDBusConnection *bus, Request *operation, gboolean accepted)
+static void report(Request *operation, gboolean accepted)
 {
-    g_dbus_connection_call(bus, operation->owner, BIOS_PATH, BIOS_BUS, "Report",
+    g_dbus_connection_call(operation->control, operation->owner, BIOS_PATH, BIOS_BUS, "Report",
                            g_variant_new("(sb)", operation->id, accepted), G_VARIANT_TYPE("(s)"),
                            G_DBUS_CALL_FLAGS_NO_AUTO_START, 30000, NULL, view_done, operation);
 }
@@ -548,7 +667,7 @@ static void install_done(GObject *source, GAsyncResult *result, gpointer data)
     g_autoptr(GVariant) reply = g_dbus_connection_call_with_unix_fd_list_finish(bus, NULL, result, &error);
     if (!reply)
         error_notice("受付結果が未確定です。同じ更新は再送せず、予約と実機を照合します。", error);
-    report(bus, data, reply != NULL);
+    report(data, reply != NULL);
 }
 
 /* Only the immutable file descriptor from the service is forwarded. The
@@ -587,9 +706,9 @@ static void authorized(GObject *source, GAsyncResult *result, gpointer data)
         return;
     }
     if (g_strcmp0(owner, r->fwupd) != 0 || g_strcmp0(device, r->device) != 0 || !valid_cab(fds, index) ||
-        ui.closing || g_strcmp0(r->owner, ui.owner) != 0 || bus != ui.bus) {
+        ui.closing || !same_service(r) || g_dbus_connection_is_closed(r->control)) {
         notice("対象または配布ファイルの送信条件を確認できません。端末の記録を読み直します。");
-        report(bus, g_steal_pointer(&r), FALSE);
+        report(g_steal_pointer(&r), FALSE);
         return;
     }
     GVariantBuilder options;
@@ -599,7 +718,8 @@ static void authorized(GObject *source, GAsyncResult *result, gpointer data)
     g_free(ui.stage);
     ui.stage = g_strdup("検証済みの配布ファイルを fwupd に渡しています。");
     render();
-    g_dbus_connection_call_with_unix_fd_list(bus, owner, "/", FWUPD, "Install",
+    GDBusConnection *system = r->system;
+    g_dbus_connection_call_with_unix_fd_list(system, owner, "/", FWUPD, "Install",
                                             g_variant_new("(sha{sv})", device, index, &options),
                                             G_VARIANT_TYPE_UNIT, G_DBUS_CALL_FLAGS_NO_AUTO_START |
                                             G_DBUS_CALL_FLAGS_ALLOW_INTERACTIVE_AUTHORIZATION,
@@ -643,46 +763,38 @@ static void user_candidates(GObject *source, GAsyncResult *result, gpointer data
     g_autoptr(Request) r = data;
     g_autoptr(GError) error = NULL;
     g_autoptr(GVariant) reply = g_dbus_connection_call_finish(bus, result, &error);
-    if (!reply || !has_reviewed_release(reply, r) || ui.closing || ui.bus != bus ||
-        ui.generation != r->generation || g_strcmp0(ui.owner, r->owner) != 0) {
+    if (!reply || !has_reviewed_release(reply, r) || ui.closing || !same_service(r) ||
+        ui.generation != r->generation) {
         error_notice("この画面から確認した更新候補が承認内容と一致しません。配布情報を見直してください。", error);
         schedule_status();
         end();
         return;
     }
     Request *checked = g_steal_pointer(&r);
-    g_dbus_connection_call_with_unix_fd_list(bus, checked->owner, BIOS_PATH, BIOS_BUS, "Authorize",
+    g_dbus_connection_call_with_unix_fd_list(checked->control, checked->owner, BIOS_PATH, BIOS_BUS, "Authorize",
                                             g_variant_new("(s)", checked->id), G_VARIANT_TYPE("(sssh)"),
                                             G_DBUS_CALL_FLAGS_NO_AUTO_START |
                                             G_DBUS_CALL_FLAGS_ALLOW_INTERACTIVE_AUTHORIZATION,
                                             120000, NULL, NULL, authorized, checked);
 }
 
-typedef struct {
-    GDBusConnection *bus;
-    Request *request;
-} PowerReport;
-
 static void power_recorded(GObject *source, GAsyncResult *result, gpointer data)
 {
-    (void) data;
+    g_autoptr(Request) r = data;
     g_autoptr(GError) error = NULL;
     g_autoptr(GVariant) reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), result, &error);
-    if (!reply) error_notice("終了要求の結果を記録できません。状態を再確認してください。", error);
+    if (!reply && same_service(r)) error_notice("終了要求の結果を記録できません。状態を再確認してください。", error);
     schedule_status();
     end();
 }
 
 static void power_complete(gboolean cancelled, const char *message, gpointer data)
 {
-    PowerReport *p = data;
-    notice(message);
-    g_dbus_connection_call(p->bus, p->request->owner, BIOS_PATH, BIOS_BUS, "ReplyPower",
-                           g_variant_new("(sb)", p->request->id, cancelled), G_VARIANT_TYPE_UNIT,
-                           G_DBUS_CALL_FLAGS_NO_AUTO_START, 5000, NULL, power_recorded, NULL);
-    request_free(p->request);
-    g_object_unref(p->bus);
-    g_free(p);
+    Request *r = data;
+    if (same_service(r)) notice(message);
+    g_dbus_connection_call(r->control, r->owner, BIOS_PATH, BIOS_BUS, "ReplyPower",
+                           g_variant_new("(sb)", r->id, cancelled), G_VARIANT_TYPE_UNIT,
+                           G_DBUS_CALL_FLAGS_NO_AUTO_START, 5000, NULL, power_recorded, r);
 }
 
 static void power_ready(GObject *source, GAsyncResult *result, gpointer data)
@@ -699,27 +811,38 @@ static void power_ready(GObject *source, GAsyncResult *result, gpointer data)
     }
     const char *id, *desktop, *action;
     g_variant_get(reply, "(&s&s&s)", &id, &desktop, &action);
-    gboolean matches = g_str_equal(r->id, action) && !ui.closing && bus == ui.bus &&
-                       g_strcmp0(ui.owner, r->owner) == 0;
+    gboolean matches = g_str_equal(r->id, action) && !ui.closing && same_service(r);
     g_free(r->id);
     r->id = g_strdup(id);
-    PowerReport *p = g_new0(PowerReport, 1);
-    p->bus = g_object_ref(bus);
-    p->request = g_steal_pointer(&r);
     if (!matches) {
-        power_complete(TRUE, "終了要求を取り消しました。予約は保持されています。", p);
+        power_complete(TRUE, "終了要求を取り消しました。予約は保持されています。", g_steal_pointer(&r));
         return;
     }
     g_free(ui.stage);
     ui.stage = g_strdup("デスクトップの終了条件と確認画面を待っています。");
     render();
-    session_request_power(bus, p->request->owner, id, desktop, action, notice, power_complete, p);
+    Request *operation = g_steal_pointer(&r);
+    session_request_power(operation->system, operation->control, operation->owner, id, desktop, action,
+                          notice, power_complete, operation);
 }
 
 static void action_clicked(GtkButton *button_widget, gpointer data)
 {
     (void) button_widget;
     const char *action = data;
+    if (g_str_equal(action, "OpenPortable") && ui.portable && !ui.read_only && !ui.control &&
+        !ui.busy && !ui.opening && !ui.closing) {
+        ui.first_status = TRUE;
+        notice(NULL);
+        connect_service();
+        return;
+    }
+    if (g_str_equal(action, "ReopenPortable") && ui.portable && ui.read_only && !ui.closing) {
+        g_autoptr(GError) error = NULL;
+        portable_reopen(ui.appdir_fd, &error);
+        error_notice("同じ AppImage を通常モードで開いてください。", error);
+        return;
+    }
     if (g_str_equal(action, "AbandonPrepare") && ui.preparing) {
         ui.abandon_prepare = TRUE;
         notice("今回は見送ります。進行中の検証が終了したら承認待ちの計画を閉じます。");
@@ -776,7 +899,7 @@ static void action_clicked(GtkButton *button_widget, gpointer data)
     } else if (g_str_equal(action, "Power") && state("pending") && flag("can_power") && *field("plan") &&
                (g_str_equal(field("power"), "reboot") || g_str_equal(field("power"), "shutdown"))) {
         begin("給電状態・起動先・更新の予約を再確認しています。");
-        g_dbus_connection_call(ui.bus, ui.owner, BIOS_PATH, BIOS_BUS, "Power",
+        g_dbus_connection_call(ui.control, ui.owner, BIOS_PATH, BIOS_BUS, "Power",
                                g_variant_new("(s)", field("plan")), G_VARIANT_TYPE("(sss)"),
                                G_DBUS_CALL_FLAGS_NO_AUTO_START, 30000, NULL, power_ready,
                                request_new(field("power")));
@@ -786,8 +909,9 @@ static void action_clicked(GtkButton *button_widget, gpointer data)
 static gboolean closing(GtkWindow *window, gpointer data)
 {
     (void) data;
+    ui.closing = TRUE;
+    if (ui.startup) g_cancellable_cancel(ui.startup);
     if (ui.busy) {
-        ui.closing = TRUE;
         gtk_widget_set_visible(GTK_WIDGET(window), FALSE);
         return TRUE;
     }
@@ -811,7 +935,7 @@ static void activate(GtkApplication *app, gpointer data)
         return;
     }
     ui.window = GTK_WINDOW(gtk_application_window_new(app));
-    ui.first_status = !ui.read_only;
+    ui.first_status = !ui.read_only && !ui.portable;
     gtk_window_set_default_size(ui.window, 640, 620);
     gtk_window_set_title(ui.window, "BIOS 更新");
     g_signal_connect(ui.window, "close-request", G_CALLBACK(closing), NULL);
@@ -867,7 +991,8 @@ static void activate(GtkApplication *app, gpointer data)
     g_signal_connect(toggle, "toggled", G_CALLBACK(toggle_history), NULL);
     render();
     if (!ui.login) gtk_window_present(ui.window);
-    connect_service();
+    if (!ui.portable) connect_service();
+    else if (ui.login) g_application_quit(G_APPLICATION(app));
 }
 
 int main(int argc, char **argv)
@@ -887,20 +1012,23 @@ int main(int argc, char **argv)
         return 2;
     }
     ui.read_only = ui.read_only || ui.login;
+    ui.portable = g_strcmp0(g_getenv("MKNK_BIOS_PORTABLE"), "1") == 0;
+    ui.appdir_fd = ui.portable ? portable_take_appdir() : -1;
     g_set_application_name("BIOS 更新");
     ui.app = gtk_application_new(BIOS_APP, G_APPLICATION_NON_UNIQUE);
     g_object_set(ui.app, "register-session", FALSE, NULL);
     g_signal_connect(ui.app, "activate", G_CALLBACK(activate), NULL);
     int status = g_application_run(G_APPLICATION(ui.app), argc, argv);
-    if (ui.timer) g_source_remove(ui.timer);
-    if (ui.changes) g_dbus_connection_signal_unsubscribe(ui.bus, ui.changes);
+    if (ui.startup) g_cancellable_cancel(ui.startup);
+    finish_startup();
+    if (ui.portable && ui.control) g_dbus_connection_close_sync(ui.control, NULL, NULL);
+    clear_control();
     if (ui.watch) g_bus_unwatch_name(ui.watch);
+    if (ui.appdir_fd >= 0) close(ui.appdir_fd);
     g_clear_object(&ui.bus);
     g_clear_object(&ui.app);
-    g_clear_pointer(&ui.view, json_object_unref);
     g_free(ui.previous_state);
     g_free(ui.stage);
     g_free(ui.deferred_plan);
-    g_free(ui.owner);
     return status;
 }

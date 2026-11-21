@@ -1,7 +1,9 @@
 /* Native GTK controls, real GDBus serialization and FD passing, private bus.
  * No method in this test can reach the machine's system or session bus. */
 #define main application_main
+#define portable_connect_async mock_portable_connect_async
 #include "../src/main.c"
+#undef portable_connect_async
 #undef main
 #include <sys/mman.h>
 
@@ -16,6 +18,10 @@ static guint rechecks, cancelled, responses, stopped;
 static gboolean last_response;
 static GDBusMethodInvocation *held_check, *held_prepare;
 static GDBusConnection *service, *fwupd, *desktop;
+static GDBusConnection *peer_service;
+static GDBusServer *peer_server;
+static guint helper_starts, status_calls;
+static gboolean deny_helper;
 static char *permit_sender, *client_sender, *reader;
 static const char device_id[] = "0123456789012345678901234567890123456789";
 #define DIGEST256 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -88,9 +94,16 @@ static void method_call(GDBusConnection *bus, const char *sender, const char *pa
                         const char *interface, const char *method, GVariant *args,
                         GDBusMethodInvocation *inv, gpointer data)
 {
-    (void) bus; (void) path; (void) interface; (void) data;
+    (void) path; (void) data;
     GVariant *result = NULL;
-    if (g_str_equal(method, "Check")) {
+    if (ui.portable && g_str_equal(interface, BIOS_BUS)) {
+        g_assert_true(bus == peer_service);
+        g_assert_null(sender);
+        g_assert_null(g_dbus_message_get_destination(g_dbus_method_invocation_get_message(inv)));
+    }
+    if (g_str_equal(method, "Status")) {
+        status_calls++;
+    } else if (g_str_equal(method, "Check")) {
         checks_sent++;
         if (withhold) {
             held_check = g_object_ref(inv);
@@ -134,9 +147,9 @@ static void method_call(GDBusConnection *bus, const char *sender, const char *pa
         result = g_variant_new("(aa{sv})", &entries);
     } else if (g_str_equal(method, "Authorize")) {
         permits++;
-        g_assert_cmpstr(reader, ==, sender);
+        g_assert_cmpstr(reader, ==, ui.portable ? g_dbus_connection_get_unique_name(ui.bus) : sender);
         g_free(permit_sender);
-        permit_sender = g_strdup(sender);
+        permit_sender = g_strdup(reader);
         int fd = memfd_create("mock", MFD_CLOEXEC | MFD_ALLOW_SEALING);
         g_assert_cmpint(fd, >=, 0);
         g_assert_cmpint(write(fd, "simulated", 9), ==, 9);
@@ -241,6 +254,42 @@ static void expose(GDBusConnection *bus, GDBusNodeInfo *node, const char *path, 
         g_dbus_node_info_lookup_interface(node, iface), &vtable, NULL, NULL, NULL), >, 0);
 }
 
+static gboolean accept_peer(GDBusServer *server, GDBusConnection *connection, gpointer data)
+{
+    (void) server;
+    g_set_object(&peer_service, connection);
+    expose(connection, data, BIOS_PATH, BIOS_BUS);
+    return TRUE;
+}
+
+static void mock_peer_ready(GObject *source, GAsyncResult *result, gpointer data)
+{
+    (void) source;
+    g_autoptr(GTask) task = data;
+    g_autoptr(GError) error = NULL;
+    GDBusConnection *connection = g_dbus_connection_new_for_address_finish(result, &error);
+    if (connection) g_task_return_pointer(task, connection, g_object_unref);
+    else g_task_return_error(task, g_steal_pointer(&error));
+}
+
+/* Only this translation unit substitutes the interactive launch. All subsequent
+ * calls, signals and file descriptors use a real GDBus peer and a separate bus. */
+void mock_portable_connect_async(GDBusConnection *system, int dir_fd, GCancellable *cancel,
+                                 GAsyncReadyCallback callback, gpointer data)
+{
+    (void) dir_fd;
+    helper_starts++;
+    g_assert_nonnull(g_dbus_connection_get_unique_name(system));
+    GTask *task = g_task_new(system, cancel, callback, data);
+    if (deny_helper) {
+        g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED, "管理者認証を取り消しました。");
+        g_object_unref(task);
+        return;
+    }
+    g_dbus_connection_new_for_address(g_dbus_server_get_client_address(peer_server),
+        G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT, NULL, cancel, mock_peer_ready, task);
+}
+
 static GDBusConnection *mock_connection(const char *address, const char *name)
 {
     GDBusConnection *bus = g_dbus_connection_new_for_address_sync(address, G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION |
@@ -324,13 +373,16 @@ int main(int argc, char **argv)
     gboolean status_start = argc == 2 && g_str_equal(argv[1], "--test-status-start");
     gboolean pending_start = argc == 2 && g_str_equal(argv[1], "--test-pending-start");
     gboolean silent_start = argc == 2 && g_str_equal(argv[1], "--test-login-start");
-    if (status_start || pending_start || silent_start) {
+    gboolean portable = argc == 2 && g_str_has_prefix(argv[1], "--test-portable-");
+    gboolean portable_status = portable && g_str_equal(argv[1], "--test-portable-status");
+    if (status_start || pending_start || silent_start || portable) {
         argc = 1;
         argv[1] = NULL;
     }
     g_test_init(&argc, &argv, NULL);
-    if (!status_start && !pending_start && !silent_start) {
-        char *modes[] = {"--test-status-start", "--test-pending-start", "--test-login-start"};
+    if (!status_start && !pending_start && !silent_start && !portable) {
+        char *modes[] = {"--test-status-start", "--test-pending-start", "--test-login-start",
+                         "--test-portable-status", "--test-portable-plan"};
         for (guint i = 0; i < G_N_ELEMENTS(modes); i++) {
             char *child[] = {argv[0], modes[i], NULL};
             int result;
@@ -356,13 +408,60 @@ int main(int argc, char **argv)
     expose(login, node, "/org/freedesktop/login1", "org.freedesktop.login1.Manager");
     expose(desktop, node, "/org/gnome/SessionManager", "org.gnome.SessionManager");
     expose(desktop, node, "/test/client", "org.gnome.SessionManager.ClientPrivate");
+    if (portable) {
+        g_autofree char *guid = g_dbus_generate_guid();
+        peer_server = g_dbus_server_new_sync("unix:tmpdir=/tmp", G_DBUS_SERVER_FLAGS_NONE, guid,
+                                             NULL, NULL, NULL);
+        g_assert_nonnull(peer_server);
+        g_signal_connect(peer_server, "new-connection", G_CALLBACK(accept_peer), node);
+        g_dbus_server_start(peer_server);
+    }
     ui.app = gtk_application_new(BIOS_APP, G_APPLICATION_NON_UNIQUE);
     g_assert_true(g_application_register(G_APPLICATION(ui.app), NULL, NULL));
     g_object_set(gtk_settings_get_default(), "gtk-font-name", "Sans 22", NULL);
     ui.login = silent_start;
-    ui.read_only = status_start || silent_start;
+    ui.portable = portable;
+    ui.read_only = status_start || silent_start || portable_status;
     if (pending_start) mock_state = "pending";
     activate(ui.app, NULL);
+    if (portable) {
+        click("状態を再確認");
+        while (g_main_context_iteration(NULL, FALSE)) {}
+        g_assert_null(ui.bus);
+        g_assert_null(ui.control);
+        g_assert_cmpuint(helper_starts, ==, 0);
+        g_assert_cmpuint(status_calls, ==, 0);
+        g_assert_cmpuint(checks_sent, ==, 0);
+        g_autofree char *model = dmi("product_name");
+        g_autofree char *version = dmi("bios_version");
+        g_autofree char *current = g_strconcat("現在の BIOS　", version, NULL);
+        g_assert_cmpstr(gtk_label_get_text(GTK_LABEL(ui.model)), ==, model);
+        g_assert_cmpstr(gtk_label_get_text(GTK_LABEL(ui.current)), ==, current);
+        if (portable_status) {
+            g_assert_null(action_button("更新情報を確認"));
+            g_assert_nonnull(action_button("通常モードで開き直す"));
+            action_clicked(NULL, "OpenPortable");
+            g_assert_false(ui.opening);
+            g_test_dbus_stop(sandbox);
+            return 0;
+        }
+        deny_helper = TRUE;
+        click("更新情報を確認");
+        action_clicked(NULL, "OpenPortable");
+        WAIT_FOR(!ui.opening);
+        g_assert_cmpuint(helper_starts, ==, 1);
+        g_assert_cmpuint(checks_sent, ==, 0);
+        g_assert_null(ui.control);
+        g_assert_cmpstr(gtk_label_get_text(GTK_LABEL(ui.current)), ==, current);
+        g_assert_nonnull(strstr(gtk_label_get_text(GTK_LABEL(ui.notice)), "管理者認証"));
+        deny_helper = FALSE;
+        click("更新情報を確認");
+        action_clicked(NULL, "OpenPortable");
+        WAIT_FOR(ui.control != NULL);
+        g_assert_cmpuint(helper_starts, ==, 2);
+        g_assert_true(ui.control != ui.bus);
+        g_assert_null(ui.owner);
+    }
     if (status_start || pending_start || silent_start) {
         WAIT_FOR(ui.fresh && !ui.busy && !ui.reading);
         g_assert_cmpuint(checks_sent, ==, 0);
@@ -379,7 +478,7 @@ int main(int argc, char **argv)
     g_assert_cmpuint(checks_sent, ==, 1);
     click("更新する");
     advance("review");
-    preview();
+    if (!portable) preview();
     g_assert_null(gtk_widget_get_ancestor(ui.actions, GTK_TYPE_SCROLLED_WINDOW));
     g_assert_null(gtk_widget_get_ancestor(ui.model, GTK_TYPE_SCROLLED_WINDOW));
     g_assert_nonnull(gtk_widget_get_ancestor(ui.page, GTK_TYPE_SCROLLED_WINDOW));
@@ -464,7 +563,8 @@ int main(int argc, char **argv)
     click("配布情報を再確認");
     WAIT_FOR(held_check != NULL);
     mock_state = "pending";
-    g_assert_true(g_dbus_connection_emit_signal(service, NULL, BIOS_PATH, BIOS_BUS, "Changed", NULL, NULL));
+    g_assert_true(g_dbus_connection_emit_signal(portable ? peer_service : service, NULL, BIOS_PATH,
+                                               BIOS_BUS, "Changed", NULL, NULL));
     WAIT_FOR(state("pending") && ui.busy);
     return_view(held_check, "available");
     g_clear_object(&held_check);
@@ -551,6 +651,19 @@ int main(int argc, char **argv)
     advance("hold");
     g_assert_null(find_button(ui.page, "メーカーの更新手順"));
     g_assert_null(find_button(ui.page, "メーカーの復旧手順"));
+    if (portable) {
+        /* A replacement helper must come from a new explicit click. */
+        g_assert_true(g_dbus_connection_close_sync(peer_service, NULL, NULL));
+        WAIT_FOR(!ui.control && !ui.fresh);
+        click("状態を再確認");
+        g_assert_cmpuint(helper_starts, ==, 2);
+        click("更新情報を確認");
+        advance("hold");
+        g_assert_cmpuint(helper_starts, ==, 3);
+        g_assert_cmpuint(installs, ==, 2);
+        g_test_dbus_stop(sandbox);
+        return 0;
+    }
     g_autoptr(GVariant) lost = g_dbus_connection_call_sync(service, "org.freedesktop.DBus",
         "/org/freedesktop/DBus", "org.freedesktop.DBus", "ReleaseName", g_variant_new("(s)", BIOS_BUS),
         G_VARIANT_TYPE("(u)"), G_DBUS_CALL_FLAGS_NONE, 1000, NULL, NULL);

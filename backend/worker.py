@@ -47,6 +47,13 @@ def main():
     if os.geteuid() == 0:
         raise RuntimeError("catalog worker requires an unprivileged account")
     request = json.load(sys.stdin)
+    if "profile" in request:
+        # The portable parent read and validated this snapshot as root. It
+        # checks the canonical file again before accepting the worker's result.
+        profile = request["profile"]
+        if not isinstance(profile, dict):
+            raise ValueError("invalid device profile")
+        fw.read_settings = lambda: profile
     mode = request["mode"]
     with ExitStack() as stack:
         files = [stack.enter_context(os.fdopen(f, "r+b")) for f in request["fds"]]

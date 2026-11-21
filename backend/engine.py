@@ -135,7 +135,11 @@ class Engine:
             else:
                 self.idle_view(v, actor, obs)
             if not actor.writable:
-                v["detail"] = (v["detail"] + "\n閲覧専用です。承認にはランチャーの「更新計画を開く」を使います。").strip()
+                hint = "閲覧専用です。承認にはランチャーの「更新計画を開く」を使います。"
+                if getattr(self.platform, "portable", False):
+                    hint = ("閲覧専用です。この画面をログイン中のデスクトップに直接対応付けられません。"
+                            "そのデスクトップの端末から同じ AppImage を開き直してください。")
+                v["detail"] = (v["detail"] + "\n" + hint).strip()
             history = self.db.history(obs["machine"], obs["boot"])
             v["history"] = "\n".join(filter(None, (history, obs["history"])))
             v["title"] = "電源オフ待ち" if v["state"] == "pending" and v["power"] == "shutdown" else TITLES[v["state"]]

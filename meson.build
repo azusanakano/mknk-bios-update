@@ -3,7 +3,7 @@ project('mknk-bios-update', 'c', version: '0.1.0', meson_version: '>=0.63',
 
 gtk = dependency('gtk4', version: '>=4.8')
 deps = [gtk, dependency('gio-unix-2.0'), dependency('json-glib-1.0')]
-executable('mknk-bios-update', 'src/main.c', 'src/session.c', dependencies: deps, install: true)
+executable('mknk-bios-update', 'src/main.c', 'src/session.c', 'src/portable.c', dependencies: deps, install: true)
 
 backend_dir = 'lib/mknk-bios-update'
 install_data('backend/catalog.py', 'backend/engine.py', 'backend/firmware_api.py', 'backend/hardware.py',
@@ -29,7 +29,9 @@ test('controller and firmware observations', python,
      args: ['-B', '-m', 'unittest', 'discover', '-s', meson.project_source_root() / 'tests'], timeout: 180)
 test('existing CLI', python, args: ['-B', '-m', 'unittest', 'discover', '-s',
      meson.project_source_root() / 'mknk-bios-update-design-and-sample'], timeout: 180)
-ui_tests = executable('ui-acceptance', 'tests/ui_acceptance.c', 'src/session.c', dependencies: deps)
+ui_tests = executable('ui-acceptance', 'tests/ui_acceptance.c', 'src/session.c', 'src/portable.c', dependencies: deps)
+transport_tests = executable('portable-ui-transport', 'tests/portable_ui_transport.c', dependencies: deps)
+test('portable sealed image and UNIX peer credentials', transport_tests, timeout: 30)
 xvfb = find_program('xvfb-run', required: false)
 if xvfb.found()
   test('GTK single-window flow on isolated D-Bus', xvfb, args: ['-a', ui_tests],

@@ -11,6 +11,6 @@ typedef void (*PowerNotice)(const char *message);
 
 /* Keep the registered client's connection alive until cancellation, session stop,
  * or loss of the manager. The completion callback runs on the GTK main context. */
-void session_request_power(GDBusConnection *system, const char *service_owner,
+void session_request_power(GDBusConnection *system, GDBusConnection *control, const char *service_owner,
                            const char *request, const char *desktop, const char *action,
                            PowerNotice notice, PowerDone done, gpointer data);
