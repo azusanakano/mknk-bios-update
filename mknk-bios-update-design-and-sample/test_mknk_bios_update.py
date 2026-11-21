@@ -1,6 +1,7 @@
 """Regression tests for the sample. No firmware, network or system bus access."""
 
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from email.message import Message
 import hashlib
 import importlib.util
 import io
@@ -15,7 +16,8 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
-from urllib.request import Request
+from urllib.response import addinfourl
+from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 import uuid
 import xml.etree.ElementTree as ET
 
@@ -150,9 +152,11 @@ class StableCatalogTest(unittest.TestCase):
       <checksum type="sha256">aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</checksum>
       </artifact></artifacts></release></releases></component></components>'''
 
-    def exercise_check(self, release, *, xml=None, metadata_result=None, expected_hold=None,
-                       host_ids=None, policy=(None, frozenset())):
-        remote = {"Id": "lvfs", "MetadataUri": self.metadata_uri, "MetadataUriSig": self.signature_uri}
+    def exercise_check(self, release, *, xml=None, metadata_result=None, expected_hold=None, expected_output=None,
+                       host_ids=None, policy=(None, frozenset()), approval_required=False, daemon_version="2.0.20"):
+        remote = {"Id": "lvfs", "MetadataUri": self.metadata_uri, "MetadataUriSig": self.signature_uri,
+                  "ApprovalRequired": False}
+        active_remote = dict(remote, ApprovalRequired=approval_required)
         signed = lzma.compress(self.signed_xml if xml is None else xml)
         signature = b"signature fixture"
         bodies = {self.signature_uri: signature, self.metadata_uri: signed}
@@ -176,7 +180,7 @@ class StableCatalogTest(unittest.TestCase):
                 raise FwupdError(metadata_result)
             return True
 
-        client = SimpleNamespace(update_metadata_bytes=update)
+        client = SimpleNamespace(update_metadata_bytes=update, get_daemon_version=lambda: daemon_version)
         fwupd = SimpleNamespace(Client=SimpleNamespace(new=lambda: client),
                                 Error=SimpleNamespace(NOTHING_TO_DO=19))
         glib = SimpleNamespace(Bytes=SimpleNamespace(new=bytes), Error=FwupdError)
@@ -189,15 +193,15 @@ class StableCatalogTest(unittest.TestCase):
               patch.object(updater, "DMI", Path(tmp)),
               patch.object(updater, "ESRT", Path(tmp)),
               patch.object(updater, "read_settings", return_value={}),
-              patch.object(updater, "stable_remote", return_value=remote),
+              patch.object(updater, "stable_remote", side_effect=[remote, remote, active_remote]),
               patch.object(updater, "command", return_value=json.dumps(host_ids)) as command,
-              patch.object(updater, "admin_checksums", return_value=policy),
+              patch.object(updater, "admin_checksums", return_value=policy) as admin,
               patch.object(updater, "inventory", return_value=(self.guid, self.bios, [self.bios])),
               patch.object(updater, "fwupd_query", return_value=[release] if release else []),
               patch.object(updater, "build_opener", return_value=SimpleNamespace(open=get))):
             if expected_hold is None:
                 updater.main()
-                self.assertIn("更新候補  " if release else "更新候補を取得できませんでした", output.getvalue())
+                self.assertIn(expected_output or "更新候補  ", output.getvalue())
             else:
                 with self.assertRaisesRegex(updater.Hold, expected_hold):
                     updater.main()
@@ -206,6 +210,8 @@ class StableCatalogTest(unittest.TestCase):
             command.assert_not_called()
         else:
             command.assert_called_once_with(["hwids"])
+        if approval_required:
+            admin.assert_called_once_with(active_remote)
         self.assertCountEqual(requests, [self.signature_uri, self.metadata_uri])
         self.assertEqual(daemon_calls, [("lvfs", signed, signature)])
 
@@ -224,6 +230,40 @@ class StableCatalogTest(unittest.TestCase):
 
     def test_daemon_accepts_verified_signature_with_same_timestamp(self):
         self.exercise_check(self.published, metadata_result=19)
+
+    def catalog_with_requirements(self, requirements):
+        root = ET.fromstring(self.signed_xml)
+        root.find("component").append(ET.fromstring(requirements))
+        return ET.tostring(root)
+
+    def test_checks_the_signed_current_bios_requirement_even_with_the_same_cab(self):
+        for compare, version, expected_hold in (("lt", "1.0", "必須条件"), ("lt", "1.1", None),
+                                                ("eq", "1.0", None), ("ne", "1.0", "必須条件")):
+            with self.subTest(compare=compare, version=version):
+                xml = self.catalog_with_requirements(
+                    f'<requires><firmware compare="{compare}" version="{version}"/></requires>')
+                self.exercise_check(self.published, xml=xml, metadata_result=19, expected_hold=expected_hold)
+
+    def test_selected_candidate_is_held_when_a_signed_requirement_is_unknown(self):
+        xml = self.catalog_with_requirements("<requires><phased_update>4</phased_update></requires>")
+        self.exercise_check(self.published, xml=xml, metadata_result=19, expected_hold="必須条件")
+
+    def test_fwupd_minimum_version_is_verified_for_a_selected_candidate(self):
+        xml = self.catalog_with_requirements(
+            '<requires><id compare="ge" version="2.0.20">org.freedesktop.fwupd</id></requires>')
+        self.exercise_check(self.published, xml=xml, metadata_result=19)
+        self.exercise_check(self.published, xml=xml, metadata_result=19,
+                            daemon_version="2.0.19", expected_hold="必須条件")
+        self.exercise_check(self.published, xml=xml, metadata_result=19,
+                            daemon_version=None, expected_hold="必須条件")
+
+    def test_selected_candidate_uses_the_current_remote_approval_policy(self):
+        self.exercise_check(self.published, approval_required=True, policy=(set(), set()),
+                            expected_hold="承認一覧")
+        self.exercise_check(self.published, approval_required=True, policy=({"a" * 64}, set()))
+
+    def test_selected_candidate_is_checked_for_an_explicit_block_without_competitors(self):
+        self.exercise_check(self.published, policy=(None, {"a" * 64}), expected_hold="明示ブロック")
 
     def catalog_with_competitor(self, version, *, requirements=None):
         root = ET.fromstring(self.signed_xml)
@@ -249,7 +289,15 @@ class StableCatalogTest(unittest.TestCase):
         self.exercise_check(None, expected_hold="上位版")
 
     def test_only_installed_version_in_catalog_means_no_update(self):
-        self.exercise_check(None, xml=self.signed_xml.replace(b'version="131072"', b'version="65536"'))
+        self.exercise_check(None, xml=self.signed_xml.replace(b'version="131072"', b'version="65536"'),
+                            expected_output="このBIOSで利用できる新版はありません")
+
+    def test_check_reports_a_missing_model_separately_from_a_missing_update(self):
+        self.exercise_check(None, xml=b"<components/>", expected_output="この機種の掲載を確認できません")
+        xml = self.catalog_with_requirements(
+            "<requires><hardware>33333333-3333-3333-3333-333333333333</hardware></requires>")
+        self.exercise_check(None, xml=xml, expected_output="この機種の掲載を確認できません",
+                            host_ids={"Manufacturer&Family": "44444444-4444-4444-4444-444444444444"})
 
     def test_policy_excludes_only_a_cab_with_a_matching_signed_container_hash(self):
         xml = self.catalog_with_competitor("196608")
@@ -270,6 +318,12 @@ class StableCatalogTest(unittest.TestCase):
         self.exercise_check(self.published, xml=xml)
         self.exercise_check(self.published, xml=self.catalog_with_competitor("65536"))
 
+    def test_current_version_can_exclude_a_competitor_when_its_hardware_ids_are_unavailable(self):
+        xml = self.catalog_with_competitor("196608", requirements=(
+            '<requires><hardware>33333333-3333-3333-3333-333333333333</hardware>'
+            '<firmware compare="ge" version="2.0"/></requires>'))
+        self.exercise_check(self.published, xml=xml, host_ids={})
+
     def test_number_format_uses_the_numeric_value_of_hex_encoded_releases(self):
         first = self.signed_xml.replace(b'version="131072"', b'version="2"')
         root = ET.fromstring(first)
@@ -283,43 +337,104 @@ class StableCatalogTest(unittest.TestCase):
         with patch.object(self, "bios", bios):
             self.exercise_check(release, xml=ET.tostring(root), expected_hold="上位版")
 
-    def test_apply_rechecks_the_signed_catalog_after_approval(self):
-        initial = ET.fromstring(self.signed_xml)
-        competing = ET.fromstring(self.catalog_with_competitor("196608"))
+    def exercise_apply(self, latest_xml, *, expected_error=None, secure_boot_after=b"\x01"):
         verify_path = "/proc/self/fd/23"
-        for latest, expected_error in ((initial, None), (competing, "上位版")):
-            with self.subTest(conflict=expected_error is not None), TemporaryDirectory() as tmp:
-                esp = (Path(tmp), self.guid)
-                remote = {"Id": "lvfs"}
-                cabinet = SimpleNamespace(fileno=lambda: 23)
-                catalog = Mock(side_effect=[list(initial), list(latest)])
-                ready = Mock(return_value=esp)
-                verify = Mock(return_value="FMP画像1件")
-                send = Mock()
-                with (redirect_stdout(io.StringIO()),
-                      patch.object(sys, "argv", [SCRIPT.name, "--apply"]),
-                      patch.object(sys.stdin, "isatty", return_value=True),
-                      patch.object(sys.stdout, "isatty", return_value=True),
-                      patch.multiple(updater, ESRT=Path(tmp), DMI=Path(tmp), require_fwupdmgr=Mock(),
-                                     read_settings=Mock(return_value={}), support_profile=Mock(return_value={}),
-                                     inventory=Mock(return_value=(self.guid, self.bios, [self.bios])),
-                                     stable_remote=Mock(return_value=remote), rows=Mock(return_value=[]),
-                                     admin_checksums=Mock(return_value=(None, set())), load_stable_catalog=catalog,
-                                     candidate=Mock(return_value=self.published),
-                                     marker_path=Mock(return_value=Path(tmp) / "marker"), check_ready=ready,
-                                     open_cabinet=Mock(return_value=nullcontext(cabinet)),
-                                     fetch_cab=Mock(return_value=verify_path), verify_cab=verify, send_once=send),
-                      patch("builtins.input", return_value="yes")):
-                    if expected_error:
-                        with self.assertRaisesRegex(updater.Hold, expected_error):
-                            updater.main()
-                        send.assert_not_called()
-                    else:
+        with TemporaryDirectory() as tmp:
+            esp = Path(tmp) / "esp"
+            esp.mkdir()
+            variables = Path(tmp) / "efivars"
+            variables.mkdir()
+            secure_boot = variables / f"SecureBoot-{updater.EFI_GLOBAL}"
+            secure_boot.write_bytes(struct.pack("<I", 7) + b"\x01")
+            (variables / f"OsIndicationsSupported-{updater.EFI_GLOBAL}").write_bytes(struct.pack("<IQ", 7, 4))
+            bios = dict(self.bios, Flags=["updatable"])
+            profile = {"secure_boot": {"delivery": "capsule-on-disk"}}
+            cabinet = SimpleNamespace(fileno=lambda: 23)
+            catalog = Mock(side_effect=[(list(ET.fromstring(xml)), "2.0.20")
+                                        for xml in (self.signed_xml, latest_xml)])
+            verify = Mock(return_value="FMP画像1件")
+            send = Mock()
+            marker = Path(tmp) / "marker"
+
+            def approve(_prompt):
+                if secure_boot_after is None:
+                    secure_boot.unlink()
+                else:
+                    secure_boot.write_bytes(struct.pack("<I", 7) + secure_boot_after)
+                return "yes"
+
+            with (redirect_stdout(io.StringIO()),
+                  patch.object(sys, "argv", [SCRIPT.name, "--apply"]),
+                  patch.object(sys.stdin, "isatty", return_value=True),
+                  patch.object(sys.stdout, "isatty", return_value=True),
+                  patch.multiple(updater, ESRT=Path(tmp), DMI=Path(tmp), EFIVARS=variables, require_fwupdmgr=Mock(),
+                                 read_settings=Mock(return_value=profile), support_profile=Mock(return_value=profile),
+                                 inventory=Mock(return_value=(self.guid, bios, [bios])),
+                                 stable_remote=Mock(return_value={"Id": "lvfs"}), rows=Mock(return_value=[]),
+                                 admin_checksums=Mock(return_value=(None, set())), load_stable_catalog=catalog,
+                                 candidate=Mock(return_value=self.published), marker_path=Mock(return_value=marker),
+                                 mount_points=Mock(return_value={str(variables): ("0:1", "/", "efivarfs")}),
+                                 find_esp=Mock(return_value=(esp, self.guid)), check_power=Mock(),
+                                 open_cabinet=Mock(return_value=nullcontext(cabinet)),
+                                 fetch_cab=Mock(return_value=verify_path), verify_cab=verify, send_once=send),
+                  patch("builtins.input", side_effect=approve)):
+                if expected_error:
+                    with self.assertRaisesRegex(updater.Hold, expected_error):
                         updater.main()
-                        self.assertEqual(ready.call_count, 2)
-                        self.assertEqual([call.args[0] for call in verify.call_args_list], [verify_path, verify_path])
-                        send.assert_called_once_with(Path(tmp) / "marker", self.bios, self.published, 23)
-                    self.assertEqual(catalog.call_count, 2)
+                    send.assert_not_called()
+                else:
+                    updater.main()
+                    self.assertEqual([call.args[0] for call in verify.call_args_list], [verify_path, verify_path])
+                    send.assert_called_once_with(marker, bios, self.published, 23)
+                self.assertEqual(catalog.call_count, 2)
+
+    def test_apply_rechecks_the_signed_catalog_after_approval(self):
+        self.exercise_apply(self.signed_xml)
+        self.exercise_apply(self.catalog_with_competitor("196608"), expected_error="上位版")
+        xml = self.catalog_with_requirements('<requires><firmware compare="lt" version="1.0"/></requires>')
+        self.exercise_apply(xml, expected_error="必須条件")
+
+    def test_apply_holds_when_secure_boot_disappears_or_changes_after_approval(self):
+        for state in (None, b"\x00"):
+            with self.subTest(secure_boot=state):
+                self.exercise_apply(self.signed_xml, secure_boot_after=state, expected_error="Secure[ ]?Boot")
+
+
+class CatalogSizeTest(unittest.TestCase):
+    def release(self, *, size="", artifact_size="", other=""):
+        return ET.fromstring(f"""<release>{size}<artifacts><artifact type="binary">
+          <filename>bios.cab</filename><checksum type="sha256">{"a" * 64}</checksum>{artifact_size}
+          </artifact>{other}</artifacts></release>""")
+
+    def test_signed_download_size_can_be_stored_at_either_level(self):
+        size = '<size type="download">17</size>'
+        for release in (self.release(size=size), self.release(artifact_size=size),
+                        self.release(size=size, artifact_size=size)):
+            with self.subTest(xml=ET.tostring(release)):
+                self.assertEqual(updater.catalog_download_size(release), 17)
+
+    def test_signed_download_sizes_must_agree(self):
+        release = self.release(size='<size type="download">17</size>',
+                               artifact_size='<size type="download">23</size>')
+        with self.assertRaisesRegex(updater.Hold, "受信サイズ"):
+            updater.catalog_download_size(release)
+
+    def test_release_size_for_multiple_binary_artifacts_is_ambiguous(self):
+        release = self.release(size='<size type="download">17</size>',
+                               other='<artifact type="binary"><filename>another.cab</filename></artifact>')
+        with self.assertRaisesRegex(updater.Hold, "受信サイズ"):
+            updater.catalog_download_size(release)
+
+    def test_release_size_requires_the_legacy_reference_to_match_the_binary_artifact(self):
+        size = '<size type="download">17</size>'
+        for filename, digest in (("other.cab", "a" * 64), ("bios.cab", "b" * 64)):
+            with self.subTest(filename=filename, digest=digest):
+                release = self.release(size=size + (
+                    f'<checksum target="container" filename="{filename}" type="sha256">{digest}</checksum>'))
+                with self.assertRaisesRegex(updater.Hold, "受信サイズ"):
+                    updater.catalog_download_size(release)
+        legacy = ET.fromstring(f"<release>{size}</release>")
+        self.assertEqual(updater.catalog_download_size(legacy), 17)
 
 
 class BootEntryTest(unittest.TestCase):
@@ -400,19 +515,40 @@ class ReservationStatusTest(unittest.TestCase):
                 with self.subTest(state=state):
                     entry.write_bytes(self.fwupd_variable(state, guid, include_device_path=False))
                     with self.assertRaisesRegex(updater.Hold, "デバイスパス"):
-                        updater.nvram_reservations()
+                        updater.fwupd_efi_state()
 
     def test_cleared_registration_with_valid_device_path_is_not_pending(self):
         guid = CapsuleScopeTest.guid
         with TemporaryDirectory() as tmp, patch.object(updater, "EFIVARS", Path(tmp)):
             entry = Path(tmp) / f"fwupd-{guid}-0-{updater.FWUPDATE_GUID}"
             entry.write_bytes(self.fwupd_variable(0, guid))
-            self.assertEqual(updater.nvram_reservations(), [])
+            self.assertEqual(updater.fwupd_efi_state(), ([], False))
+
+    def test_status_counts_the_reservation_when_a_bootloader_capability_is_present(self):
+        guid = CapsuleScopeTest.guid
+        with TemporaryDirectory() as tmp, patch.object(updater, "EFIVARS", Path(tmp)):
+            variables = Path(tmp)
+            flag = variables / f"BootloaderSupportsFwupd-{updater.FWUPDATE_GUID}"
+            (variables / f"fwupd-{guid}-0-{updater.FWUPDATE_GUID}").write_bytes(self.fwupd_variable(1, guid))
+            for capability in (0, 1):
+                with self.subTest(capability=capability), redirect_stdout(io.StringIO()) as output:
+                    flag.write_bytes(struct.pack("<IB", 7, capability))
+                    updater.show_efi_variables(str(guid))
+                    self.assertIn("実行待ち登録1件（BIOS対象1件）", output.getvalue())
+
+    def test_malformed_bootloader_capability_is_held(self):
+        with TemporaryDirectory() as tmp, patch.object(updater, "EFIVARS", Path(tmp)):
+            flag = Path(tmp) / f"BootloaderSupportsFwupd-{updater.FWUPDATE_GUID}"
+            for payload in (b"", b"\x02", b"\x01\x00"):
+                with self.subTest(payload=payload):
+                    flag.write_bytes(struct.pack("<I", 7) + payload)
+                    with self.assertRaisesRegex(updater.Hold, "BootloaderSupportsFwupd"):
+                        updater.fwupd_efi_state()
 
     def test_status_prints_delivery_bit_even_when_esp_cannot_be_resolved(self):
         with (patch.object(updater, "mount_points", return_value={}),
               patch.object(updater, "require_efivarfs"),
-              patch.object(updater, "nvram_reservations", return_value=[]),
+              patch.object(updater, "fwupd_efi_state", return_value=([], False)),
               patch.object(updater, "boot_next", return_value=None),
               patch.object(updater, "find_esp", side_effect=updater.Hold("ESP is ambiguous")),
               patch.object(updater, "disk_delivery_requested", return_value=True),
@@ -564,6 +700,31 @@ class ReadinessTest(unittest.TestCase):
             (variables / f"OsIndicationsSupported-{updater.EFI_GLOBAL}").write_bytes(struct.pack("<IQ", 7, 4))
             self.assertEqual(self.check_secure_boot_readiness(base, profile)[0], base / "esp")
 
+    def test_readiness_requires_a_confirmed_secure_boot_state(self):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            variables = base / "efivars"
+            variables.mkdir()
+            with self.assertRaisesRegex(updater.Hold, "Secure Boot"):
+                self.check_secure_boot_readiness(base, {})
+            (variables / f"SecureBoot-{updater.EFI_GLOBAL}").write_bytes(struct.pack("<IB", 7, 0))
+            self.assertEqual(self.check_secure_boot_readiness(base, {})[0], base / "esp")
+
+    def test_bootloader_capability_requires_a_verified_delivery_route(self):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            variables = base / "efivars"
+            variables.mkdir()
+            (variables / f"SecureBoot-{updater.EFI_GLOBAL}").write_bytes(struct.pack("<IB", 7, 0))
+            (variables / f"BootloaderSupportsFwupd-{updater.FWUPDATE_GUID}").write_bytes(struct.pack("<IB", 7, 1))
+            with self.assertRaisesRegex(updater.Hold, "配送方式"):
+                self.check_secure_boot_readiness(base, {})
+            profile = {"secure_boot": {"delivery": "capsule-on-disk"}}
+            with self.assertRaisesRegex(updater.Hold, "OsIndicationsSupported"):
+                self.check_secure_boot_readiness(base, profile)
+            (variables / f"OsIndicationsSupported-{updater.EFI_GLOBAL}").write_bytes(struct.pack("<IQ", 7, 4))
+            self.assertEqual(self.check_secure_boot_readiness(base, profile)[0], base / "esp")
+
     def test_dell_recovery_file_blocks_preparation_without_delivery_bit(self):
         bios = {"DeviceId": "b" * 40, "Flags": ["updatable"]}
         with TemporaryDirectory() as tmp:
@@ -574,7 +735,7 @@ class ReadinessTest(unittest.TestCase):
             with (patch.object(updater, "mount_points", return_value={}),
                   patch.object(updater, "require_efivarfs"),
                   patch.object(updater, "find_esp", return_value=(esp, str(BootEntryTest.esp))),
-                  patch.object(updater, "nvram_reservations", return_value=[]),
+                  patch.object(updater, "fwupd_efi_state", return_value=([], False)),
                   patch.object(updater, "boot_next", return_value=None),
                   patch.object(updater, "check_boot_entries"),
                   patch.object(updater, "disk_delivery_requested", return_value=False),
@@ -735,6 +896,62 @@ class CabDestinationTest(unittest.TestCase):
                 with self.assertRaisesRegex(updater.Hold, expected_error):
                     updater.fetch_cab(release, remote, cab, {}, download_size=8)
                 self.assertLessEqual(len(cab.getvalue()), 8)
+
+    def test_redirect_closes_the_intermediate_response_without_reading_its_body(self):
+        origin = "https://cdn.fwupd.org/downloads/"
+        initial, final = origin + "initial.cab", origin + "final.cab"
+        supported_statuses = (301, 302, 303, 307, 308)
+        for code in supported_statuses:
+            with self.subTest(code=code):
+                body = io.BytesIO(b"payload outside the CAB transfer")
+                requests = []
+
+                class FixtureHttps(HTTPSHandler):
+                    def https_open(self, request):
+                        requests.append(request.full_url)
+                        headers = Message()
+                        if request.full_url == initial:
+                            headers["Location"] = "/downloads/final.cab"
+                            response = addinfourl(body, headers, initial, code)
+                        else:
+                            response = addinfourl(io.BytesIO(b"test CAB"), headers, final, 200)
+                        response.msg = "test response"
+                        return response
+
+                opener = build_opener(ProxyHandler({}), FixtureHttps(),
+                                      updater.CabRedirectHandler(updater.cab_bases({})))
+                with patch.object(body, "read", wraps=body.read) as read:
+                    with opener.open(Request(initial), timeout=60) as response:
+                        self.assertEqual(response.read(), b"test CAB")
+                    self.assertTrue(body.closed)
+                    read.assert_not_called()
+                self.assertEqual(requests, [initial, final])
+
+    def test_retry_cannot_use_bytes_already_budgeted_for_a_failed_location(self):
+        class Interrupted(io.BytesIO):
+            def read(self, size):
+                if self.tell():
+                    raise ConnectionResetError("test interruption")
+                return super().read(size)
+
+        mib = 1024 * 1024
+        base = "https://cdn.fwupd.org/downloads/"
+        remote = {"MetadataUri": base + "firmware.xml.zst"}
+        for data in (b"12345678", b"123456789"):
+            with (self.subTest(size=len(data)), io.BytesIO() as cab,
+                  patch.object(updater, "CAB_DOWNLOAD_LIMIT", 2 * mib + 8),
+                  patch.object(updater, "build_opener") as build,
+                  patch.object(updater, "seal_cabinet", return_value="sealed fixture") as seal):
+                build.return_value.open.side_effect = [Interrupted(b"?" * mib), io.BytesIO(data)]
+                release = {"Locations": [base + "first.cab", base + "second.cab"],
+                           "Checksum": [hashlib.sha256(data).hexdigest()]}
+                if len(data) == 8:
+                    self.assertEqual(updater.fetch_cab(release, remote, cab, {}), "sealed fixture")
+                    self.assertEqual(cab.getvalue(), data)
+                else:
+                    with self.assertRaisesRegex(updater.Hold, "上限"):
+                        updater.fetch_cab(release, remote, cab, {})
+                    seal.assert_not_called()
 
 
 class CabinetHandoffTest(unittest.TestCase):

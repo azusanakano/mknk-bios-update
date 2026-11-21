@@ -15,12 +15,14 @@
 
 import argparse
 import ctypes
+from functools import cache, reduce
 import gzip
 import hashlib
 from http.client import HTTPException
 import io
 import json
 import lzma
+import operator
 import os
 import re
 import stat
@@ -57,6 +59,11 @@ BDP_TYPE = "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7"
 UDISKS = "org.freedesktop.UDisks2"
 FMP_CAPSULE = uuid.UUID("6dcbd5ed-e82d-4c44-bda1-7194199ad92a").bytes_le
 PROTOCOL = "org.uefi.capsule"
+FWUPD_ID = "org.freedesktop.fwupd"
+CLIENT_FEATURES = ("requests", "requests-non-generic", "detach-action", "update-action",
+                   "allow-authentication", "fde-warning", "show-problems")
+VERSION_COMPARISONS = {"eq": operator.eq, "ne": operator.ne, "lt": operator.lt,
+                       "gt": operator.gt, "le": operator.le, "ge": operator.ge}
 REMOTE = "lvfs"
 LVFS_METADATA_URIS = frozenset({"https://cdn.fwupd.org/downloads/firmware.xml.xz",
                                "https://cdn.fwupd.org/downloads/firmware.xml.zst"})
@@ -268,10 +275,8 @@ def fwupd_bindings():
 def fwupd_query(operation, argument):
     Fwupd, GLib = fwupd_bindings()
     # 適用時に対話モードの fwupdmgr local-install が処理する操作を、照会接続にも伝える。
-    feature = Fwupd.FeatureFlags
-    flags = (feature.REQUESTS | feature.REQUESTS_NON_GENERIC | feature.DETACH_ACTION
-             | feature.UPDATE_ACTION | feature.ALLOW_AUTHENTICATION | feature.FDE_WARNING
-             | feature.SHOW_PROBLEMS)
+    flags = reduce(operator.or_, (getattr(Fwupd.FeatureFlags, name.upper().replace("-", "_"))
+                                  for name in CLIENT_FEATURES))
     client = Fwupd.Client.new()
     try:
         if not client.set_feature_flags(flags, None):
@@ -361,6 +366,7 @@ def verify_catalog_signature(metadata, signature):
         # 索引が同じカタログに由来するとは仮定せず、候補を検証済みXMLに照合する。
         if not (exc.domain == "FwupdError" and exc.code == Fwupd.Error.NOTHING_TO_DO):
             raise Hold("fwupdで安定版カタログの署名を確認できません。 " + visible(exc.message)) from exc
+    return client.get_daemon_version()
 
 
 def catalog_blocks(content):
@@ -415,10 +421,10 @@ def load_stable_catalog(remote, settings, guid, device):
     signature = download_catalog_file(opener, signature_uri, METADATA_SIG_LIMIT)
     metadata = download_catalog_file(opener, uri, METADATA_LIMIT)
     compare_remote(remote, stable_remote(settings))
-    verify_catalog_signature(metadata, signature)
+    daemon_version = verify_catalog_signature(metadata, signature)
     guids = {value.lower() for value in strings(device, "Guid")}
     guids.add(guid)
-    return read_catalog_components(metadata, guids)
+    return read_catalog_components(metadata, guids), daemon_version
 
 
 def catalog_cab_artifact(release):
@@ -459,65 +465,109 @@ def catalog_version_key(raw, fmt):
 def host_hardware_ids():
     try:
         ids = json.loads(command(["hwids"]))
-    except (Error, OSError, ValueError) as exc:
-        raise Hold("fwupdのハードウェアIDを確認できません。") from exc
+    except (Error, OSError, ValueError):
+        return None
     if not isinstance(ids, dict) or not all(isinstance(value, str) for value in ids.values()):
-        raise Hold("fwupdのハードウェアIDを確認できません。")
+        return None
     # fwupdmgrはSMBIOSの属性値と、属性の組から得たCHIDを同じオブジェクトで返す。
     hardware_ids = {value for value in ids.values() if GUID_TEXT.fullmatch(value)}
-    if not hardware_ids:
-        raise Hold("fwupdから実機のハードウェアIDを取得できません。")
-    return hardware_ids
+    return hardware_ids or None
 
 
-def catalog_hardware_groups(component):
-    for node in component.findall("requires/hardware"):
+def catalog_hardware_matches(requirements, hardware_ids, *, emulated):
+    matches = True
+    for node in requirements:
+        if node.tag == "not_hardware":
+            matches = None
+        if node.tag != "hardware":
+            continue
         alternatives = (node.text or "").strip().split("|")
-        if all(GUID_TEXT.fullmatch(value) for value in alternatives):
-            yield set(alternatives)
+        if node.attrib or len(node) or not all(GUID_TEXT.fullmatch(value) for value in alternatives):
+            matches = None
+            continue
+        if emulated:
+            continue
+        ids = hardware_ids()
+        if ids is None:
+            matches = None
+        elif set(alternatives).isdisjoint(ids):
+            return False
+    return matches
 
 
-def catalog_minimum_version(component, fmt):
-    # 対象BIOS自身に対する最低版だけをここで評価する。
-    minimum = []
-    for node in component.findall("requires/firmware[@compare='ge']"):
-        version = node.get("version", "")
-        if (not node.text and "depth" not in node.attrib
-                and re.fullmatch(r"[0-9]+(?:\.[0-9]+)*|0x[0-9a-fA-F]+", version)):
-            minimum.append(version_key(version, fmt))
-    return max(minimum, default=None)
+def catalog_requirement_matches(node, device, daemon_version):
+    """評価できない必須条件には None を返す。"""
+    if len(node):
+        return None
+    text = (node.text or "").strip()
+    if node.tag == "client" and not node.attrib:
+        return True if set(text.split("|")).issubset(CLIENT_FEATURES) else None
+    if node.tag == "firmware" and not text:
+        actual, fmt = device["Version"], device.get("VersionFormat")
+    elif node.tag == "id" and text == FWUPD_ID:
+        actual, fmt = daemon_version, None
+    else:
+        return None
+    compare = VERSION_COMPARISONS.get(node.get("compare"))
+    required = node.get("version", "")
+    version_pattern = (r"[A-Za-z0-9][A-Za-z0-9._+~-]{0,127}" if fmt == "plain"
+                       else r"(?:[0-9]{1,18}(?:\.[0-9]{1,18})*|0x[0-9a-fA-F]{1,8})")
+    if (compare is None or set(node.attrib) != {"compare", "version"}
+            or not actual or len(required) > 128 or not re.fullmatch(version_pattern, required)):
+        return None
+    return compare(version_key(actual, fmt), version_key(required, fmt))
 
 
 def catalog_download_size(entry):
     artifact = catalog_cab_artifact(entry)
-    source = artifact if artifact is not None and artifact.findall("checksum") else entry
-    values = {(node.text or "").strip() for node in source.findall("size[@type='download']")}
-    if not values:
+    size_path = "size[@type='download']"
+    release_sizes = entry.findall(size_path)
+    artifact_sizes = artifact.findall(size_path) if artifact is not None else []
+    if not release_sizes and not artifact_sizes:
         return None
+    size_error = "署名済みカタログのCABに受信サイズを一意に対応付けられません。"
+    binaries = entry.findall("artifacts/artifact[@type='binary']")
+    artifact_checksums = artifact.findall("checksum") if artifact is not None else []
+    if ((release_sizes and binaries and (len(binaries) > 1 or artifact is None))
+            or (artifact_sizes and len(binaries) > 1 and not artifact_checksums)):
+        raise Hold(size_error)
+    if artifact is not None and (release_sizes or not artifact_checksums):
+        # 階層をまたいで使う場合は、旧形式のCAB参照がbinary artifactと矛盾しないことを確認する。
+        name = artifact.findtext("filename")
+        hashes = catalog_hashes(entry)
+        for node in entry.findall("checksum[@target='container']"):
+            other_name = node.get("filename")
+            digest = (node.text or "").strip().lower()
+            if ((name and other_name and other_name != name)
+                    or any(len(digest) == len(value) and digest != value for value in hashes)):
+                raise Hold(size_error)
+    values = {(node.text or "").strip() for node in release_sizes + artifact_sizes}
     value = values.pop()
     if values or not re.fullmatch(r"[1-9][0-9]{0,18}", value):
         raise Hold("署名済みカタログのCAB受信サイズを確認できません。")
     return int(value)
 
 
-def require_catalog_release(components, device, guid, release, remote, *, policy=None):
+def require_catalog_release(components, device, guid, release, remote, *, daemon_version):
     fmt = device.get("VersionFormat")
     branch = device.get("Branch") or "default"
     current = version_key(device["Version"], fmt)
     target = version_key(release["Version"], fmt) if release else current
     digest = strong_hash(release)[1] if release else None
-    hardware_ids = None
+    hardware_ids = cache(host_hardware_ids)
+    emulated = "emulated" in strings(device, "Flags")
     matched_hashes = set()
     sizes = set()
+    policy = None
+    model_listed = False
+    uncertain_listing = False
     for component in components:
         if (component.findtext("branch") or "default") != branch:
             continue
-        minimum = catalog_minimum_version(component, fmt)
-        if minimum is not None and current < minimum:
-            continue
-        groups = list(catalog_hardware_groups(component))
+        component_requirements = component.findall("requires/*")
         app_id = component.findtext("id")
         esrt_matches = guid in component_guids(component)
+        check_listing = not release and esrt_matches
         for entry in component.findall("releases/release"):
             raw = entry.get("version")
             hashes = catalog_hashes(entry)
@@ -527,14 +577,27 @@ def require_catalog_release(components, device, guid, release, remote, *, policy
                 version = catalog_version_key(raw, fmt)
             except Hold:
                 version = None
-            if not match and version is not None and (version < target or (not release and version == current)):
+            can_compete = version is None or (version >= target if release else version > current)
+            if not (match or can_compete or check_listing):
                 continue
-            if groups and "emulated" not in strings(device, "Flags"):
-                if hardware_ids is None:
-                    hardware_ids = host_hardware_ids()
-                if any(group.isdisjoint(hardware_ids) for group in groups):
-                    continue
+            requirements = component_requirements + entry.findall("requires/*")
+            hardware_matches = catalog_hardware_matches(requirements, hardware_ids, emulated=emulated)
+            if hardware_matches is False:
+                continue
+            if check_listing:
+                model_listed |= hardware_matches is True
+                uncertain_listing |= hardware_matches is None
+            if not (match or can_compete):
+                continue
+            matches = [catalog_requirement_matches(node, device, daemon_version)
+                       for node in requirements if node.tag not in ("hardware", "not_hardware")]
+            if False in matches:
+                if match:
+                    raise Hold("このBIOSは署名済みカタログにある更新候補の必須条件を満たしません。")
+                continue
             if match:
+                if hardware_matches is None or None in matches:
+                    raise Hold("署名済みカタログにある更新候補の必須条件を確認できません。")
                 matched_hashes.update(hashes)
                 size = catalog_download_size(entry)
                 if size is not None:
@@ -554,11 +617,14 @@ def require_catalog_release(components, device, guid, release, remote, *, policy
     if release:
         if not matched_hashes:
             raise Hold("このBIOS更新候補の版とCABハッシュを、署名済みのLVFS安定版カタログで確認できません。")
-        if policy is not None:
-            check_admin_policy(matched_hashes, policy)
+        if policy is None:
+            policy = admin_checksums(remote)
+        check_admin_policy(matched_hashes, policy)
+    elif not model_listed and uncertain_listing:
+        raise Hold("署名済みカタログにある機種の必須条件を確認できません。")
     if len(sizes) > 1:
         raise Hold("署名済みカタログで同じCABの受信サイズが一致しません。")
-    return next(iter(sizes), None)
+    return next(iter(sizes), None), model_listed
 
 
 def check_admin_policy(hashes, policy):
@@ -796,12 +862,16 @@ def efi_asset_sha256(path, *, esp=None):
         raise Hold("ESPのshimのハッシュを確認できません。")
 
 
-def check_secure_boot_assets(esp, profile):
-    secure_boot = efi_variable_payload("SecureBoot", EFI_GLOBAL, size=1)
-    if secure_boot in (None, b"\x00"):
-        return
-    if secure_boot != b"\x01":
+def check_boot_delivery(esp, profile, *, bootloader_supports_fwupd):
+    try:
+        secure_boot = efi_variable_payload("SecureBoot", EFI_GLOBAL, size=1)
+    except OSError as exc:
+        raise Hold("Secure Bootの有効状態を確認できません。") from exc
+    if secure_boot not in (b"\x00", b"\x01"):
         raise Hold("Secure Bootの有効状態を確認できません。")
+    enabled = secure_boot == b"\x01"
+    if not enabled and not bootloader_supports_fwupd:
+        return enabled
 
     boot = profile.get("secure_boot", {})
     if not isinstance(boot, dict):
@@ -810,7 +880,9 @@ def check_secure_boot_assets(esp, profile):
         supported = efi_variable_payload("OsIndicationsSupported", EFI_GLOBAL, size=8)
         if supported is None or not (int.from_bytes(supported, "little") & 4):
             raise Hold("機種別対応情報のディスク配送方式をOsIndicationsSupportedに照合できません。")
-        return
+        return enabled
+    if bootloader_supports_fwupd:
+        raise Hold("ブートローダーが更新に対応すると通知しています。検証済みの配送方式を確認できません。")
     if boot.get("delivery") != "shim":
         raise Hold("Secure Bootが有効です。検証済みの配送方式と起動ファイルを機種別対応情報に設定してください。")
 
@@ -835,6 +907,7 @@ def check_secure_boot_assets(esp, profile):
         digest = hashlib.sha256(sbat).hexdigest() if sbat is not None else None
         if "shim_copy_sbat_sha256" not in boot or digest != boot["shim_copy_sbat_sha256"]:
             raise Hold("shimのコピー先で検証したSBAT設定を現在のSbatLevelRTに照合できません。")
+    return enabled
 
 
 def valid_update_device_path(path):
@@ -868,14 +941,21 @@ def valid_update_device_path(path):
     return False
 
 
-def nvram_reservations():
+def fwupd_efi_state():
     # fwupd-efi v1.4のFWUP_UPDATE_INFO v7、先頭4バイトはefivarfsの属性。
     pending = []
+    bootloader_supports_fwupd = False
     for var in EFIVARS.iterdir():
         if not var.name.lower().endswith("-" + FWUPDATE_GUID):
             continue
         name = var.name[:-(len(FWUPDATE_GUID) + 1)]
         if name in ("FWUPDATE_VERBOSE", "FWUPDATE_DEBUG_LOG"):
+            continue
+        if name == "BootloaderSupportsFwupd":
+            capability = read_efi_variable(var)[4:]
+            if capability not in (b"\x00", b"\x01"):
+                raise Hold("EFI変数 BootloaderSupportsFwupd の内容を確認できません。")
+            bootloader_supports_fwupd |= capability == b"\x01"
             continue
         if not name.startswith("fwupd-"):
             raise Hold("fwupd用EFI名前空間に用途を確認できない既存登録があります。")
@@ -889,7 +969,7 @@ def nvram_reservations():
             pending.append(str(uuid.UUID(bytes_le=data[8:24])))
         elif status not in (0, 2):  # 結果クリア後とATTEMPTED
             raise Hold("fwupd-efiに状態を確定できない更新登録があります。")
-    return pending
+    return pending, bootloader_supports_fwupd
 
 
 def boot_next():
@@ -931,16 +1011,17 @@ def check_ready(device, devices, history, settings):
     entries = disk_entries(esp)
     if entries:
         raise Hold("ESPの配送先に既存の項目があります。 " + "、".join(entries))
-    if nvram_reservations():
+    pending, bootloader_supports_fwupd = fwupd_efi_state()
+    if pending:
         raise Hold("fwupd-efiに実行待ちの更新登録があります。")
     if boot_next() is not None:
         raise Hold("別の次回起動先（BootNext）が設定されています。その用途を確認してください。")
     check_boot_entries(esp_guid, settings)
     if disk_delivery_requested():
         raise Hold("既存のディスク経由カプセル配送指示があります。")
-    check_secure_boot_assets(esp, settings)
+    secure_boot = check_boot_delivery(esp, settings, bootloader_supports_fwupd=bootloader_supports_fwupd)
     check_power()
-    return esp, esp_guid
+    return esp, esp_guid, secure_boot, bootloader_supports_fwupd
 
 
 def cab_bases(settings):
@@ -966,6 +1047,21 @@ class CabRedirectHandler(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         require_cab_url(newurl, self.bases)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        # urllibの標準処理は転送前に中間応答の本文を読み切る。
+        with fp:
+            location = headers.get("Location") or headers.get("URI")
+            if not location:
+                raise Hold("CABの転送先を確認できません。")
+            redirected = self.redirect_request(req, fp, code, msg, headers, urljoin(req.full_url, location))
+            visited = getattr(req, "cab_redirects", {req.full_url})
+            if redirected.full_url in visited or len(visited) > self.max_redirections:
+                raise Hold("CABの取得先が繰り返し転送されました。")
+            redirected.cab_redirects = visited | {redirected.full_url}
+        return self.parent.open(redirected, timeout=req.timeout)
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
 
 
 def open_cabinet():
@@ -1004,7 +1100,7 @@ def seal_cabinet(cabinet, release):
 def fetch_cab(release, remote, cabinet, settings, *, download_size=None):
     if download_size is not None and not 0 < download_size <= CAB_DOWNLOAD_LIMIT:
         raise Hold("署名済みカタログに記載されたCABの受信量が上限を超えています。")
-    limit = CAB_DOWNLOAD_LIMIT if download_size is None else download_size
+    budget = CAB_DOWNLOAD_LIMIT
     bases = cab_bases(settings)
     opener = build_opener(CabRedirectHandler(bases))
     errors = []
@@ -1021,14 +1117,21 @@ def fetch_cab(release, remote, cabinet, settings, *, download_size=None):
             require_cab_url(url, bases)
         except (Hold, ValueError):
             continue
+        if budget < (download_size or 1):
+            raise Hold("CABの受信量が上限を超えました。")
+        remaining = download_size if download_size is not None else budget
         try:
             req = Request(url, headers={"User-Agent": "mknk-bios-update/1.0"})
             with opener.open(req, timeout=60) as src:
                 cabinet.seek(0)
                 cabinet.truncate()
-                remaining = limit
-                while chunk := src.read(min(1024 * 1024, remaining + 1)):
-                    if len(chunk) > remaining:
+                while True:
+                    requested = min(1024 * 1024, remaining + 1)
+                    # 読み取りが途中で失敗した場合は、消費し得た分を受信枠に数える。
+                    budget -= requested
+                    chunk = src.read(requested)
+                    budget += requested - len(chunk)
+                    if not chunk or len(chunk) > remaining:
                         break
                     cabinet.write(chunk)
                     remaining -= len(chunk)
@@ -1036,9 +1139,12 @@ def fetch_cab(release, remote, cabinet, settings, *, download_size=None):
             errors.append(str(exc))
             continue
         except HTTPError as exc:
+            exc.close()
             errors.append(f"HTTP {exc.code}")
             continue
         except (URLError, TimeoutError, ConnectionError, HTTPException, ValueError) as exc:
+            if budget <= 0:
+                raise Hold("CABの受信量が上限を超えました。") from exc
             errors.append(type(exc).__name__)
             continue
         if chunk:
@@ -1337,7 +1443,7 @@ def describe(device):
 
 def show_efi_variables(guid):
     try:
-        pending = nvram_reservations()
+        pending, _ = fwupd_efi_state()
         if pending:
             target = f"BIOS対象{pending.count(guid)}件" if guid else "BIOSへの帰属は確認不能"
             print(f"fwupd-efi  実行待ち登録{len(pending)}件（{target}）")
@@ -1457,17 +1563,20 @@ def main():
     if opt.apply:
         marker = marker_path()
         check_marker(marker)
-        delivery_volume = check_ready(device, devices, rows(["get-history"], allow_empty=True), settings)
-    catalog = load_stable_catalog(remote, settings, guid, device)
+        esp, esp_guid, secure_boot, bootloader_capable = check_ready(
+            device, devices, rows(["get-history"], allow_empty=True), settings)
+    catalog, daemon_version = load_stable_catalog(remote, settings, guid, device)
     release = candidate(device)
     active_remote = stable_remote(settings)
     compare_remote(remote, active_remote)
-    download_size = require_catalog_release(catalog, device, guid, release, active_remote)
+    download_size, model_listed = require_catalog_release(
+        catalog, device, guid, release, active_remote, daemon_version=daemon_version)
     if not release:
         if device.get("UpdateError"):
             print("fwupd    ", visible(device["UpdateError"]))
-        message = ("有効なLVFS安定版から、このBIOSの更新候補を取得できませんでした。"
-                   " メーカーサイトを含めた最新版かどうかは未確認です。")
+        message = ("照合したLVFS安定版に、このBIOSで利用できる新版はありません。"
+                   if model_listed else "照合したLVFS安定版で、この機種の掲載を確認できませんでした。")
+        message += " メーカーサイトを含めた最新版かどうかは未確認です。"
         if opt.apply:
             raise Hold(message)
         print(message)
@@ -1499,7 +1608,7 @@ def main():
             raise Hold("承認後に安定版配布元または機種別対応情報が変更されました。再確認してください。")
         active_remote = stable_remote(active_settings)
         compare_remote(remote, active_remote)
-        catalog = load_stable_catalog(active_remote, active_settings, guid, device)
+        catalog, daemon_version = load_stable_catalog(active_remote, active_settings, guid, device)
         new_guid, current, peers = inventory()
         identity_fields = ("DeviceId", "Version", "VersionFormat", "Branch", "CompositeId")
         if (new_guid != guid or any(current.get(k) != device.get(k) for k in identity_fields)
@@ -1511,15 +1620,20 @@ def main():
             raise Hold("承認後に配布候補が変わりました。再確認してください。")
         active_profile = support_profile(active_settings, guid, current)
         verify_cab(cab, updated, guid, current, peers, active_profile)
-        active_volume = check_ready(current, peers, rows(["get-history"], allow_empty=True), active_profile)
-        if active_volume != delivery_volume:
+        active_esp, active_esp_guid, active_secure_boot, active_bootloader_capable = check_ready(
+            current, peers, rows(["get-history"], allow_empty=True), active_profile)
+        if (active_esp, active_esp_guid) != (esp, esp_guid):
             raise Hold("承認後に配送区画が変わりました。再確認してください。")
+        if active_secure_boot != secure_boot:
+            raise Hold("承認後にSecure Bootの有効状態が変わりました。再確認してください。")
+        if active_bootloader_capable != bootloader_capable:
+            raise Hold("承認後にブートローダーの更新対応通知が変わりました。再確認してください。")
         if read_settings() != active_settings:
             raise Hold("送信準備中に設定が変更されました。再確認してください。")
         active_remote = stable_remote(active_settings)
         compare_remote(remote, active_remote)
-        policy = admin_checksums(active_remote)
-        fresh_size = require_catalog_release(catalog, current, guid, updated, active_remote, policy=policy)
+        fresh_size, _ = require_catalog_release(
+            catalog, current, guid, updated, active_remote, daemon_version=daemon_version)
         if fresh_size is not None and os.fstat(cabinet.fileno()).st_size != fresh_size:
             raise Hold("承認後に署名済みカタログのCAB受信サイズが変わりました。")
         send_once(marker, current, updated, cabinet.fileno())
