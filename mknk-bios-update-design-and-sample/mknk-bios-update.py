@@ -429,11 +429,18 @@ def load_stable_catalog(remote, settings, guid, device):
 
 def catalog_cab_artifact(release):
     artifact = release.find("artifacts/artifact[@type='binary']")
-    if artifact is not None:
-        filename = artifact.findtext("filename")
-        if filename is None or filename.lower().endswith(".cab"):
-            return artifact
+    if artifact is not None and catalog_artifact_is_cab(artifact):
+        return artifact
     return None
+
+
+def catalog_artifact_is_cab(artifact):
+    filename = artifact.findtext("filename")
+    return filename is None or filename.lower().endswith(".cab")
+
+
+def catalog_checksum_values(nodes):
+    return {node.text.strip().lower() for node in nodes if node.text}
 
 
 def catalog_hashes(release):
@@ -441,7 +448,7 @@ def catalog_hashes(release):
     values = artifact.findall("checksum") if artifact is not None else []
     if not values:
         values = release.findall("checksum[@target='container']")
-    return {node.text.strip().lower() for node in values if node.text}
+    return catalog_checksum_values(values)
 
 
 def release_version_matches(raw, version, fmt):
@@ -474,12 +481,45 @@ def host_hardware_ids():
     return hardware_ids or None
 
 
-def catalog_hardware_matches(requirements, hardware_ids, *, emulated):
+def catalog_requirements(element):
+    # 通常のfwupd更新では推奨条件も適用される。
+    return [node for tag in ("requires", "recommends", "suggests")
+            for node in element.findall(f"{tag}/*")]
+
+
+def catalog_model_requirement(node):
+    return (node.tag in ("hardware", "not_hardware")
+            or (node.tag == "firmware" and (node.text or "").strip() == "vendor-id"))
+
+
+def catalog_vendor_matches(node, device):
+    pattern = node.get("version")
+    vendor_ids = device.get("VendorIds")
+    if (len(node) or set(node.attrib) - {"compare", "version"} or not pattern
+            or not isinstance(vendor_ids, list) or not vendor_ids
+            or any(not isinstance(value, str) or not value.strip() or "\0" in value for value in vendor_ids)):
+        return None
+    # fwupdはcompare属性にかかわらず、連結したVendorIdsをGLibの正規表現で照合する。
+    _, GLib = fwupd_bindings()
+    try:
+        regex = GLib.Regex.new(pattern, 0, 0)
+        return regex.match("|".join(vendor_ids), 0)[0] if regex is not None else None
+    except GLib.Error:
+        return None
+
+
+def catalog_model_matches(requirements, device, hardware_ids, *, emulated):
     matches = True
     for node in requirements:
+        if node.tag == "firmware":
+            vendor_matches = catalog_vendor_matches(node, device)
+            if vendor_matches is False:
+                return False
+            if vendor_matches is None:
+                matches = None
+            continue
         if node.tag == "not_hardware":
             matches = None
-        if node.tag != "hardware":
             continue
         alternatives = (node.text or "").strip().split("|")
         if node.attrib or len(node) or not all(GUID_TEXT.fullmatch(value) for value in alternatives):
@@ -518,23 +558,44 @@ def catalog_requirement_matches(node, device, daemon_version):
     return compare(version_key(actual, fmt), version_key(required, fmt))
 
 
+def catalog_component_compatible(component, device):
+    protocol = component.findtext("custom/value[@key='LVFS::UpdateProtocol']")
+    if protocol is not None and protocol not in strings(device, "Protocols"):
+        return False
+    formats = {node.text for node in component.findall("custom/value[@key='LVFS::VersionFormat']")}
+    if not formats:
+        return True
+    fmt = device.get("VersionFormat")
+    # fwupd 2.0.20はBCD機器にpairのリリースも認める。
+    return fmt not in (None, "", "unknown") and (fmt in formats or (fmt == "bcd" and "pair" in formats))
+
+
 def catalog_download_size(entry):
     artifact = catalog_cab_artifact(entry)
     size_path = "size[@type='download']"
     release_sizes = entry.findall(size_path)
-    artifact_sizes = artifact.findall(size_path) if artifact is not None else []
+    primary_sizes = artifact.findall(size_path) if artifact is not None else []
+    binaries = entry.findall("artifacts/artifact[@type='binary']")
+    hashes = catalog_hashes(entry)
+    strong_digests = {digest for digest in hashes if re.fullmatch(r"[0-9a-f]{64}|[0-9a-f]{128}", digest)}
+    matching_artifacts = [artifact] if artifact is not None else []
+    for binary in binaries:
+        if binary is artifact or not catalog_artifact_is_cab(binary):
+            continue
+        if strong_digests.intersection(catalog_checksum_values(binary.findall("checksum"))):
+            matching_artifacts.append(binary)
+    artifact_sizes = [size for binary in matching_artifacts for size in binary.findall(size_path)]
     if not release_sizes and not artifact_sizes:
         return None
     size_error = "署名済みカタログのCABに受信サイズを一意に対応付けられません。"
-    binaries = entry.findall("artifacts/artifact[@type='binary']")
     artifact_checksums = artifact.findall("checksum") if artifact is not None else []
-    if ((release_sizes and binaries and (len(binaries) > 1 or artifact is None))
-            or (artifact_sizes and len(binaries) > 1 and not artifact_checksums)):
+    ambiguous = len(matching_artifacts) != len(binaries)
+    if ((release_sizes and binaries and (artifact is None or ambiguous))
+            or (primary_sizes and ambiguous and not artifact_checksums)):
         raise Hold(size_error)
-    if artifact is not None and (release_sizes or not artifact_checksums):
+    if artifact is not None and (release_sizes or (primary_sizes and not artifact_checksums)):
         # 階層をまたいで使う場合は、旧形式のCAB参照がbinary artifactと矛盾しないことを確認する。
         name = artifact.findtext("filename")
-        hashes = catalog_hashes(entry)
         for node in entry.findall("checksum[@target='container']"):
             other_name = node.get("filename")
             digest = (node.text or "").strip().lower()
@@ -559,44 +620,54 @@ def require_catalog_release(components, device, guid, release, remote, *, daemon
     matched_hashes = set()
     sizes = set()
     policy = None
+    candidate_mismatch = None
     model_listed = False
     uncertain_listing = False
     for component in components:
-        if (component.findtext("branch") or "default") != branch:
-            continue
-        component_requirements = component.findall("requires/*")
-        app_id = component.findtext("id")
+        same_branch = (component.findtext("branch") or "default") == branch
         esrt_matches = guid in component_guids(component)
-        check_listing = not release and esrt_matches
+        check_listing = release is None and esrt_matches
+        if not (same_branch or check_listing):
+            continue
+        compatible = same_branch and catalog_component_compatible(component, device)
+        component_requirements = catalog_requirements(component)
+        app_id = component.findtext("id")
         for entry in component.findall("releases/release"):
             raw = entry.get("version")
             hashes = catalog_hashes(entry)
             match = (release and esrt_matches and app_id == release["AppstreamId"] and digest in hashes
                      and release_version_matches(raw, release["Version"], fmt))
             try:
-                version = catalog_version_key(raw, fmt)
+                version = catalog_version_key(raw, fmt) if same_branch else None
             except Hold:
                 version = None
-            can_compete = version is None or (version >= target if release else version > current)
+            can_compete = same_branch and (version is None or (version >= target if release else version > current))
             if not (match or can_compete or check_listing):
                 continue
-            requirements = component_requirements + entry.findall("requires/*")
-            hardware_matches = catalog_hardware_matches(requirements, hardware_ids, emulated=emulated)
-            if hardware_matches is False:
+            requirements = component_requirements + catalog_requirements(entry)
+            model_requirements = [node for node in requirements if catalog_model_requirement(node)]
+            model_matches = catalog_model_matches(model_requirements, device, hardware_ids, emulated=emulated)
+            if model_matches is False:
+                if match:
+                    candidate_mismatch = "このBIOSは署名済みカタログにある更新候補の機種条件を満たしません。"
                 continue
             if check_listing:
-                model_listed |= hardware_matches is True
-                uncertain_listing |= hardware_matches is None
+                model_listed |= model_matches is True
+                uncertain_listing |= model_matches is None
             if not (match or can_compete):
                 continue
+            if not compatible:
+                if match:
+                    candidate_mismatch = "このBIOSは署名済みカタログの配布条件（更新プロトコル・版形式）を満たしません。"
+                continue
             matches = [catalog_requirement_matches(node, device, daemon_version)
-                       for node in requirements if node.tag not in ("hardware", "not_hardware")]
+                       for node in requirements if not catalog_model_requirement(node)]
             if False in matches:
                 if match:
                     raise Hold("このBIOSは署名済みカタログにある更新候補の必須条件を満たしません。")
                 continue
             if match:
-                if hardware_matches is None or None in matches:
+                if model_matches is None or None in matches:
                     raise Hold("署名済みカタログにある更新候補の必須条件を確認できません。")
                 matched_hashes.update(hashes)
                 size = catalog_download_size(entry)
@@ -616,7 +687,8 @@ def require_catalog_release(components, device, guid, release, remote, *, daemon
             raise Hold("署名済みカタログに、適合を除外できない上位版があります。 " + visible(raw))
     if release:
         if not matched_hashes:
-            raise Hold("このBIOS更新候補の版とCABハッシュを、署名済みのLVFS安定版カタログで確認できません。")
+            raise Hold(candidate_mismatch or
+                       "このBIOS更新候補の版とCABハッシュを、署名済みのLVFS安定版カタログで確認できません。")
         if policy is None:
             policy = admin_checksums(remote)
         check_admin_policy(matched_hashes, policy)
@@ -870,8 +942,6 @@ def check_boot_delivery(esp, profile, *, bootloader_supports_fwupd):
     if secure_boot not in (b"\x00", b"\x01"):
         raise Hold("Secure Bootの有効状態を確認できません。")
     enabled = secure_boot == b"\x01"
-    if not enabled and not bootloader_supports_fwupd:
-        return enabled
 
     boot = profile.get("secure_boot", {})
     if not isinstance(boot, dict):
@@ -883,6 +953,8 @@ def check_boot_delivery(esp, profile, *, bootloader_supports_fwupd):
         return enabled
     if bootloader_supports_fwupd:
         raise Hold("ブートローダーが更新に対応すると通知しています。検証済みの配送方式を確認できません。")
+    if not enabled:
+        return enabled
     if boot.get("delivery") != "shim":
         raise Hold("Secure Bootが有効です。検証済みの配送方式と起動ファイルを機種別対応情報に設定してください。")
 
@@ -1559,13 +1631,19 @@ def main():
     guid, device, devices = inventory()
     if opt.device_id is not None and opt.device_id.lower() != device["DeviceId"]:
         raise Hold("指定したDevice IDが実機のシステムBIOSと一致しません。")
-    describe(device)
     if opt.apply:
         marker = marker_path()
         check_marker(marker)
         esp, esp_guid, secure_boot, bootloader_capable = check_ready(
             device, devices, rows(["get-history"], allow_empty=True), settings)
     catalog, daemon_version = load_stable_catalog(remote, settings, guid, device)
+    # メタデータを更新すると、fwupdが同じBIOSの表示版・版形式を更新することがある。
+    new_guid, refreshed, peers = inventory()
+    if (new_guid != guid or refreshed["DeviceId"] != device["DeviceId"]
+            or set(strings(refreshed, "Guid")) != set(strings(device, "Guid"))):
+        raise Hold("カタログの照会中に機器の識別情報が変化しました。再確認してください。")
+    device, devices = refreshed, peers
+    describe(device)
     release = candidate(device)
     active_remote = stable_remote(settings)
     compare_remote(remote, active_remote)
@@ -1574,8 +1652,11 @@ def main():
     if not release:
         if device.get("UpdateError"):
             print("fwupd    ", visible(device["UpdateError"]))
-        message = ("照合したLVFS安定版に、このBIOSで利用できる新版はありません。"
-                   if model_listed else "照合したLVFS安定版で、この機種の掲載を確認できませんでした。")
+        if model_listed:
+            message = ("照合したLVFS安定版に、この機種は掲載されています。"
+                       " このBIOSで利用できる新版はありません（現行ブランチ）。")
+        else:
+            message = "照合したLVFS安定版で、この機種の掲載を確認できませんでした。"
         message += " メーカーサイトを含めた最新版かどうかは未確認です。"
         if opt.apply:
             raise Hold(message)

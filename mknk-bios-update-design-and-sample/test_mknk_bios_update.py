@@ -9,6 +9,7 @@ import json
 import lzma
 import os
 from pathlib import Path
+import re
 import struct
 import subprocess
 import sys
@@ -139,11 +140,26 @@ class StableRemoteTest(unittest.TestCase):
                 updater.stable_remote(settings)
 
 
+class FixtureGLibError(Exception):
+    pass
+
+
+class FixtureRegex:
+    @staticmethod
+    def new(pattern, _compile_options, _match_options):
+        try:
+            compiled = re.compile(pattern)
+        except re.error as exc:
+            raise FixtureGLibError(str(exc)) from exc
+        return SimpleNamespace(match=lambda text, _options: (compiled.search(text) is not None, None))
+
+
 class StableCatalogTest(unittest.TestCase):
     metadata_uri = "https://cdn.fwupd.org/downloads/firmware.xml.xz"
     signature_uri = metadata_uri + ".jcat"
     guid = "12345678-1234-1234-1234-123456789abc"
-    bios = {"DeviceId": "b" * 40, "Version": "1.0", "VersionFormat": "pair"}
+    bios = {"DeviceId": "b" * 40, "Version": "1.0", "VersionFormat": "pair",
+            "VendorIds": ["DMI:LENOVO"], "Protocols": ["org.uefi.capsule"]}
     published = {"RemoteId": "lvfs", "AppstreamId": "example.bios", "Version": "2.0",
                  "Checksum": ["a" * 64]}
     signed_xml = b'''<components><component type="firmware"><id>example.bios</id>
@@ -153,7 +169,8 @@ class StableCatalogTest(unittest.TestCase):
       </artifact></artifacts></release></releases></component></components>'''
 
     def exercise_check(self, release, *, xml=None, metadata_result=None, expected_hold=None, expected_output=None,
-                       host_ids=None, policy=(None, frozenset()), approval_required=False, daemon_version="2.0.20"):
+                       host_ids=None, policy=(None, frozenset()), approval_required=False, daemon_version="2.0.20",
+                       device_before_refresh=None):
         remote = {"Id": "lvfs", "MetadataUri": self.metadata_uri, "MetadataUriSig": self.signature_uri,
                   "ApprovalRequired": False}
         active_remote = dict(remote, ApprovalRequired=approval_required)
@@ -167,7 +184,7 @@ class StableCatalogTest(unittest.TestCase):
             requests.append(request.full_url)
             return io.BytesIO(bodies[request.full_url])
 
-        class FwupdError(Exception):
+        class FwupdError(FixtureGLibError):
             domain = "FwupdError"
 
             def __init__(self, code):
@@ -180,10 +197,14 @@ class StableCatalogTest(unittest.TestCase):
                 raise FwupdError(metadata_result)
             return True
 
+        def inventory():
+            device = self.bios if daemon_calls or device_before_refresh is None else device_before_refresh
+            return self.guid, device, [device]
+
         client = SimpleNamespace(update_metadata_bytes=update, get_daemon_version=lambda: daemon_version)
         fwupd = SimpleNamespace(Client=SimpleNamespace(new=lambda: client),
                                 Error=SimpleNamespace(NOTHING_TO_DO=19))
-        glib = SimpleNamespace(Bytes=SimpleNamespace(new=bytes), Error=FwupdError)
+        glib = SimpleNamespace(Bytes=SimpleNamespace(new=bytes), Error=FixtureGLibError, Regex=FixtureRegex)
         imports = {"gi": SimpleNamespace(require_version=lambda *_args: None),
                    "gi.repository": SimpleNamespace(Fwupd=fwupd, GLib=glib)}
         with (TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()) as output,
@@ -196,7 +217,7 @@ class StableCatalogTest(unittest.TestCase):
               patch.object(updater, "stable_remote", side_effect=[remote, remote, active_remote]),
               patch.object(updater, "command", return_value=json.dumps(host_ids)) as command,
               patch.object(updater, "admin_checksums", return_value=policy) as admin,
-              patch.object(updater, "inventory", return_value=(self.guid, self.bios, [self.bios])),
+              patch.object(updater, "inventory", side_effect=inventory),
               patch.object(updater, "fwupd_query", return_value=[release] if release else []),
               patch.object(updater, "build_opener", return_value=SimpleNamespace(open=get))):
             if expected_hold is None:
@@ -231,31 +252,88 @@ class StableCatalogTest(unittest.TestCase):
     def test_daemon_accepts_verified_signature_with_same_timestamp(self):
         self.exercise_check(self.published, metadata_result=19)
 
-    def catalog_with_requirements(self, requirements):
+    def catalog_with_component_data(self, data):
         root = ET.fromstring(self.signed_xml)
-        root.find("component").append(ET.fromstring(requirements))
+        root.find("component").append(ET.fromstring(data))
         return ET.tostring(root)
+
+    def test_check_accepts_the_vendor_requirement_used_by_public_thinkpad_metadata(self):
+        # com.lenovo.SingleCapThinkPadN3YETXXW.firmware, LVFS stable 2026-11-20.
+        xml = self.catalog_with_component_data(
+            '<requires><firmware compare="regex" version="NVME:0x144D|NVME:0x14A4|NVME:0x1CC4|'
+            'NVME:0x1E0F|NVME:0x8086|NVME:0x1E95|NVME:0x1179|NVME:0x1C5C|TBT:0x0109|'
+            'DMI:LENOVO|NVME:0x15B7|NVME:0x1344|NVME:0x17AA">vendor-id</firmware>'
+            '<id compare="ge" version="1.1.3">org.freedesktop.fwupd</id></requires>')
+        with patch.object(self, "bios", dict(self.bios, VendorIds=["PCI:0x1234", "DMI:LENOVO"])):
+            self.exercise_check(self.published, xml=xml, metadata_result=19)
+        with patch.object(self, "bios", dict(self.bios, VendorIds=["DMI:OTHER"])):
+            self.exercise_check(self.published, xml=xml, metadata_result=19, expected_hold="機種条件")
+
+    def test_check_holds_when_the_vendor_id_cannot_be_verified(self):
+        xml = self.catalog_with_component_data(
+            '<requires><firmware compare="eq" version="DMI:LENOVO">vendor-id</firmware></requires>')
+        self.exercise_check(self.published, xml=xml)
+        bios = {key: value for key, value in self.bios.items() if key != "VendorIds"}
+        with patch.object(self, "bios", bios):
+            self.exercise_check(self.published, xml=xml, expected_hold="条件を確認できません")
+        invalid = xml.replace(b'version="DMI:LENOVO"', b'version="["')
+        self.exercise_check(self.published, xml=invalid, expected_hold="条件を確認できません")
 
     def test_checks_the_signed_current_bios_requirement_even_with_the_same_cab(self):
         for compare, version, expected_hold in (("lt", "1.0", "必須条件"), ("lt", "1.1", None),
                                                 ("eq", "1.0", None), ("ne", "1.0", "必須条件")):
             with self.subTest(compare=compare, version=version):
-                xml = self.catalog_with_requirements(
+                xml = self.catalog_with_component_data(
                     f'<requires><firmware compare="{compare}" version="{version}"/></requires>')
                 self.exercise_check(self.published, xml=xml, metadata_result=19, expected_hold=expected_hold)
 
     def test_selected_candidate_is_held_when_a_signed_requirement_is_unknown(self):
-        xml = self.catalog_with_requirements("<requires><phased_update>4</phased_update></requires>")
+        xml = self.catalog_with_component_data("<requires><phased_update>4</phased_update></requires>")
         self.exercise_check(self.published, xml=xml, metadata_result=19, expected_hold="必須条件")
 
     def test_fwupd_minimum_version_is_verified_for_a_selected_candidate(self):
-        xml = self.catalog_with_requirements(
+        xml = self.catalog_with_component_data(
             '<requires><id compare="ge" version="2.0.20">org.freedesktop.fwupd</id></requires>')
         self.exercise_check(self.published, xml=xml, metadata_result=19)
         self.exercise_check(self.published, xml=xml, metadata_result=19,
                             daemon_version="2.0.19", expected_hold="必須条件")
         self.exercise_check(self.published, xml=xml, metadata_result=19,
                             daemon_version=None, expected_hold="必須条件")
+
+    def test_check_evaluates_signed_recommends_and_suggests(self):
+        for kind in ("recommends", "suggests"):
+            with self.subTest(kind=kind):
+                xml = self.catalog_with_component_data(
+                    f'<{kind}><firmware compare="ge" version="1.0"/></{kind}>')
+                self.exercise_check(self.published, xml=xml, metadata_result=19)
+                unmet = xml.replace(b'version="1.0"', b'version="1.1"')
+                self.exercise_check(self.published, xml=unmet, metadata_result=19, expected_hold="必須条件")
+
+    def test_catalog_checks_the_signed_update_protocol_and_version_format(self):
+        for key, compatible, incompatible in (
+            ("LVFS::UpdateProtocol", "org.uefi.capsule", "org.usb.dfu"),
+            ("LVFS::VersionFormat", "pair", "quad"),
+        ):
+            with self.subTest(key=key):
+                xml = self.catalog_with_component_data(f'<custom><value key="{key}">{compatible}</value></custom>')
+                self.exercise_check(self.published, xml=xml)
+                mismatched = f'<custom><value key="{key}">{incompatible}</value></custom>'
+                self.exercise_check(self.published, xml=self.catalog_with_component_data(mismatched),
+                                    expected_hold="配布条件")
+                self.exercise_check(self.published, xml=self.catalog_with_competitor("196608", component_data=mismatched))
+
+    def test_catalog_version_formats_accept_fwupd_bcd_compatibility(self):
+        xml = self.catalog_with_component_data(
+            '<custom><value key="LVFS::VersionFormat">quad</value>'
+            '<value key="LVFS::VersionFormat">pair</value></custom>')
+        xml = xml.replace(b'release version="131072"', b'release version="2.0"')
+        with patch.object(self, "bios", dict(self.bios, VersionFormat="bcd")):
+            self.exercise_check(self.published, xml=xml)
+
+    def test_check_uses_the_device_version_format_after_metadata_refresh(self):
+        xml = self.catalog_with_component_data('<custom><value key="LVFS::VersionFormat">pair</value></custom>')
+        before = dict(self.bios, Version="65536", VersionFormat="number")
+        self.exercise_check(self.published, xml=xml, device_before_refresh=before, expected_output="1.0 → 2.0")
 
     def test_selected_candidate_uses_the_current_remote_approval_policy(self):
         self.exercise_check(self.published, approval_required=True, policy=(set(), set()),
@@ -265,15 +343,15 @@ class StableCatalogTest(unittest.TestCase):
     def test_selected_candidate_is_checked_for_an_explicit_block_without_competitors(self):
         self.exercise_check(self.published, policy=(None, {"a" * 64}), expected_hold="明示ブロック")
 
-    def catalog_with_competitor(self, version, *, requirements=None):
+    def catalog_with_competitor(self, version, *, component_data=None):
         root = ET.fromstring(self.signed_xml)
         component = root.find("component")
         competitor = ET.fromstring(ET.tostring(component))
         entry = competitor.find("releases/release")
         entry.set("version", version)
         entry.find(".//checksum").text = "b" * 64
-        if requirements:
-            competitor.append(ET.fromstring(requirements))
+        if component_data:
+            competitor.append(ET.fromstring(component_data))
         root.append(competitor)
         return ET.tostring(root)
 
@@ -294,10 +372,23 @@ class StableCatalogTest(unittest.TestCase):
 
     def test_check_reports_a_missing_model_separately_from_a_missing_update(self):
         self.exercise_check(None, xml=b"<components/>", expected_output="この機種の掲載を確認できません")
-        xml = self.catalog_with_requirements(
+        xml = self.catalog_with_component_data(
             "<requires><hardware>33333333-3333-3333-3333-333333333333</hardware></requires>")
         self.exercise_check(None, xml=xml, expected_output="この機種の掲載を確認できません",
                             host_ids={"Manufacturer&Family": "44444444-4444-4444-4444-444444444444"})
+
+    def test_old_release_for_another_vendor_does_not_count_as_a_model_listing(self):
+        xml = self.catalog_with_component_data(
+            '<requires><firmware compare="eq" version="DMI:OTHER">vendor-id</firmware></requires>')
+        xml = xml.replace(b'release version="131072"', b'release version="65536"')
+        self.exercise_check(None, xml=xml, expected_output="この機種の掲載を確認できません")
+        with patch.object(self, "bios", dict(self.bios, VendorIds=[])):
+            self.exercise_check(None, xml=xml, expected_hold="機種の必須条件を確認できません")
+
+    def test_alternate_branch_counts_as_a_model_listing_without_an_update(self):
+        xml = self.catalog_with_component_data("<branch>alternate</branch>")
+        self.exercise_check(None, xml=xml, expected_output=(
+            "この機種は掲載されています。 このBIOSで利用できる新版はありません（現行ブランチ）"))
 
     def test_policy_excludes_only_a_cab_with_a_matching_signed_container_hash(self):
         xml = self.catalog_with_competitor("196608")
@@ -307,19 +398,20 @@ class StableCatalogTest(unittest.TestCase):
     def test_allows_lower_candidate_only_when_the_newer_sku_is_excluded(self):
         sku = "22222222-2222-2222-2222-222222222222"
         second_sku = "33333333-3333-3333-3333-333333333333"
-        xml = self.catalog_with_competitor("196608", requirements=(
+        xml = self.catalog_with_competitor("196608", component_data=(
             f"<requires><hardware>{sku}|{second_sku}</hardware></requires>"))
         key = "Manufacturer&Family&ProductName&ProductSku"
         self.exercise_check(self.published, xml=xml, host_ids={key: "44444444-4444-4444-4444-444444444444"})
         self.exercise_check(self.published, xml=xml, host_ids={key: second_sku}, expected_hold="上位版")
 
     def test_allows_a_required_intermediate_version_and_ignores_older_entries(self):
-        xml = self.catalog_with_competitor("196608", requirements='<requires><firmware compare="ge" version="2.0"/></requires>')
+        xml = self.catalog_with_competitor(
+            "196608", component_data='<requires><firmware compare="ge" version="2.0"/></requires>')
         self.exercise_check(self.published, xml=xml)
         self.exercise_check(self.published, xml=self.catalog_with_competitor("65536"))
 
     def test_current_version_can_exclude_a_competitor_when_its_hardware_ids_are_unavailable(self):
-        xml = self.catalog_with_competitor("196608", requirements=(
+        xml = self.catalog_with_competitor("196608", component_data=(
             '<requires><hardware>33333333-3333-3333-3333-333333333333</hardware>'
             '<firmware compare="ge" version="2.0"/></requires>'))
         self.exercise_check(self.published, xml=xml, host_ids={})
@@ -337,7 +429,8 @@ class StableCatalogTest(unittest.TestCase):
         with patch.object(self, "bios", bios):
             self.exercise_check(release, xml=ET.tostring(root), expected_hold="上位版")
 
-    def exercise_apply(self, latest_xml, *, expected_error=None, secure_boot_after=b"\x01"):
+    def exercise_apply(self, latest_xml, *, expected_error=None, secure_boot_before=b"\x01",
+                       secure_boot_after=b"\x01", disk_support_after=4):
         verify_path = "/proc/self/fd/23"
         with TemporaryDirectory() as tmp:
             esp = Path(tmp) / "esp"
@@ -345,8 +438,9 @@ class StableCatalogTest(unittest.TestCase):
             variables = Path(tmp) / "efivars"
             variables.mkdir()
             secure_boot = variables / f"SecureBoot-{updater.EFI_GLOBAL}"
-            secure_boot.write_bytes(struct.pack("<I", 7) + b"\x01")
-            (variables / f"OsIndicationsSupported-{updater.EFI_GLOBAL}").write_bytes(struct.pack("<IQ", 7, 4))
+            secure_boot.write_bytes(struct.pack("<I", 7) + secure_boot_before)
+            disk_support = variables / f"OsIndicationsSupported-{updater.EFI_GLOBAL}"
+            disk_support.write_bytes(struct.pack("<IQ", 7, 4))
             bios = dict(self.bios, Flags=["updatable"])
             profile = {"secure_boot": {"delivery": "capsule-on-disk"}}
             cabinet = SimpleNamespace(fileno=lambda: 23)
@@ -361,12 +455,18 @@ class StableCatalogTest(unittest.TestCase):
                     secure_boot.unlink()
                 else:
                     secure_boot.write_bytes(struct.pack("<I", 7) + secure_boot_after)
+                if disk_support_after is None:
+                    disk_support.unlink()
+                else:
+                    disk_support.write_bytes(struct.pack("<IQ", 7, disk_support_after))
                 return "yes"
 
             with (redirect_stdout(io.StringIO()),
                   patch.object(sys, "argv", [SCRIPT.name, "--apply"]),
                   patch.object(sys.stdin, "isatty", return_value=True),
                   patch.object(sys.stdout, "isatty", return_value=True),
+                  patch.object(updater, "fwupd_bindings", return_value=(
+                      None, SimpleNamespace(Error=FixtureGLibError, Regex=FixtureRegex))),
                   patch.multiple(updater, ESRT=Path(tmp), DMI=Path(tmp), EFIVARS=variables, require_fwupdmgr=Mock(),
                                  read_settings=Mock(return_value=profile), support_profile=Mock(return_value=profile),
                                  inventory=Mock(return_value=(self.guid, bios, [bios])),
@@ -391,13 +491,37 @@ class StableCatalogTest(unittest.TestCase):
     def test_apply_rechecks_the_signed_catalog_after_approval(self):
         self.exercise_apply(self.signed_xml)
         self.exercise_apply(self.catalog_with_competitor("196608"), expected_error="上位版")
-        xml = self.catalog_with_requirements('<requires><firmware compare="lt" version="1.0"/></requires>')
+        xml = self.catalog_with_component_data('<requires><firmware compare="lt" version="1.0"/></requires>')
         self.exercise_apply(xml, expected_error="必須条件")
+
+    def test_apply_rechecks_the_signed_vendor_id_after_approval(self):
+        xml = self.catalog_with_component_data(
+            '<requires><firmware compare="eq" version="DMI:OTHER">vendor-id</firmware></requires>')
+        self.exercise_apply(xml, expected_error="機種条件")
+
+    def test_apply_rechecks_recommends_and_suggests_after_approval(self):
+        for kind in ("recommends", "suggests"):
+            with self.subTest(kind=kind):
+                xml = self.catalog_with_component_data(
+                    f'<{kind}><firmware compare="lt" version="1.0"/></{kind}>')
+                self.exercise_apply(xml, expected_error="必須条件")
+
+    def test_apply_rechecks_update_protocol_and_version_format_after_approval(self):
+        for key, value in (("LVFS::UpdateProtocol", "org.usb.dfu"), ("LVFS::VersionFormat", "quad")):
+            with self.subTest(key=key):
+                xml = self.catalog_with_component_data(f'<custom><value key="{key}">{value}</value></custom>')
+                self.exercise_apply(xml, expected_error="配布条件")
 
     def test_apply_holds_when_secure_boot_disappears_or_changes_after_approval(self):
         for state in (None, b"\x00"):
             with self.subTest(secure_boot=state):
                 self.exercise_apply(self.signed_xml, secure_boot_after=state, expected_error="Secure[ ]?Boot")
+
+    def test_apply_rechecks_declared_disk_delivery_with_secure_boot_off(self):
+        for supported in (4, 0, None):
+            with self.subTest(supported=supported):
+                self.exercise_apply(self.signed_xml, secure_boot_before=b"\x00", secure_boot_after=b"\x00",
+                                    disk_support_after=supported, expected_error=None if supported else "OsIndicationsSupported")
 
 
 class CatalogSizeTest(unittest.TestCase):
@@ -424,6 +548,25 @@ class CatalogSizeTest(unittest.TestCase):
                                other='<artifact type="binary"><filename>another.cab</filename></artifact>')
         with self.assertRaisesRegex(updater.Hold, "受信サイズ"):
             updater.catalog_download_size(release)
+
+    def test_later_artifacts_for_the_same_cab_contribute_their_signed_sizes(self):
+        other = (f'<artifact type="binary"><filename>bios.cab</filename><checksum type="sha256">{"a" * 64}</checksum>'
+                 '<size type="download">17</size></artifact>')
+        size = '<size type="download">17</size>'
+        for release in (self.release(other=other), self.release(artifact_size=size, other=other),
+                        self.release(size=size, other=other)):
+            with self.subTest(xml=ET.tostring(release)):
+                self.assertEqual(updater.catalog_download_size(release), 17)
+        conflict = self.release(artifact_size='<size type="download">23</size>', other=other)
+        with self.assertRaisesRegex(updater.Hold, "受信サイズ"):
+            updater.catalog_download_size(conflict)
+
+    def test_size_for_a_different_cab_is_not_used_even_when_its_name_matches(self):
+        other = (f'<artifact type="binary"><filename>bios.cab</filename><checksum type="sha256">{"b" * 64}</checksum>'
+                 '<size type="download">23</size></artifact>')
+        self.assertIsNone(updater.catalog_download_size(self.release(other=other)))
+        size = '<size type="download">17</size>'
+        self.assertEqual(updater.catalog_download_size(self.release(artifact_size=size, other=other)), 17)
 
     def test_release_size_requires_the_legacy_reference_to_match_the_binary_artifact(self):
         size = '<size type="download">17</size>'
