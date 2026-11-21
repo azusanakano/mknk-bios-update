@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Name=BIOS Update
+Name[ja]=BIOS 更新
+Comment=Check the installed system BIOS and available updates
+Comment[ja]=この PC の BIOS 版と適用できる更新を確認します
+Exec=/usr/bin/mknk-bios-update
+Icon=computer
+Terminal=false
+Categories=System;
+DBusActivatable=false
+Actions=OpenPlan;
+
+[Desktop Action OpenPlan]
+Name=Open update plan
+Name[ja]=更新計画を開く
+Exec=/usr/bin/mknk-bios-update --open-plan

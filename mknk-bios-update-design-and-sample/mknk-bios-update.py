@@ -165,10 +165,11 @@ def read_esrt():
     return guids[0]
 
 
-def inventory(guid=None):
+def inventory(guid=None, *, devices=None):
     if guid is None:
         guid = read_esrt()
-    devices = rows(["get-devices"])
+    if devices is None:
+        devices = rows(["get-devices"])
     matches = [d for d in devices if d.get("Plugin") == "uefi_capsule"
                and PROTOCOL in strings(d, "Protocols") and "internal" in strings(d, "Flags")
                and guid in {s.lower() for s in strings(d, "Guid")}]
@@ -235,8 +236,10 @@ def https_origin_path(url):
     return parsed.hostname, port, path
 
 
-def stable_remote(settings):
-    remotes = [r for r in rows(["get-remotes"], "Remotes") if r.get("Id") == REMOTE]
+def stable_remote(settings, *, remotes=None, remote_id=REMOTE, allow_credentials=False):
+    if remotes is None:
+        remotes = rows(["get-remotes"], "Remotes")
+    remotes = [r for r in remotes if r.get("Id") == remote_id]
     if len(remotes) != 1 or remotes[0].get("Enabled") is not True or remotes[0].get("Kind") != "download":
         raise Hold("LVFSの安定版配布元 lvfs が有効なダウンロード元になっていません。fwupdmgr get-remotes で確認してください。")
     remote = remotes[0]
@@ -245,9 +248,10 @@ def stable_remote(settings):
         raise Hold("安定版ミラーのメタデータURIを確認できません。")
     uri = remote.get("MetadataUri")
     host, _, _ = https_origin_path(uri)
-    if uri not in LVFS_METADATA_URIS and (uri not in mirrors or host in ("cdn.fwupd.org", "fwupd.org")):
+    public = remote_id == REMOTE and uri in LVFS_METADATA_URIS
+    if not public and (uri not in mirrors or host in ("cdn.fwupd.org", "fwupd.org")):
         raise Hold("lvfs のメタデータURIが公開安定版または検証済み安定版ミラーと一致しません。")
-    if remote.get("Username") or remote.get("Password"):
+    if (remote.get("Username") or remote.get("Password")) and not allow_credentials:
         raise Hold("このサンプルでは認証情報を含まないHTTPSの安定版配布元を指定してください。")
     return remote
 
@@ -334,10 +338,11 @@ def version_key(version, fmt):
     return tuple(parts)
 
 
-def candidate(device):
-    releases = fwupd_query("get_upgrades", device["DeviceId"])
+def candidate(device, *, releases=None, remote_id=REMOTE):
+    if releases is None:
+        releases = fwupd_query("get_upgrades", device["DeviceId"])
     branch = device.get("Branch") or "default"
-    eligible = [r for r in releases if r.get("RemoteId") == REMOTE
+    eligible = [r for r in releases if r.get("RemoteId") == remote_id
                 and (r.get("Branch") or "default") == branch
                 and not {"blocked-approval", "blocked-version", "is-alternate-branch",
                          "is-downgrade"}.intersection(strings(r, "Flags"))]
@@ -411,7 +416,7 @@ def component_guids(component):
             if node.text}
 
 
-def read_catalog_components(metadata, guids):
+def read_catalog_components(metadata, guids, *, digest=None):
     parser = ET.XMLPullParser(events=("end",))
     components = []
     decoded_size = 0
@@ -420,6 +425,8 @@ def read_catalog_components(metadata, guids):
             decoded_size += len(block)
             if decoded_size > METADATA_XML_LIMIT:
                 raise Hold("展開したLVFS安定版カタログが大きすぎます。")
+            if digest is not None:
+                digest.update(block)
             parser.feed(block)
             for _, element in parser.read_events():
                 if element.tag != "component":
@@ -576,13 +583,13 @@ def catalog_model_matches(requirements, device, hardware_ids, *, emulated):
     return matches
 
 
-def catalog_requirement_matches(node, device, devices, daemon_version):
+def catalog_requirement_matches(node, device, devices, daemon_version, client_features=CLIENT_FEATURES):
     """評価できない必須条件には None を返す。"""
     if len(node):
         return None
     text = (node.text or "").strip()
     if node.tag == "client" and not node.attrib:
-        return True if set(text.split("|")).issubset(CLIENT_FEATURES) else None
+        return True if set(text.split("|")).issubset(client_features) else None
     compare = VERSION_COMPARISONS.get(node.get("compare"))
     if compare is None or set(node.attrib) != {"compare", "version"}:
         return None
@@ -614,9 +621,10 @@ def catalog_requirement_matches(node, device, devices, daemon_version):
     return compare(version_key(actual, fmt), version_key(required, fmt))
 
 
-def missing_client_features(requirements):
+def missing_client_features(requirements, client_features=CLIENT_FEATURES):
     return sorted({feature for node in requirements if node.tag == "client" and not node.attrib and not len(node)
-                   for feature in (node.text or "").strip().split("|") if feature in UNSUPPORTED_CLIENT_FEATURES})
+                   for feature in (node.text or "").strip().split("|")
+                   if feature in UNSUPPORTED_CLIENT_FEATURES or feature in CLIENT_FEATURES and feature not in client_features})
 
 
 def catalog_component_compatible(component, device):
@@ -670,7 +678,8 @@ class CatalogCheck(NamedTuple):
     unavailable: str | None
 
 
-def require_catalog_release(components, device, devices, guid, release, remote, *, daemon_version, verified_hashes=()):
+def require_catalog_release(components, device, devices, guid, release, remote, *, daemon_version,
+                            verified_hashes=(), policy=None, client_features=CLIENT_FEATURES):
     fmt = device.get("VersionFormat")
     branch = device.get("Branch") or "default"
     current = version_key(device["Version"], fmt)
@@ -681,7 +690,6 @@ def require_catalog_release(components, device, devices, guid, release, remote, 
     emulated = "emulated" in flags
     matched_hashes = set()
     sizes = set()
-    policy = None
     candidate_mismatch = None
     model_listed = False
     uncertain_listing = False
@@ -738,7 +746,7 @@ def require_catalog_release(components, device, devices, guid, release, remote, 
                 if report_exclusion:
                     exclusions.append((version, display_version, reason))
                 continue
-            evaluated = [(node, catalog_requirement_matches(node, device, devices, daemon_version))
+            evaluated = [(node, catalog_requirement_matches(node, device, devices, daemon_version, client_features))
                          for node in requirements if not catalog_model_requirement(node)]
             failed = [node for node, result in evaluated if result is False]
             if failed:
@@ -753,7 +761,7 @@ def require_catalog_release(components, device, devices, guid, release, remote, 
                         reason = f"必須の版条件（{node.get('compare')} {required}）を満たしていません。"
                     exclusions.append((version, display_version, reason))
                 continue
-            missing = missing_client_features(node for node, result in evaluated if result is None)
+            missing = missing_client_features((node for node, result in evaluated if result is None), client_features)
             client_reason = (f"必要なクライアント機能 {'、'.join(missing)} に対応する更新方法を確認してください。"
                              if missing else None)
             if match:
@@ -1430,12 +1438,13 @@ def verify_cabinet_hashes(cabinet, hashes):
             raise Hold("ダウンロードしたCABのハッシュがLVFSの配布情報と一致しません。")
 
 
-def fetch_cab(release, remote, cabinet, settings, *, download_size=None):
+def fetch_cab(release, remote, cabinet, settings, *, download_size=None, opener=None):
     if download_size is not None and not 0 < download_size <= CAB_DOWNLOAD_LIMIT:
         raise Hold("署名済みカタログに記載されたCABの受信量が上限を超えています。")
     budget = CAB_DOWNLOAD_LIMIT
     bases = cab_bases(settings)
-    opener = build_opener(CabRedirectHandler(bases))
+    if opener is None:
+        opener = build_opener(CabRedirectHandler(bases))
     errors = []
     for location in strings(release, "Locations"):
         try:
@@ -1600,15 +1609,15 @@ def firmware_payload_name(release):
     return basename
 
 
-def cab_manifest(path, app_id):
+def cab_manifest(path, app_id, *, single_component=False):
     components = []
     for data in read_cab_files(path).values():
         try:
             xml = ET.fromstring(data)
         except ET.ParseError as exc:
             raise Hold("CABのAppStreamメタデータを解釈できません。") from exc
-        components.extend(node for node in xml.iter("component") if node.findtext("id") == app_id)
-    if len(components) != 1:
+        components.extend(node for node in xml.iter("component") if single_component or node.findtext("id") == app_id)
+    if len(components) != 1 or components[0].findtext("id") != app_id:
         raise Hold("CAB内の署名対象と更新コンポーネントを一意に対応付けられません。")
     # GetDetailsと通常のInstallは最初のreleaseを使う。全版適用機器はcheck_readyで除外する。
     selected = components[0].find("releases/release")
@@ -1692,8 +1701,9 @@ def esrt_version(raw, fmt):
     return ".".join(map(str, parts[fmt]))
 
 
-def verify_cab(path, release, guid, device, devices, profile):
-    parts = fwupd_query("get_details", str(path))
+def verify_cab(path, release, guid, device, devices, profile, *, parts=None, include_payload=False):
+    if parts is None:
+        parts = fwupd_query("get_details", str(path))
     if len(parts) != 1:
         raise Hold(f"CABに{len(parts)}件の更新コンポーネントがあります。BIOS単体として予約できません。")
     part = parts[0]
@@ -1716,7 +1726,10 @@ def verify_cab(path, release, guid, device, devices, profile):
         raise Hold("CAB内のコンポーネント・版が候補と一致しません。")
     if "trusted-payload" not in strings(content[0], "Flags"):
         raise Hold("fwupdでCAB内の更新データの署名を確認できません。")
-    payload_name, raw_version = cab_manifest(path, release["AppstreamId"])
+    if include_payload:
+        payload_name, raw_version = cab_manifest(path, release["AppstreamId"], single_component=True)
+    else:
+        payload_name, raw_version = cab_manifest(path, release["AppstreamId"])
     version = content[0].get("Version")
     fmt = device.get("VersionFormat")
     if (not release_version_matches(raw_version, release["Version"], fmt)
@@ -1725,7 +1738,8 @@ def verify_cab(path, release, guid, device, devices, profile):
     payload = read_cab_files(path, payload_name).get(payload_name)
     if not payload or len(payload) < 16:
         raise Hold("CAB内のペイロードを読み取れません。")
-    return check_capsule_scope(payload, guid, profile)
+    scope = check_capsule_scope(payload, guid, profile)
+    return (scope, payload, raw_version) if include_payload else scope
 
 
 def marker_path():

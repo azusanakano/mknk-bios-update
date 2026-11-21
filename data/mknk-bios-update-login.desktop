@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=BIOS update result
+Name[ja]=BIOS 更新結果
+Exec=/usr/bin/mknk-bios-update --login
+Terminal=false
+NoDisplay=true
+OnlyShowIn=GNOME;X-Cinnamon;

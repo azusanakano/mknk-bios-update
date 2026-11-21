@@ -1,0 +1,15 @@
+[Unit]
+Description=BIOS update inventory and transaction service
+After=systemd-logind.service
+
+[Service]
+Type=dbus
+BusName=io.github.mknk.BiosUpdate1
+ExecStart=/usr/bin/python3 -I /usr/lib/mknk-bios-update/service.py
+StateDirectory=mknk-bios-update
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+LockPersonality=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes

@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=io.github.mknk.BiosUpdate1
+Exec=/usr/bin/python3 -I /usr/lib/mknk-bios-update/service.py
+User=root
+SystemdService=mknk-bios-update.service

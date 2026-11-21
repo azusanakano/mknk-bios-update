@@ -1,0 +1,10 @@
+/build/
+/dist/
+__pycache__/
+*.pyc
+/debian/.debhelper/
+/debian/mknk-bios-update/
+/debian/*.substvars
+/debian/files
+/debian/debhelper-build-stamp
+/obj-*/

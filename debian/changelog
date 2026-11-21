@@ -1,0 +1,5 @@
+mknk-bios-update (0.1.0) noble; urgency=medium
+
+  * Initial native GTK desktop application and machine-wide transaction service.
+
+ -- MKNK BIOS Update contributors <mknk-bios-update@localhost>  Sat, 21 Nov 2026 12:00:00 +0900

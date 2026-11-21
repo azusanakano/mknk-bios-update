@@ -1,0 +1,15 @@
+Source: mknk-bios-update
+Section: admin
+Priority: optional
+Maintainer: MKNK BIOS Update contributors <mknk-bios-update@localhost>
+Build-Depends: debhelper-compat (= 13), meson, pkgconf, libgtk-4-dev, libjson-glib-dev, python3, python3-gi <!nocheck>, gir1.2-fwupd-2.0 (>= 2.0.20) <!nocheck>, gir1.2-jcat-1.0 <!nocheck>, openssl <!nocheck>, dbus-daemon, xvfb, xauth
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: mknk-bios-update
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}, python3 (>= 3.12), python3-gi, gir1.2-fwupd-2.0, gir1.2-jcat-1.0, fwupd (>= 2.0.20), libarchive13t64, udisks2, systemd, polkitd
+Description: native desktop updater for system BIOS and UEFI firmware
+ Displays the machine model, installed BIOS and next operation in one GTK
+ window. Validates stable vendor firmware and records individual update
+ requests across reboots using the system firmware update service.

@@ -1,0 +1,165 @@
+"""Machine-wide update receipts. Every permission is committed before it leaves the service."""
+import hashlib
+import hmac
+import json
+import re
+import secrets
+import sqlite3
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timezone
+
+
+class Conflict(Exception):
+    """An observation or a concurrent operation prevents this action."""
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+class Journal:
+    def __init__(self, path):
+        self.path = path
+        with self.transaction() as db:
+            db.execute("""CREATE TABLE IF NOT EXISTS operation (
+                id TEXT PRIMARY KEY, boot TEXT NOT NULL UNIQUE, machine TEXT NOT NULL,
+                plan TEXT NOT NULL, sender TEXT NOT NULL, daemon TEXT NOT NULL, bus TEXT NOT NULL,
+                issued TEXT NOT NULL, receipt TEXT NOT NULL DEFAULT 'unknown',
+                active INTEGER NOT NULL DEFAULT 1, outcome TEXT, observed TEXT, ended TEXT,
+                power_id TEXT, power_sender TEXT, power_bus TEXT)""")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS single_pending ON operation(active) WHERE active=1")
+            db.execute("CREATE TABLE IF NOT EXISTS setting (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS approval (slot INTEGER PRIMARY KEY CHECK(slot=1), id TEXT, plan TEXT)")
+            db.execute("INSERT OR IGNORE INTO setting VALUES ('identity-key', ?)", (secrets.token_hex(32),))
+
+    @contextmanager
+    def transaction(self):
+        db = sqlite3.connect(self.path, timeout=8)
+        db.row_factory = sqlite3.Row
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            yield db
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    def machine_key(self, value):
+        if not value:
+            return ""
+        with self.transaction() as db:
+            key = bytes.fromhex(db.execute("SELECT value FROM setting WHERE name='identity-key'").fetchone()[0])
+        return hmac.new(key, value.encode(), hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def unpack(row):
+        if row is None:
+            return None
+        obj = dict(row)
+        plan = json.loads(obj.pop("plan"))
+        return {**plan, **obj}
+
+    def active(self):
+        with self.transaction() as db:
+            return self.unpack(db.execute("SELECT * FROM operation WHERE active=1").fetchone())
+
+    def last(self, machine, boot):
+        with self.transaction() as db:
+            return self.unpack(db.execute(
+                "SELECT * FROM operation WHERE (machine=? AND machine!='') OR boot=? ORDER BY rowid DESC LIMIT 1",
+                (machine, boot)).fetchone())
+
+    def approval(self):
+        with self.transaction() as db:
+            row = db.execute("SELECT plan FROM approval WHERE slot=1").fetchone()
+            return json.loads(row[0]) if row else None
+
+    def approve(self, plan):
+        with self.transaction() as db:
+            row = db.execute("SELECT id FROM approval").fetchone()
+            if (row and row["id"] != plan["id"]) or db.execute("SELECT 1 FROM operation WHERE active=1").fetchone():
+                raise Conflict("別の計画の承認または送信を確認中です。")
+            db.execute("INSERT OR IGNORE INTO approval VALUES (1,?,?)", (plan["id"], json.dumps(plan)))
+
+    def cancel_approval(self, plan_id):
+        with self.transaction() as db:
+            db.execute("DELETE FROM approval WHERE id=?", (plan_id,))
+
+    def issue(self, plan, sender, daemon, bus, *, from_approval=False):
+        try:
+            with self.transaction() as db:
+                if from_approval and not db.execute("DELETE FROM approval WHERE id=?", (plan["id"],)).rowcount:
+                    raise Conflict("準備前の承認が取り消されました。")
+                db.execute("""INSERT INTO operation(id,boot,machine,plan,sender,daemon,bus,issued)
+                              VALUES (?,?,?,?,?,?,?,?)""",
+                           (plan["id"], plan["boot"], plan["machine"], json.dumps(plan), sender, daemon, bus, now()))
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("更新の依頼記録があります。状態を再確認してください。") from exc
+
+    def report(self, op, sender, bus, accepted):
+        with self.transaction() as db:
+            changed = db.execute("""UPDATE operation SET receipt=CASE WHEN ? THEN 'accepted' ELSE receipt END
+                                    WHERE id=? AND sender=? AND bus=?""", (bool(accepted), op, sender, bus))
+            if not changed.rowcount:
+                raise Conflict("更新依頼と応答元の接続が一致しません。")
+
+    def finish(self, op, outcome, current):
+        with self.transaction() as db:
+            db.execute("UPDATE operation SET active=0,outcome=?,observed=?,ended=? WHERE id=? AND active=1",
+                       (outcome, current, now(), op))
+
+    def history(self, machine, boot=""):
+        with self.transaction() as db:
+            rows = db.execute("""SELECT * FROM operation WHERE (machine=? AND machine!='') OR boot=?
+                                 ORDER BY rowid DESC LIMIT 20""", (machine, boot)).fetchall()
+        outcomes = {"installed": "目標版を確認", "unapplied": "目標版に未到達", "failed": "試行失敗",
+                    "unattributed": "旧計画への帰属は未確認"}
+        lines = []
+        for row in rows:
+            p = self.unpack(row)
+            receipt = "受付済み" if p["receipt"] == "accepted" else "受付未確定"
+            result = outcomes.get(p["outcome"], "結果を照合中")
+            lines.append(f"{p['issued']}　{p['current']} → {p['target']}　{receipt}　{result}"
+                         + (f"（実機 {p['observed']}）" if p["observed"] else ""))
+        return "\n".join(lines)
+
+    def power(self, op, sender, bus):
+        request = str(uuid.uuid4())
+        with self.transaction() as db:
+            changed = db.execute("""UPDATE operation SET power_id=?,power_sender=?,power_bus=?
+                                    WHERE id=? AND active=1 AND power_id IS NULL""", (request, sender, bus, op))
+            if not changed.rowcount:
+                raise Conflict("起動操作はすでに処理中か、予約が変わりました。状態を再確認してください。")
+        return request
+
+    def power_reply(self, request, sender, bus, cancelled):
+        with self.transaction() as db:
+            args = (request, sender, bus)
+            where = " WHERE power_id=? AND power_sender=? AND power_bus=? AND active=1"
+            if not db.execute("SELECT id FROM operation" + where, args).fetchone():
+                raise Conflict("電源操作の要求元を確認できません。")
+            if cancelled:
+                db.execute("UPDATE operation SET power_id=NULL,power_sender=NULL,power_bus=NULL" + where, args)
+
+    def catalog_generation(self, stamp, digest):
+        if type(stamp) is not int or stamp <= 0 or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise Conflict("配布情報の署名時刻またはハッシュを確認できません。")
+        with self.transaction() as db:
+            row = db.execute("SELECT value FROM setting WHERE name='generation'").fetchone()
+            if row:
+                latest, previous = json.loads(row[0])
+                if stamp <= latest:
+                    if digest != previous:
+                        raise Conflict("以前に確認した安定版カタログと署名世代が矛盾しています。")
+                    return
+            db.execute("INSERT OR REPLACE INTO setting VALUES ('generation',?)", (json.dumps([stamp, digest]),))
+
+    def setting(self, name, value=None):
+        with self.transaction() as db:
+            if value is not None:
+                db.execute("INSERT OR REPLACE INTO setting VALUES (?,?)", (name, json.dumps(value)))
+            row = db.execute("SELECT value FROM setting WHERE name=?", (name,)).fetchone()
+            return json.loads(row[0]) if row else None
