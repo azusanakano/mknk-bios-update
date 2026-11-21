@@ -10,6 +10,7 @@ import lzma
 import os
 from pathlib import Path
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -101,17 +102,18 @@ class CapsuleScopeTest(unittest.TestCase):
           <release version="65536"><checksum target="content" filename="old.bin"/></release>
         </releases></component>'''
         guid = str(self.guid)
-        device = {"DeviceId": "b" * 40, "VersionFormat": "pair"}
-        candidate = {"Version": "2.0", "AppstreamId": "example.bios"}
-        detail = {"AppstreamId": "example.bios", "Version": "131072", "Flags": ["trusted-payload"]}
         profile = {"fmp": {"image_type_id": guid, "image_index": 1, "hardware_instance": 0}}
         payload = self.single_image()
-        with (patch.object(updater, "fwupd_query",
-                           return_value=[{"Guid": [guid], "Releases": [detail]}]),
-              patch.object(updater, "read_cab_files",
-                           side_effect=[{"bios.metainfo.xml": manifest}, {"new.bin": payload}])):
-            self.assertEqual(updater.verify_cab(Path("fixture.cab"), candidate, guid, device, [device], profile),
-                             "FMP画像1件")
+        for fmt, raw, version in (("pair", "131072", "2.0"), ("bcd", "0x03800290", "3.80.2.90")):
+            device = {"DeviceId": "b" * 40, "VersionFormat": fmt}
+            candidate = {"Version": version, "AppstreamId": "example.bios"}
+            detail = {"AppstreamId": "example.bios", "Version": raw, "Flags": ["trusted-payload"]}
+            with (self.subTest(fmt=fmt),
+                  patch.object(updater, "fwupd_query", return_value=[{"Guid": [guid], "Releases": [detail]}]),
+                  patch.object(updater, "read_cab_files", side_effect=[
+                      {"bios.metainfo.xml": manifest.replace(b"131072", raw.encode())}, {"new.bin": payload}])):
+                self.assertEqual(updater.verify_cab(Path("fixture.cab"), candidate, guid, device, [device], profile),
+                                 "FMP画像1件")
 
 
 class StableRemoteTest(unittest.TestCase):
@@ -158,7 +160,7 @@ class StableCatalogTest(unittest.TestCase):
     metadata_uri = "https://cdn.fwupd.org/downloads/firmware.xml.xz"
     signature_uri = metadata_uri + ".jcat"
     guid = "12345678-1234-1234-1234-123456789abc"
-    bios = {"DeviceId": "b" * 40, "Version": "1.0", "VersionFormat": "pair",
+    bios = {"DeviceId": "b" * 40, "Version": "1.0", "VersionFormat": "pair", "Guid": [guid],
             "VendorIds": ["DMI:LENOVO"], "Protocols": ["org.uefi.capsule"]}
     published = {"RemoteId": "lvfs", "AppstreamId": "example.bios", "Version": "2.0",
                  "Checksum": ["a" * 64]}
@@ -170,7 +172,7 @@ class StableCatalogTest(unittest.TestCase):
 
     def exercise_check(self, release, *, xml=None, metadata_result=None, expected_hold=None, expected_output=None,
                        host_ids=None, policy=(None, frozenset()), approval_required=False, daemon_version="2.0.20",
-                       device_before_refresh=None):
+                       device_before_refresh=None, other_devices=()):
         remote = {"Id": "lvfs", "MetadataUri": self.metadata_uri, "MetadataUriSig": self.signature_uri,
                   "ApprovalRequired": False}
         active_remote = dict(remote, ApprovalRequired=approval_required)
@@ -199,7 +201,7 @@ class StableCatalogTest(unittest.TestCase):
 
         def inventory():
             device = self.bios if daemon_calls or device_before_refresh is None else device_before_refresh
-            return self.guid, device, [device]
+            return self.guid, device, [device, *other_devices]
 
         client = SimpleNamespace(update_metadata_bytes=update, get_daemon_version=lambda: daemon_version)
         fwupd = SimpleNamespace(Client=SimpleNamespace(new=lambda: client),
@@ -227,6 +229,8 @@ class StableCatalogTest(unittest.TestCase):
                 with self.assertRaisesRegex(updater.Hold, expected_hold):
                     updater.main()
                 self.assertNotIn("更新候補", output.getvalue())
+                if expected_output:
+                    self.assertIn(expected_output, output.getvalue())
         if host_ids is None:
             command.assert_not_called()
         else:
@@ -248,6 +252,10 @@ class StableCatalogTest(unittest.TestCase):
 
     def test_signature_rejection_stops_candidate_display(self):
         self.exercise_check(self.published, metadata_result=9, expected_hold="署名")
+
+    def test_check_shows_local_bios_even_when_catalog_verification_fails(self):
+        self.exercise_check(self.published, metadata_result=9, expected_hold="署名",
+                            expected_output="現在のBIOS 1.0")
 
     def test_daemon_accepts_verified_signature_with_same_timestamp(self):
         self.exercise_check(self.published, metadata_result=19)
@@ -286,6 +294,33 @@ class StableCatalogTest(unittest.TestCase):
                 xml = self.catalog_with_component_data(
                     f'<requires><firmware compare="{compare}" version="{version}"/></requires>')
                 self.exercise_check(self.published, xml=xml, metadata_result=19, expected_hold=expected_hold)
+
+    def test_a_unique_guid_requirement_uses_the_bios_version(self):
+        xml = self.catalog_with_component_data(
+            f'<requires><firmware compare="ge" version="1.0">{self.guid}</firmware></requires>')
+        self.exercise_check(self.published, xml=xml)
+        self.exercise_check(self.published, xml=xml.replace(b'version="1.0"', b'version="1.1"'),
+                            expected_hold="必須条件")
+        self.exercise_check(self.published, xml=xml, expected_hold="条件を確認できません",
+                            other_devices=[dict(self.bios, DeviceId="c" * 40)])
+
+    def test_version_check_required_demands_a_component_hard_requirement(self):
+        hard = '<requires><firmware compare="ge" version="1.0"/></requires>'
+        soft = hard.replace("requires", "recommends")
+        release_level = ET.fromstring(self.signed_xml)
+        release_level.find("component/releases/release").append(ET.fromstring(hard))
+        with patch.object(self, "bios", dict(self.bios, Flags=["version-check-required"])):
+            for xml in (self.signed_xml, self.catalog_with_component_data(soft), ET.tostring(release_level)):
+                with self.subTest(xml=xml):
+                    self.exercise_check(self.published, xml=xml, expected_hold="必須の版条件")
+            self.exercise_check(self.published, xml=self.catalog_with_component_data(hard))
+
+    def test_names_known_client_features_that_the_sample_does_not_provide(self):
+        xml = self.catalog_with_component_data('<requires><client>requests|switch-branch</client></requires>')
+        self.exercise_check(self.published, xml=xml, expected_hold=r"switch-branch.*対応")
+        self.exercise_check(None, xml=xml, expected_hold=r"switch-branch.*対応")
+        self.exercise_check(self.published, xml=xml.replace(b"switch-branch", b"made-up"),
+                            expected_hold="必須条件")
 
     def test_selected_candidate_is_held_when_a_signed_requirement_is_unknown(self):
         xml = self.catalog_with_component_data("<requires><phased_update>4</phased_update></requires>")
@@ -330,6 +365,11 @@ class StableCatalogTest(unittest.TestCase):
         with patch.object(self, "bios", dict(self.bios, VersionFormat="bcd")):
             self.exercise_check(self.published, xml=xml)
 
+    def test_catalog_accepts_the_bcd_integer_version_of_the_selected_cab(self):
+        xml = self.signed_xml.replace(b'version="131072"', b'version="0x03800290"')
+        with patch.object(self, "bios", dict(self.bios, Version="3.70.2.90", VersionFormat="bcd")):
+            self.exercise_check(dict(self.published, Version="3.80.2.90"), xml=xml)
+
     def test_check_uses_the_device_version_format_after_metadata_refresh(self):
         xml = self.catalog_with_component_data('<custom><value key="LVFS::VersionFormat">pair</value></custom>')
         before = dict(self.bios, Version="65536", VersionFormat="number")
@@ -342,6 +382,28 @@ class StableCatalogTest(unittest.TestCase):
 
     def test_selected_candidate_is_checked_for_an_explicit_block_without_competitors(self):
         self.exercise_check(self.published, policy=(None, {"a" * 64}), expected_hold="明示ブロック")
+
+    def catalog_with_cab_alias(self):
+        root = ET.fromstring(self.signed_xml)
+        artifacts = root.find("component/releases/release/artifacts")
+        alias = ET.fromstring(ET.tostring(artifacts[0]))
+        ET.SubElement(alias, "checksum", type="sha512").text = "e" * 128
+        artifacts.append(alias)
+        return ET.tostring(root)
+
+    def test_signed_alias_of_selected_cab_is_enough_to_block_it(self):
+        xml = self.catalog_with_cab_alias()
+        self.exercise_check(self.published, xml=xml, policy=(None, {"e" * 128}), expected_hold="明示ブロック")
+        self.exercise_check(self.published, xml=xml, policy=({"e" * 128}, set()), approval_required=True)
+
+    def test_an_additional_index_digest_can_block_but_cannot_approve_the_cab(self):
+        release = dict(self.published, Checksum=["a" * 64, "e" * 128])
+        self.exercise_check(release, policy=(None, {"e" * 128}), expected_hold="明示ブロック")
+        self.exercise_check(release, policy=({"e" * 128}, set()), approval_required=True, expected_hold="承認一覧")
+
+    def test_index_and_catalog_can_identify_the_cab_with_either_strong_hash(self):
+        xml = self.signed_xml.replace(b'a' * 64, b'e' * 128).replace(b"sha256", b"sha512")
+        self.exercise_check(dict(self.published, Checksum=["a" * 64, "e" * 128]), xml=xml)
 
     def catalog_with_competitor(self, version, *, component_data=None):
         root = ET.fromstring(self.signed_xml)
@@ -369,6 +431,16 @@ class StableCatalogTest(unittest.TestCase):
     def test_only_installed_version_in_catalog_means_no_update(self):
         self.exercise_check(None, xml=self.signed_xml.replace(b'version="131072"', b'version="65536"'),
                             expected_output="このBIOSで利用できる新版はありません")
+
+    def test_check_explains_the_known_policy_reason_for_an_unavailable_newer_version(self):
+        for policy, reason in (((None, {"a" * 64}), "明示ブロック"), ((set(), set()), "承認一覧")):
+            with self.subTest(reason=reason):
+                self.exercise_check(None, policy=policy, approval_required=policy[0] is not None,
+                                    expected_output=f"新版 2.0　{reason}")
+
+    def test_check_explains_the_known_intermediate_version_when_no_candidate_exists(self):
+        xml = self.catalog_with_component_data('<requires><firmware compare="ge" version="1.5"/></requires>')
+        self.exercise_check(None, xml=xml, expected_output="新版 2.0　前提版 1.5")
 
     def test_check_reports_a_missing_model_separately_from_a_missing_update(self):
         self.exercise_check(None, xml=b"<components/>", expected_output="この機種の掲載を確認できません")
@@ -430,10 +502,13 @@ class StableCatalogTest(unittest.TestCase):
             self.exercise_check(release, xml=ET.tostring(root), expected_hold="上位版")
 
     def exercise_apply(self, latest_xml, *, expected_error=None, secure_boot_before=b"\x01",
-                       secure_boot_after=b"\x01", disk_support_after=4):
+                       secure_boot_after=b"\x01", disk_support_after=4, boot_order_after=3,
+                       boot_order_during_authorization=None, policy=(None, frozenset()), policy_after=None,
+                       initial_xml=None, initial_release=None, latest_release=None, cabinet_bytes=None):
         verify_path = "/proc/self/fd/23"
         with TemporaryDirectory() as tmp:
-            esp = Path(tmp) / "esp"
+            base = Path(tmp)
+            esp = base / "esp"
             esp.mkdir()
             variables = Path(tmp) / "efivars"
             variables.mkdir()
@@ -441,14 +516,17 @@ class StableCatalogTest(unittest.TestCase):
             secure_boot.write_bytes(struct.pack("<I", 7) + secure_boot_before)
             disk_support = variables / f"OsIndicationsSupported-{updater.EFI_GLOBAL}"
             disk_support.write_bytes(struct.pack("<IQ", 7, 4))
+            BootEntryTest.disk_boot_target(variables, uuid.UUID(self.guid))
             bios = dict(self.bios, Flags=["updatable"])
             profile = {"secure_boot": {"delivery": "capsule-on-disk"}}
-            cabinet = SimpleNamespace(fileno=lambda: 23)
+            cabinet = SimpleNamespace() if cabinet_bytes is None else io.BytesIO(cabinet_bytes)
+            cabinet.fileno = lambda: 23
             catalog = Mock(side_effect=[(list(ET.fromstring(xml)), "2.0.20")
-                                        for xml in (self.signed_xml, latest_xml)])
+                                        for xml in (initial_xml or self.signed_xml, latest_xml)])
             verify = Mock(return_value="FMP画像1件")
-            send = Mock()
+            send = Mock(return_value=SimpleNamespace(wait=lambda: 0))
             marker = Path(tmp) / "marker"
+            release = initial_release or self.published
 
             def approve(_prompt):
                 if secure_boot_after is None:
@@ -459,7 +537,20 @@ class StableCatalogTest(unittest.TestCase):
                     disk_support.unlink()
                 else:
                     disk_support.write_bytes(struct.pack("<IQ", 7, disk_support_after))
+                (variables / f"BootOrder-{updater.EFI_GLOBAL}").write_bytes(struct.pack("<IH", 7, boot_order_after))
                 return "yes"
+
+            def sudo(args, _purpose):
+                self.assertEqual(Path(args[-1]), marker)
+                if args[0] == "/usr/bin/mkdir":
+                    marker.mkdir()
+                    if boot_order_during_authorization is not None:
+                        (variables / f"BootOrder-{updater.EFI_GLOBAL}").write_bytes(
+                            struct.pack("<IH", 7, boot_order_during_authorization))
+                else:
+                    self.assertEqual(args[0], "/usr/bin/rmdir")
+                    marker.rmdir()
+                return b""
 
             with (redirect_stdout(io.StringIO()),
                   patch.object(sys, "argv", [SCRIPT.name, "--apply"]),
@@ -467,25 +558,32 @@ class StableCatalogTest(unittest.TestCase):
                   patch.object(sys.stdout, "isatty", return_value=True),
                   patch.object(updater, "fwupd_bindings", return_value=(
                       None, SimpleNamespace(Error=FixtureGLibError, Regex=FixtureRegex))),
+                  patch.object(updater, "partition_number", return_value=1),
+                  patch.object(updater.subprocess, "Popen", send),
                   patch.multiple(updater, ESRT=Path(tmp), DMI=Path(tmp), EFIVARS=variables, require_fwupdmgr=Mock(),
                                  read_settings=Mock(return_value=profile), support_profile=Mock(return_value=profile),
                                  inventory=Mock(return_value=(self.guid, bios, [bios])),
                                  stable_remote=Mock(return_value={"Id": "lvfs"}), rows=Mock(return_value=[]),
-                                 admin_checksums=Mock(return_value=(None, set())), load_stable_catalog=catalog,
-                                 candidate=Mock(return_value=self.published), marker_path=Mock(return_value=marker),
-                                 mount_points=Mock(return_value={str(variables): ("0:1", "/", "efivarfs")}),
+                                 admin_checksums=Mock(side_effect=[policy, policy if policy_after is None else policy_after]),
+                                 load_stable_catalog=catalog,
+                                 candidate=Mock(side_effect=[release, latest_release or release]),
+                                 marker_path=Mock(return_value=marker), sudo_command=sudo,
+                                 MOUNTINFO=ReadinessTest.mountinfo(base),
                                  find_esp=Mock(return_value=(esp, self.guid)), check_power=Mock(),
                                  open_cabinet=Mock(return_value=nullcontext(cabinet)),
-                                 fetch_cab=Mock(return_value=verify_path), verify_cab=verify, send_once=send),
+                                 fetch_cab=Mock(return_value=verify_path), verify_cab=verify),
                   patch("builtins.input", side_effect=approve)):
                 if expected_error:
                     with self.assertRaisesRegex(updater.Hold, expected_error):
                         updater.main()
                     send.assert_not_called()
+                    self.assertFalse(marker.exists())
                 else:
                     updater.main()
                     self.assertEqual([call.args[0] for call in verify.call_args_list], [verify_path, verify_path])
-                    send.assert_called_once_with(marker, bios, self.published, 23)
+                    send.assert_called_once_with([updater.FWUPDMGR, "--no-reboot-check", "local-install",
+                                                  verify_path, bios["DeviceId"]], pass_fds=(23,))
+                    self.assertTrue(marker.is_dir())
                 self.assertEqual(catalog.call_count, 2)
 
     def test_apply_rechecks_the_signed_catalog_after_approval(self):
@@ -522,6 +620,44 @@ class StableCatalogTest(unittest.TestCase):
             with self.subTest(supported=supported):
                 self.exercise_apply(self.signed_xml, secure_boot_before=b"\x00", secure_boot_after=b"\x00",
                                     disk_support_after=supported, expected_error=None if supported else "OsIndicationsSupported")
+
+    def test_apply_holds_a_cab_blocked_under_an_alias_added_after_approval(self):
+        self.exercise_apply(self.catalog_with_cab_alias(), policy=(None, {"e" * 128}), expected_error="明示ブロック")
+
+    def test_apply_rechecks_which_esp_boot_order_selects_after_approval(self):
+        self.exercise_apply(self.signed_xml, boot_order_after=4, expected_error="Boot0004")
+
+    def test_apply_rechecks_boot_order_after_authorizing_the_request_marker(self):
+        self.exercise_apply(self.signed_xml, boot_order_during_authorization=4, expected_error="Boot0004")
+
+    def test_apply_can_recheck_an_index_that_changes_from_sha256_to_verified_sha512(self):
+        content = b"verified temporary CAB"
+        sha256 = hashlib.sha256(content).hexdigest().encode()
+        sha512 = hashlib.sha512(content).hexdigest().encode()
+        initial_xml = self.catalog_with_cab_alias().replace(b"a" * 64, sha256).replace(b"e" * 128, sha512)
+        latest_xml = self.signed_xml.replace(b"a" * 64, sha512).replace(b"sha256", b"sha512")
+        self.exercise_apply(latest_xml, initial_xml=initial_xml, cabinet_bytes=content,
+                            initial_release=dict(self.published, Checksum=[sha256.decode()]),
+                            latest_release=dict(self.published, Checksum=[sha512.decode()]))
+
+    def test_apply_rechecks_new_signed_digests_against_the_original_cabinet(self):
+        content = b"verified temporary CAB"
+        sha256 = hashlib.sha256(content).hexdigest().encode()
+        initial_xml = self.signed_xml.replace(b"a" * 64, sha256)
+        latest_xml = self.catalog_with_cab_alias().replace(b"a" * 64, sha256)
+        self.exercise_apply(latest_xml, initial_xml=initial_xml, cabinet_bytes=content,
+                            initial_release=dict(self.published, Checksum=[sha256.decode()]),
+                            expected_error="CABのハッシュ")
+
+    def test_apply_keeps_checking_a_verified_digest_that_disappears_from_the_catalog(self):
+        content = b"verified temporary CAB"
+        sha256 = hashlib.sha256(content).hexdigest().encode()
+        sha512 = hashlib.sha512(content).hexdigest().encode()
+        initial_xml = self.catalog_with_cab_alias().replace(b"a" * 64, sha256).replace(b"e" * 128, sha512)
+        latest_xml = self.signed_xml.replace(b"a" * 64, sha256)
+        self.exercise_apply(latest_xml, initial_xml=initial_xml, cabinet_bytes=content,
+                            initial_release=dict(self.published, Checksum=[sha256.decode()]),
+                            policy_after=(None, {sha512.decode()}), expected_error="明示ブロック")
 
 
 class CatalogSizeTest(unittest.TestCase):
@@ -561,6 +697,17 @@ class CatalogSizeTest(unittest.TestCase):
         with self.assertRaisesRegex(updater.Hold, "受信サイズ"):
             updater.catalog_download_size(conflict)
 
+    def test_cab_artifact_linked_through_a_second_digest_contributes_its_size(self):
+        bridge = (f'<artifact type="binary"><checksum type="sha256">{"a" * 64}</checksum>'
+                  f'<checksum type="sha512">{"e" * 128}</checksum></artifact>')
+        end = (f'<artifact type="binary"><checksum type="sha512">{"e" * 128}</checksum>'
+               '<size type="download">23</size></artifact>')
+        for other in (bridge + end, end + bridge):
+            with self.subTest(other=other):
+                with self.assertRaisesRegex(updater.Hold, "受信サイズ"):
+                    updater.catalog_download_size(self.release(artifact_size='<size type="download">17</size>',
+                                                              other=other))
+
     def test_size_for_a_different_cab_is_not_used_even_when_its_name_matches(self):
         other = (f'<artifact type="binary"><filename>bios.cab</filename><checksum type="sha256">{"b" * 64}</checksum>'
                  '<size type="download">23</size></artifact>')
@@ -583,12 +730,21 @@ class CatalogSizeTest(unittest.TestCase):
 class BootEntryTest(unittest.TestCase):
     esp = uuid.UUID("87654321-4321-4321-4321-cba987654321")
 
-    def boot_option(self, options=b""):
-        device_path = struct.pack("<BBHIQQ16sBB", 4, 1, 42, 1, 64, 4096, self.esp.bytes_le, 2, 2)
-        loader = "\\EFI\\example\\fwupdx64.efi\0".encode("utf-16-le")
-        device_path += struct.pack("<BBH", 4, 4, len(loader) + 4) + loader + b"\x7f\xff\x04\x00"
-        name = "Linux Firmware Updater\0".encode("utf-16-le")
-        return struct.pack("<IIH", 7, 1, len(device_path)) + name + device_path + options
+    @staticmethod
+    def boot_option(options=b"", *, guid=esp, name="Linux Firmware Updater", attributes=1, partition=1,
+                    device_path=None, prefix=b""):
+        if device_path is None:
+            drive = struct.pack("<BBHIQQ16sBB", 4, 1, 42, partition, 64, 4096, guid.bytes_le, 2, 2)
+            loader = "\\EFI\\example\\bootx64.efi\0".encode("utf-16-le")
+            device_path = prefix + drive + struct.pack("<BBH", 4, 4, len(loader) + 4) + loader
+        device_path += b"\x7f\xff\x04\x00"
+        label = (name + "\0").encode("utf-16-le")
+        return struct.pack("<IIH", 7, attributes, len(device_path)) + label + device_path + options
+
+    @staticmethod
+    def disk_boot_target(efivars, guid=esp):
+        (efivars / f"BootOrder-{updater.EFI_GLOBAL}").write_bytes(struct.pack("<IH", 7, 3))
+        (efivars / f"Boot0003-{updater.EFI_GLOBAL}").write_bytes(BootEntryTest.boot_option(guid=guid, name="Ubuntu"))
 
     def test_only_the_verified_boot_option_for_the_current_esp_is_reusable(self):
         expected = self.boot_option()
@@ -635,7 +791,8 @@ class ReservationStatusTest(unittest.TestCase):
             with (patch.object(sys, "argv", [SCRIPT.name, "--status"]),
                   patch.object(updater.os.path, "isfile", return_value=True),
                   patch.object(updater, "EFIVARS", variables),
-                  patch.object(updater, "mount_points", return_value={str(variables): ("0:1", "/", "efivarfs")}),
+                  patch.object(updater, "mount_points", return_value={
+                      str(variables): updater.MountPoint(20, "0:1", "/", "efivarfs", False)}),
                   patch.object(updater, "find_esp", return_value=(esp, str(BootEntryTest.esp))),
                   patch.object(updater, "read_esrt", return_value=str(guid)),
                   patch.object(updater, "inventory", return_value=(str(guid), bios, [bios])),
@@ -665,7 +822,7 @@ class ReservationStatusTest(unittest.TestCase):
         with TemporaryDirectory() as tmp, patch.object(updater, "EFIVARS", Path(tmp)):
             entry = Path(tmp) / f"fwupd-{guid}-0-{updater.FWUPDATE_GUID}"
             entry.write_bytes(self.fwupd_variable(0, guid))
-            self.assertEqual(updater.fwupd_efi_state(), ([], False))
+            self.assertEqual(updater.fwupd_efi_state(), ([], None))
 
     def test_status_counts_the_reservation_when_a_bootloader_capability_is_present(self):
         guid = CapsuleScopeTest.guid
@@ -691,7 +848,7 @@ class ReservationStatusTest(unittest.TestCase):
     def test_status_prints_delivery_bit_even_when_esp_cannot_be_resolved(self):
         with (patch.object(updater, "mount_points", return_value={}),
               patch.object(updater, "require_efivarfs"),
-              patch.object(updater, "fwupd_efi_state", return_value=([], False)),
+              patch.object(updater, "fwupd_efi_state", return_value=([], None)),
               patch.object(updater, "boot_next", return_value=None),
               patch.object(updater, "find_esp", side_effect=updater.Hold("ESP is ambiguous")),
               patch.object(updater, "disk_delivery_requested", return_value=True),
@@ -711,14 +868,15 @@ class ReservationStatusTest(unittest.TestCase):
                   patch.object(updater, "read_esrt", return_value=str(CapsuleScopeTest.guid)),
                   patch.object(updater, "inventory", side_effect=updater.Hold("inventory unavailable")),
                   patch.object(updater, "EFIVARS", variables),
-                  patch.object(updater, "mount_points", return_value={str(variables): ("0:1", "/", "efivarfs")}),
+                  patch.object(updater, "mount_points", return_value={
+                      str(variables): updater.MountPoint(20, "0:1", "/", "efivarfs", False)}),
                   patch.object(updater, "find_esp", return_value=(variables, str(BootEntryTest.esp))),
                   patch.object(updater, "marker_path", return_value=marker),
                   self.assertRaisesRegex(updater.Hold, "inventory unavailable")):
                 updater.main()
 
         self.assertIn("Boot0003", output.getvalue())
-        self.assertIn("この起動で更新を依頼しています", output.getvalue())
+        self.assertIn("この起動で更新依頼の記録があります", output.getvalue())
 
     def test_status_prints_marker_when_history_fails(self):
         bios = {"DeviceId": "b" * 40, "Version": "1.0"}
@@ -735,7 +893,7 @@ class ReservationStatusTest(unittest.TestCase):
                   patch.object(updater, "rows", side_effect=updater.Error("history unavailable")),
                   self.assertRaisesRegex(updater.Error, "history unavailable")):
                 updater.main()
-        self.assertIn("この起動で更新を依頼しています", output.getvalue())
+        self.assertIn("この起動で更新依頼の記録があります", output.getvalue())
 
     def test_status_keeps_the_esrt_guid_if_fwupd_device_enumeration_fails(self):
         guid = CapsuleScopeTest.guid
@@ -753,7 +911,8 @@ class ReservationStatusTest(unittest.TestCase):
             with (patch.object(updater, "ESRT", entries),
                   patch.object(updater, "EFIVARS", variables),
                   patch.object(updater, "require_fwupdmgr"),
-                  patch.object(updater, "mount_points", return_value={str(variables): ("0:1", "/", "efivarfs")}),
+                  patch.object(updater, "mount_points", return_value={
+                      str(variables): updater.MountPoint(20, "0:1", "/", "efivarfs", False)}),
                   patch.object(updater, "find_esp", return_value=(base, str(BootEntryTest.esp))),
                   patch.object(updater, "marker_path", return_value=base / "marker"),
                   patch.object(updater, "rows", side_effect=updater.Error("get-devices unavailable")),
@@ -783,14 +942,156 @@ class ReservationStatusTest(unittest.TestCase):
 
 
 class ReadinessTest(unittest.TestCase):
-    def check_secure_boot_readiness(self, base, profile):
+    @staticmethod
+    def mountinfo(base, *, mount_options="rw", super_options="rw"):
         esp, efivars = base / "esp", base / "efivars"
+        path = base / "mountinfo"
+        path.write_text(f"20 1 0:1 / {efivars} {mount_options} - efivarfs efivarfs {super_options}\n"
+                        f"21 1 8:1 / {esp} rw - vfat /dev/sda1 rw\n", encoding="utf-8")
+        return path
+
+    def check_secure_boot_readiness(self, base, profile, *, mount_options="rw", super_options="rw"):
+        esp, efivars = base / "esp", base / "efivars"
+        platform_size = base / "fw_platform_size"
+        platform_size.write_text("64\n", encoding="ascii")
         bios = {"DeviceId": "b" * 40, "Flags": ["updatable"]}
         with (patch.object(updater, "EFIVARS", efivars),
-              patch.object(updater, "mount_points", return_value={str(efivars): ("0:1", "/", "efivarfs")}),
+              patch.object(updater, "MOUNTINFO",
+                           self.mountinfo(base, mount_options=mount_options, super_options=super_options)),
               patch.object(updater, "find_esp", return_value=(esp, str(BootEntryTest.esp))),
+              patch.object(updater, "partition_number", return_value=1),
+              patch.object(updater, "EFI_APP_DIR", base),
+              patch.object(updater, "EFI_PLATFORM_SIZE", platform_size),
               patch.object(updater, "check_power")):
             return updater.check_ready(bios, [bios], [], profile)
+
+    def test_disk_delivery_holds_when_pxe_is_first_active_in_boot_order(self):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            variables = base / "efivars"
+            variables.mkdir()
+            (variables / f"SecureBoot-{updater.EFI_GLOBAL}").write_bytes(struct.pack("<IB", 7, 0))
+            (variables / f"OsIndicationsSupported-{updater.EFI_GLOBAL}").write_bytes(struct.pack("<IQ", 7, 4))
+            BootEntryTest.disk_boot_target(variables)
+            (variables / f"BootOrder-{updater.EFI_GLOBAL}").write_bytes(struct.pack("<IHH", 7, 4, 3))
+            pxe = variables / f"Boot0004-{updater.EFI_GLOBAL}"
+            mac_path = struct.pack("<BBH", 3, 11, 37) + bytes(32) + b"\x01"
+            pxe.write_bytes(BootEntryTest.boot_option(name="PXE", device_path=mac_path))
+            profile = {"secure_boot": {"delivery": "capsule-on-disk"}}
+            with self.assertRaisesRegex(updater.Hold, "Boot0004"):
+                self.check_secure_boot_readiness(base, profile)
+
+            pxe.write_bytes(BootEntryTest.boot_option(name="PXE", device_path=mac_path, attributes=0))
+            self.assertEqual(self.check_secure_boot_readiness(base, profile)[0], base / "esp")
+            unverified = variables / f"Boot0003-{updater.EFI_GLOBAL}"
+            unverified.write_bytes(BootEntryTest.boot_option(name="Ubuntu", partition=2))
+            with self.assertRaisesRegex(updater.Hold, "Boot0003"):
+                self.check_secure_boot_readiness(base, profile)
+
+    def test_read_only_efivarfs_holds_preparation_and_can_still_show_status(self):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            variables, esp = base / "efivars", base / "esp"
+            variables.mkdir()
+            (variables / f"SecureBoot-{updater.EFI_GLOBAL}").write_bytes(struct.pack("<IB", 7, 0))
+            (variables / f"OsIndicationsSupported-{updater.EFI_GLOBAL}").write_bytes(struct.pack("<IQ", 7, 4))
+            BootEntryTest.disk_boot_target(variables)
+            profile = {"secure_boot": {"delivery": "capsule-on-disk"}}
+            for mount_options, super_options in (("ro,nosuid", "rw"), ("rw,nosuid", "ro")):
+                with self.subTest(mount=mount_options, superblock=super_options):
+                    with self.assertRaisesRegex(updater.Hold, "読み取り専用"):
+                        self.check_secure_boot_readiness(base, profile, mount_options=mount_options,
+                                                        super_options=super_options)
+                    with (patch.object(updater, "MOUNTINFO", self.mountinfo(
+                            base, mount_options=mount_options, super_options=super_options)),
+                          patch.object(updater, "EFIVARS", variables),
+                          patch.object(updater, "find_esp", return_value=(esp, str(BootEntryTest.esp))),
+                          redirect_stdout(io.StringIO()) as output):
+                        updater.show_reservations(str(BootEntryTest.esp))
+                    self.assertIn("標準の配送指示なし", output.getvalue())
+
+    @staticmethod
+    def x64_efi_fixture():
+        # DOSヘッダー、AMD64のCOFFヘッダー、PE32+のEFI Application。
+        dos = bytearray(64)
+        dos[:2] = b"MZ"
+        struct.pack_into("<I", dos, 60, 64)
+        coff = struct.pack("<4sHHIIIHH", b"PE\0\0", 0x8664, 1, 0, 0, 0, 112, 0x22)
+        optional = bytearray(112)
+        struct.pack_into("<H", optional, 0, 0x20b)
+        struct.pack_into("<H", optional, 68, 10)
+        return bytes(dos) + coff + optional + bytes(40)
+
+    def test_nvram_checks_the_first_loader_fwupd_would_choose_with_secure_boot_off(self):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            variables = base / "efivars"
+            variables.mkdir()
+            (variables / f"SecureBoot-{updater.EFI_GLOBAL}").write_bytes(struct.pack("<IB", 7, 0))
+            loader = base / "fwupdx64.efi"
+            signed = base / "fwupdx64.efi.signed"
+            image = self.x64_efi_fixture()
+            signed.write_bytes(image)
+            profile = {"secure_boot": {"delivery": "shim", "efi_app_dir": str(base),
+                                       "fwupd_efi_sha256": hashlib.sha256(image).hexdigest()}}
+            for invalid in (b"", b"non-empty broken loader"):
+                with self.subTest(loader=invalid):
+                    loader.write_bytes(invalid)
+                    with self.assertRaisesRegex(updater.Hold, "fwupdx64.efi"):
+                        self.check_secure_boot_readiness(base, profile)
+            loader.unlink()
+            self.assertEqual(self.check_secure_boot_readiness(base, profile)[0], base / "esp")
+            loader.write_bytes(image)
+            self.assertEqual(self.check_secure_boot_readiness(base, profile)[0], base / "esp")
+
+    def test_unrecognized_delivery_is_held_even_with_secure_boot_off(self):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            variables = base / "efivars"
+            variables.mkdir()
+            (variables / f"SecureBoot-{updater.EFI_GLOBAL}").write_bytes(struct.pack("<IB", 7, 0))
+            with self.assertRaisesRegex(updater.Hold, "配送方式"):
+                self.check_secure_boot_readiness(base, {"secure_boot": {"delivery": "capsule_on_disk"}})
+
+    def test_nvram_holds_a_persistent_zero_capability_but_cod_can_proceed(self):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            variables = base / "efivars"
+            variables.mkdir()
+            (variables / f"SecureBoot-{updater.EFI_GLOBAL}").write_bytes(struct.pack("<IB", 7, 0))
+            flag = variables / f"BootloaderSupportsFwupd-{updater.FWUPDATE_GUID}"
+            flag.write_bytes(struct.pack("<IB", 7, 0))
+            (base / "fwupdx64.efi").write_bytes(self.x64_efi_fixture())
+            nvram = {"secure_boot": {"delivery": "shim", "efi_app_dir": str(base)}}
+            with self.assertRaisesRegex(updater.Hold, "BootloaderSupportsFwupd"):
+                self.check_secure_boot_readiness(base, nvram)
+            flag.write_bytes(struct.pack("<IB", 6, 0))
+            self.assertEqual(self.check_secure_boot_readiness(base, nvram)[0], base / "esp")
+
+            flag.write_bytes(struct.pack("<IB", 7, 0))
+            (variables / f"OsIndicationsSupported-{updater.EFI_GLOBAL}").write_bytes(struct.pack("<IQ", 7, 4))
+            BootEntryTest.disk_boot_target(variables)
+            self.assertEqual(self.check_secure_boot_readiness(base, {"secure_boot": {"delivery": "capsule-on-disk"}})[0],
+                             base / "esp")
+
+    def test_case_sensitive_mount_still_detects_a_capsule_in_an_uppercase_directory(self):
+        with TemporaryDirectory() as tmp:
+            esp = Path(tmp)
+            directory = esp / "EFI" / "UPDATECAPSULE"
+            directory.mkdir(parents=True)
+            capsule = directory / "pending.cap"
+            capsule.touch()
+            iterdir = Path.iterdir
+
+            def case_sensitive(path):
+                if path.name == "UpdateCapsule":
+                    raise FileNotFoundError(path)
+                return iterdir(path)
+
+            with patch.object(Path, "iterdir", new=case_sensitive):
+                self.assertEqual(updater.disk_entries(esp), ["EFI/UpdateCapsule"])
+                capsule.unlink()
+                self.assertEqual(updater.disk_entries(esp), [])
 
     def test_secure_boot_requires_a_verified_shim_on_esp_or_in_the_fwupd_package(self):
         with TemporaryDirectory() as tmp:
@@ -841,6 +1142,7 @@ class ReadinessTest(unittest.TestCase):
             with self.assertRaisesRegex(updater.Hold, "OsIndicationsSupported"):
                 self.check_secure_boot_readiness(base, profile)
             (variables / f"OsIndicationsSupported-{updater.EFI_GLOBAL}").write_bytes(struct.pack("<IQ", 7, 4))
+            BootEntryTest.disk_boot_target(variables)
             self.assertEqual(self.check_secure_boot_readiness(base, profile)[0], base / "esp")
 
     def test_readiness_requires_a_confirmed_secure_boot_state(self):
@@ -851,6 +1153,7 @@ class ReadinessTest(unittest.TestCase):
             with self.assertRaisesRegex(updater.Hold, "Secure Boot"):
                 self.check_secure_boot_readiness(base, {})
             (variables / f"SecureBoot-{updater.EFI_GLOBAL}").write_bytes(struct.pack("<IB", 7, 0))
+            (base / "fwupdx64.efi").write_bytes(self.x64_efi_fixture())
             self.assertEqual(self.check_secure_boot_readiness(base, {})[0], base / "esp")
 
     def test_bootloader_capability_requires_a_verified_delivery_route(self):
@@ -866,6 +1169,7 @@ class ReadinessTest(unittest.TestCase):
             with self.assertRaisesRegex(updater.Hold, "OsIndicationsSupported"):
                 self.check_secure_boot_readiness(base, profile)
             (variables / f"OsIndicationsSupported-{updater.EFI_GLOBAL}").write_bytes(struct.pack("<IQ", 7, 4))
+            BootEntryTest.disk_boot_target(variables)
             self.assertEqual(self.check_secure_boot_readiness(base, profile)[0], base / "esp")
 
     def test_dell_recovery_file_blocks_preparation_without_delivery_bit(self):
@@ -878,7 +1182,7 @@ class ReadinessTest(unittest.TestCase):
             with (patch.object(updater, "mount_points", return_value={}),
                   patch.object(updater, "require_efivarfs"),
                   patch.object(updater, "find_esp", return_value=(esp, str(BootEntryTest.esp))),
-                  patch.object(updater, "fwupd_efi_state", return_value=([], False)),
+                  patch.object(updater, "fwupd_efi_state", return_value=([], None)),
                   patch.object(updater, "boot_next", return_value=None),
                   patch.object(updater, "check_boot_entries"),
                   patch.object(updater, "disk_delivery_requested", return_value=False),
@@ -910,7 +1214,7 @@ class EspSelectionTest(unittest.TestCase):
     filesystem = "org.freedesktop.UDisks2.Filesystem"
     lsblk = {"blockdevices": [{"maj:min": "8:1", "parttype": "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",
                               "partuuid": guid}]}
-    mounts = {str(Path("/boot/efi")): ("8:1", "/", "vfat")}
+    mounts = {str(Path("/boot/efi")): updater.MountPoint(21, "8:1", "/", "vfat", False)}
 
     def volume(self, kind, *, mount=b"/boot/efi\0", internal=True, raid="/", number=2049):
         return {
@@ -919,9 +1223,10 @@ class EspSelectionTest(unittest.TestCase):
             self.filesystem: {"MountPoints": [mount]},
         }
 
-    def lookup(self, objects, mounts=None):
+    def lookup(self, objects, mounts=None, *, opened_esp=("8:1", 21)):
         with (patch.object(updater.subprocess, "run", return_value=SimpleNamespace(stdout=json.dumps(self.lsblk))),
               patch.object(updater, "udisks_objects", return_value=objects, create=True),
+              patch.object(updater, "mounted_path_identity", return_value=opened_esp),
               patch.object(updater.os, "major", new=lambda number: number >> 8, create=True),
               patch.object(updater.os, "minor", new=lambda number: number & 255, create=True)):
             return updater.find_esp(self.mounts if mounts is None else mounts)
@@ -947,12 +1252,28 @@ class EspSelectionTest(unittest.TestCase):
             self.lookup({"/block/esp": self.volume(updater.ESP_TYPE, mount=b"/mnt/other\0")})
 
     def test_rejects_an_overlay_mount_that_hides_a_delivery_directory(self):
-        mounts = {**self.mounts, str(Path("/boot/efi/EFI")): ("8:3", "/", "ext4")}
+        mounts = {**self.mounts, str(Path("/boot/efi/EFI")): updater.MountPoint(33, "8:3", "/", "ext4", False)}
         with self.assertRaisesRegex(updater.Hold, "マウント"):
             self.lookup({"/block/esp": self.volume(updater.ESP_TYPE)}, mounts=mounts)
 
+    def test_rejects_an_esp_hidden_by_a_parent_mount(self):
+        mounts = {**self.mounts, str(Path("/boot")): updater.MountPoint(33, "8:3", "/", "ext4", False)}
+        for identity in (("8:3", 33), ("8:1", 33)):
+            with (self.subTest(opened=identity), self.assertRaisesRegex(updater.Hold, "マウント")):
+                self.lookup({"/block/esp": self.volume(updater.ESP_TYPE)}, mounts=mounts, opened_esp=identity)
+
 
 class InteractiveCandidateTest(unittest.TestCase):
+    def test_same_version_representations_of_one_cab_do_not_create_a_conflict(self):
+        device = {"DeviceId": "b" * 40, "Version": "1.0", "VersionFormat": "pair"}
+        release = dict(StableCatalogTest.published, Checksum=["a" * 64, "e" * 128])
+        other = dict(release, Checksum=["e" * 128])
+        with patch.object(updater, "fwupd_query", return_value=[release, other]):
+            self.assertEqual(updater.candidate(device), release)
+        with patch.object(updater, "fwupd_query", return_value=[release, dict(other, Checksum=["c" * 64, "e" * 128])]):
+            with self.assertRaisesRegex(updater.Hold, "異なる配布物"):
+                updater.candidate(device)
+
     def test_equivalent_triplet_versions_with_different_cabs_are_held(self):
         device = {"DeviceId": "b" * 40, "Version": "1.0.0", "VersionFormat": "triplet"}
         first = {"RemoteId": "lvfs", "AppstreamId": "example.bios", "Version": "1.02.3",
@@ -1097,16 +1418,78 @@ class CabDestinationTest(unittest.TestCase):
                     seal.assert_not_called()
 
 
+@unittest.skipUnless(shutil.which("sh"), "requires a POSIX shell")
+class ShellEntryTest(unittest.TestCase):
+    def run_wrapper(self, *args):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            venv = base / "venv"
+            venv.mkdir()
+            system_python = base / "system-python"
+            for interpreter, name in ((system_python, "system"), (venv / "python3", "venv")):
+                interpreter.write_bytes(f'#!/bin/sh\nprintf "%s\\n" {name} "$@"\n'.encode("ascii"))
+                interpreter.chmod(0o755)
+            # 本体を実行せず、ディストリビューションのPythonだけを一時ファイルに置き換える。
+            source = SCRIPT.with_suffix(".sh").read_text(encoding="utf-8")
+            wrapper = base / SCRIPT.with_suffix(".sh").name
+            wrapper.write_bytes(source.replace("/usr/bin/python3", system_python.as_posix()).encode("utf-8"))
+            env = dict(os.environ, PATH=str(venv) + os.pathsep + os.environ["PATH"])
+            result = subprocess.run([shutil.which("sh"), wrapper.as_posix(), *args],
+                                    env=env, capture_output=True, text=True, encoding="utf-8", check=True)
+            return result.stdout.splitlines()
+
+    def test_shell_passes_status_as_a_read_only_mode(self):
+        self.assertEqual(self.run_wrapper("--status")[3:], ["--status"])
+
+    def test_shell_uses_the_system_python_and_preserves_the_device_id(self):
+        device_id = "b" * 40
+        result = self.run_wrapper(device_id)
+        self.assertEqual(result[0], "system")
+        self.assertEqual(result[3:], ["--apply", f"--device-id={device_id}"])
+
+
 class CabinetHandoffTest(unittest.TestCase):
+    def test_uncertain_install_keeps_its_marker_after_session_cleanup(self):
+        bios = {"DeviceId": "b" * 40}
+        old_boot = "12345678-1234-1234-1234-123456789abc"
+        with TemporaryDirectory() as tmp:
+            run, shm = Path(tmp) / "run", Path(tmp) / "shm"
+            run.mkdir()
+            shm.mkdir()
+            boot_id = Path(tmp) / "boot_id"
+            boot_id.write_text(old_boot, encoding="ascii")
+            lock_dir = run if updater.LOCK_DIR.name == "run" else shm
+
+            def system_command(args, _purpose):
+                self.assertEqual(args[0], "/usr/bin/mkdir")
+                Path(args[-1]).mkdir()
+                return b""
+
+            with (patch.object(updater, "BOOT_ID", boot_id),
+                  patch.object(updater, "LOCK_DIR", lock_dir),
+                  patch.object(updater, "LEGACY_LOCK_DIR", shm, create=True),
+                  patch.object(updater, "sudo_command", side_effect=system_command),
+                  patch.object(updater.subprocess, "Popen") as popen):
+                popen.return_value.wait.return_value = 1
+                marker = updater.marker_path()
+                with self.assertRaisesRegex(updater.Error, "未確定"):
+                    updater.send_once(marker, 23, lambda: bios)
+                for user_ipc in shm.iterdir():
+                    user_ipc.unlink()
+                with self.assertRaisesRegex(updater.Hold, "既に予約"):
+                    updater.send_once(updater.marker_path(), 23, lambda: bios)
+                popen.assert_called_once()
+                boot_id.write_text(str(uuid.UUID(int=2)), encoding="ascii")
+                updater.check_marker(updater.marker_path())
+
     def test_install_uses_inherited_descriptor_and_keeps_standard_dialog(self):
         bios = {"DeviceId": "b" * 40}
-        release = {"Version": "2.0"}
         fd = 23
         with (TemporaryDirectory() as tmp,
-              patch.object(updater.os, "O_NOFOLLOW", getattr(os, "O_NOFOLLOW", 0), create=True),
+              patch.object(updater, "sudo_command", side_effect=lambda args, purpose: Path(args[-1]).mkdir()),
               patch.object(updater.subprocess, "Popen") as popen):
             popen.return_value.wait.return_value = 0
-            updater.send_once(Path(tmp) / "marker", bios, release, fd)
+            updater.send_once(Path(tmp) / "marker", fd, lambda: bios)
             popen.assert_called_once_with([updater.FWUPDMGR, "--no-reboot-check", "local-install",
                                            f"/proc/self/fd/{fd}", bios["DeviceId"]], pass_fds=(fd,))
 
