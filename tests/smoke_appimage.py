@@ -54,6 +54,24 @@ def wait_window(process, action, timeout=100):
     raise RuntimeError(f"Window did not expose {action!r}. Available labels: {last}")
 
 
+def click_button(pid, button):
+    # GTK4 may expose a button without exposing an AT-SPI Action for it.
+    # Use its accessible bounds to click it on the isolated X11 display.
+    if button.get_n_actions():
+        assert button.do_action(0)
+        return
+    windows = subprocess.check_output(
+        ["xdotool", "search", "--all", "--onlyvisible", "--pid", str(pid), "--name", "^BIOS 更新$"], text=True
+    ).splitlines()
+    if len(windows) != 1:
+        raise RuntimeError(f"Expected one visible BIOS window for PID {pid}. Found {windows}")
+    rect = button.get_extents(Atspi.CoordType.WINDOW)
+    if rect.width <= 0 or rect.height <= 0:
+        raise RuntimeError(f"The {button.get_name()} button did not expose its bounds")
+    subprocess.run(["xdotool", "mousemove", "--window", windows[0],
+                    str(rect.x + rect.width // 2), str(rect.y + rect.height // 2), "click", "1"], check=True)
+
+
 def main(image, extract, status_only):
     if os.getuid() == 0:
         raise RuntimeError("Run as a desktop user")
@@ -76,7 +94,7 @@ def main(image, extract, status_only):
             pid, labels = wait_window(process, primary)
             proc = Path("/proc") / str(pid)
             assert "memfd:mknk-bios-update" in os.readlink(proc / "exe")
-            assert "/usr/lib/gui/libgtk-4.so" in (proc / "maps").read_text()
+            assert b"/usr/lib/gui/libgtk-4.so" in (proc / "maps").read_bytes()
             for filename, prefix in [("product_name", "機種"), ("bios_version", "現在の BIOS")]:
                 field = Path("/sys/class/dmi/id") / filename
                 if field.exists() and os.access(field, os.R_OK):
@@ -84,7 +102,7 @@ def main(image, extract, status_only):
                     assert any(key.startswith(prefix) and value in key for key in labels), (field, labels.keys())
             assert "状態を再確認" in labels
             if status_only:
-                assert labels[primary].do_action(0)
+                click_button(pid, labels[primary])
                 pid, _ = wait_window(process, "更新情報を確認")
             print(f"Copied image, native GTK window, model, BIOS version and next action OK (extract={extract})")
         finally:

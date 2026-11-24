@@ -97,11 +97,10 @@ failed:
     return -1;
 }
 
-/* Drain stderr for the entire life of the child. Retain only a short startup
- * diagnostic, and keep /proc/<gui>/fd/<image> valid until pkexec has exited. */
+/* Drain stderr for the entire life of the child while retaining only a short
+ * startup diagnostic. */
 typedef struct {
     GSubprocess *process;
-    int image;
     GMutex mutex;
     GCond exited;
     gboolean done;
@@ -135,7 +134,6 @@ static gpointer monitor_helper(gpointer data)
         used += keep;
     }
     g_subprocess_wait(helper->process, NULL, NULL);
-    close(helper->image);
     g_mutex_lock(&helper->mutex);
     helper->done = TRUE;
     g_cond_signal(&helper->exited);
@@ -285,7 +283,6 @@ static void helper_prepared(GObject *source, GAsyncResult *result, gpointer data
     }
     /* Linux pkexec ties its lifetime to the thread that spawned it. Launch on
      * the GTK main thread, which lives until the window and its work exit. */
-    g_autofree char *program = g_strdup_printf("/proc/%ld/fd/%d", (long) getpid(), image);
     g_autoptr(GSubprocessLauncher) launcher = g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_STDOUT_PIPE |
                                                                        G_SUBPROCESS_FLAGS_STDERR_PIPE);
     /* pkexec and the privileged program must resolve their own host libraries. */
@@ -293,17 +290,18 @@ static void helper_prepared(GObject *source, GAsyncResult *result, gpointer data
     g_subprocess_launcher_set_environ(launcher, env);
     const char *lang = g_getenv("LANG");
     if (lang) g_subprocess_launcher_setenv(launcher, "LANG", lang, TRUE);
+    /* Keep the sealed binary open in pkexec itself. The graphical polkit agent
+     * authenticates independently of stdin. */
+    g_subprocess_launcher_take_stdin_fd(launcher, image);
     GSubprocess *process = g_subprocess_launcher_spawn(launcher, &error, "/usr/bin/pkexec", "--disable-internal-agent",
-                                                        program, name, NULL);
+                                                        "/proc/self/fd/0", name, NULL);
     if (!process) {
-        close(image);
         g_prefix_error(&error, "管理者認証を起動できません。端末の pkexec を確認してください。\n");
         g_task_return_error(task, g_steal_pointer(&error));
         return;
     }
     Helper *helper = g_atomic_rc_box_new0(Helper);
     helper->process = process;
-    helper->image = image;
     g_mutex_init(&helper->mutex);
     g_cond_init(&helper->exited);
     g_thread_unref(g_thread_new("portable-helper", monitor_helper, g_atomic_rc_box_acquire(helper)));

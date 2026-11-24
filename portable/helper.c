@@ -25,6 +25,12 @@ int main(int argc, char **argv)
         fputs("認証したヘルパーの固定済みイメージを確認できません。\n", stderr);
         return 1;
     }
+    int null = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (null < 0 || dup2(null, STDIN_FILENO) < 0) {
+        perror("ポータブル版の標準入力");
+        return 1;
+    }
+    close(null);
     umask(0077);
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 || chdir("/") != 0) {
         perror("ポータブル版の実行環境");
