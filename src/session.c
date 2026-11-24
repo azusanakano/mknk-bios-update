@@ -40,17 +40,17 @@ static void release(gpointer data)
 
 static GVariant *call(GDBusConnection *bus, const char *owner, const char *path,
                       const char *interface, const char *method, GVariant *args,
-                      const GVariantType *type, GError **error)
+                      const GVariantType *type, GCancellable *cancel, GError **error)
 {
     return g_dbus_connection_call_sync(bus, owner, path, interface, method, args, type,
-                                       G_DBUS_CALL_FLAGS_NO_AUTO_START, 4000, NULL, error);
+                                       G_DBUS_CALL_FLAGS_NO_AUTO_START, 4000, cancel, error);
 }
 
-static char *owner_of(GDBusConnection *bus, const char *name, GError **error)
+static char *owner_of(GDBusConnection *bus, const char *name, GCancellable *cancel, GError **error)
 {
     g_autoptr(GVariant) reply = call(bus, "org.freedesktop.DBus", "/org/freedesktop/DBus",
                                      "org.freedesktop.DBus", "GetNameOwner",
-                                     g_variant_new("(s)", name), G_VARIANT_TYPE("(s)"), error);
+                                     g_variant_new("(s)", name), G_VARIANT_TYPE("(s)"), cancel, error);
     char *value = NULL;
     if (reply) g_variant_get(reply, "(s)", &value);
     return value;
@@ -62,19 +62,19 @@ static gboolean unavailable(GError **error, const char *reason)
     return FALSE;
 }
 
-static gboolean same_session(Power *p, GError **error)
+static gboolean same_session(Power *p, GCancellable *cancel, GError **error)
 {
     g_autoptr(GVariant) process = call(p->session, "org.freedesktop.DBus", "/org/freedesktop/DBus",
         "org.freedesktop.DBus", "GetConnectionUnixProcessID", g_variant_new("(s)", p->manager),
-        G_VARIANT_TYPE("(u)"), error);
+        G_VARIANT_TYPE("(u)"), cancel, error);
     if (!process) return FALSE;
     guint pid;
     g_variant_get(process, "(u)", &pid);
     g_autoptr(GVariant) manager_session = call(p->system, p->login, LOGIN_PATH, LOGIN ".Manager",
-        "GetSessionByPID", g_variant_new("(u)", pid), G_VARIANT_TYPE("(o)"), error);
+        "GetSessionByPID", g_variant_new("(u)", pid), G_VARIANT_TYPE("(o)"), cancel, error);
     if (!manager_session) return FALSE;
     g_autoptr(GVariant) gui_session = call(p->system, p->login, LOGIN_PATH, LOGIN ".Manager",
-        "GetSessionByPID", g_variant_new("(u)", (guint) getpid()), G_VARIANT_TYPE("(o)"), error);
+        "GetSessionByPID", g_variant_new("(u)", (guint) getpid()), G_VARIANT_TYPE("(o)"), cancel, error);
     if (!gui_session) return FALSE;
     if (!g_variant_equal(manager_session, gui_session))
         return unavailable(error, "この画面と同じログインセッションの終了経路を確認できません。");
@@ -83,15 +83,15 @@ static gboolean same_session(Power *p, GError **error)
 
 /* The standards checks run on the user's connections, including checks of
  * inhibitors owned by the same uid. Only the session manager requests power. */
-static gboolean checks(Power *p, GError **error)
+static gboolean checks(Power *p, GCancellable *cancel, GError **error)
 {
-    g_autofree char *login = owner_of(p->system, LOGIN, error);
+    g_autofree char *login = owner_of(p->system, LOGIN, cancel, error);
     if (!login) return FALSE;
-    g_autofree char *manager = owner_of(p->session, SM, error);
+    g_autofree char *manager = owner_of(p->session, SM, cancel, error);
     if (!manager) return FALSE;
     if (!g_str_equal(login, p->login) || !g_str_equal(manager, p->manager))
         return unavailable(error, "終了処理を担当するサービスが変わりました。");
-    if (!same_session(p, error)) return FALSE;
+    if (!same_session(p, cancel, error)) return FALSE;
 
     if (p->cinnamon) {
         const char *paths[] = { "/var/run/gdm_socket", "/var/run/mdm_socket", "/tmp/.mdm_socket" };
@@ -103,7 +103,7 @@ static gboolean checks(Power *p, GError **error)
     }
     const char *method = p->reboot ? "CanReboot" : "CanPowerOff";
     g_autoptr(GVariant) allowed = call(p->system, login, LOGIN_PATH, LOGIN ".Manager",
-                                       method, NULL, G_VARIANT_TYPE("(s)"), error);
+                                       method, NULL, G_VARIANT_TYPE("(s)"), cancel, error);
     if (!allowed) return FALSE;
     const char *permission;
     g_variant_get(allowed, "(&s)", &permission);
@@ -111,7 +111,7 @@ static gboolean checks(Power *p, GError **error)
         return unavailable(error, "現在のセッションで電源操作が許可されていません。");
 
     g_autoptr(GVariant) locks = call(p->system, login, LOGIN_PATH, LOGIN ".Manager",
-                                     "ListInhibitors", NULL, G_VARIANT_TYPE("(a(ssssuu))"), error);
+                                     "ListInhibitors", NULL, G_VARIANT_TYPE("(a(ssssuu))"), cancel, error);
     if (!locks) return FALSE;
     g_autoptr(GVariant) entries = g_variant_get_child_value(locks, 0);
     GVariantIter iter;
@@ -126,14 +126,14 @@ static gboolean checks(Power *p, GError **error)
         }
     }
     g_autoptr(GVariant) blocked = call(p->session, manager, SM_PATH, SM, "IsInhibited",
-                                       g_variant_new("(u)", 1u), G_VARIANT_TYPE("(b)"), error);
+                                       g_variant_new("(u)", 1u), G_VARIANT_TYPE("(b)"), cancel, error);
     if (!blocked) return FALSE;
     gboolean inhibited;
     g_variant_get(blocked, "(b)", &inhibited);
     if (inhibited) return unavailable(error, "デスクトップで終了を妨げる作業が進行中です。");
     g_autoptr(GVariant) fresh = call(p->control, p->service_owner, BIOS_PATH, BIOS_BUS,
                                      "RecheckPower", g_variant_new("(s)", p->request),
-                                     G_VARIANT_TYPE_UNIT, error);
+                                     G_VARIANT_TYPE_UNIT, cancel, error);
     return fresh != NULL;
 }
 
@@ -170,9 +170,9 @@ static gboolean deadline(gpointer data)
 
 static void check_thread(GTask *task, gpointer source, gpointer data, GCancellable *cancel)
 {
-    (void) source; (void) cancel;
+    (void) source;
     g_autoptr(GError) error = NULL;
-    if (checks(data, &error)) g_task_return_boolean(task, TRUE);
+    if (checks(data, cancel, &error)) g_task_return_boolean(task, TRUE);
     else g_task_return_error(task, g_steal_pointer(&error));
 }
 
@@ -232,15 +232,24 @@ static void owner_lost(GDBusConnection *bus, const char *name, gpointer data)
     finish(p, !p->sent, "デスクトップとの接続が切れました。状態を再確認してください。");
 }
 
+static gboolean desktop_rejected(Power *p, const GError *error)
+{
+    if (g_error_matches(error, G_DBUS_ERROR, G_DBUS_ERROR_UNKNOWN_METHOD) ||
+        g_error_matches(error, G_DBUS_ERROR, G_DBUS_ERROR_ACCESS_DENIED) ||
+        g_error_matches(error, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS)) return TRUE;
+    /* GNOME returns these before it creates an end-session task. */
+    if (p->cinnamon) return FALSE;
+    g_autofree char *name = g_dbus_error_get_remote_error(error);
+    return g_strcmp0(name, SM ".LockedDown") == 0 || g_strcmp0(name, SM ".NotInRunning") == 0;
+}
+
 static void desktop_reply(GObject *source, GAsyncResult *result, gpointer data)
 {
     Power *p = data;
     g_autoptr(GError) error = NULL;
     g_autoptr(GVariant) reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), result, &error);
     if (!reply && !p->finished) {
-        if (g_error_matches(error, G_DBUS_ERROR, G_DBUS_ERROR_UNKNOWN_METHOD) ||
-            g_error_matches(error, G_DBUS_ERROR, G_DBUS_ERROR_ACCESS_DENIED) ||
-            g_error_matches(error, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS)) {
+        if (desktop_rejected(p, error)) {
             finish(p, TRUE, "デスクトップが終了要求を受け付けませんでした。");
         } else {
             /* A missing reply can arrive after the manager has begun logout.
@@ -273,16 +282,17 @@ static void preflight_done(GObject *source, GAsyncResult *result, gpointer data)
 
 static void register_thread(GTask *task, gpointer source, gpointer data, GCancellable *cancel)
 {
-    (void) source; (void) cancel;
+    (void) source;
     Power *p = data;
     g_autoptr(GError) error = NULL;
-    p->session = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &error);
-    if (p->session) p->manager = owner_of(p->session, SM, &error);
-    if (p->manager) p->login = owner_of(p->system, LOGIN, &error);
-    if (p->login) {
+    p->session = g_bus_get_sync(G_BUS_TYPE_SESSION, cancel, &error);
+    if (p->session) p->manager = owner_of(p->session, SM, cancel, &error);
+    if (p->manager) p->login = owner_of(p->system, LOGIN, cancel, &error);
+    if (p->login && !g_cancellable_set_error_if_cancelled(cancel, &error)) {
+        /* Finish receiving the registration path so cancellation can unregister it. */
         g_autoptr(GVariant) reply = call(p->session, p->manager, SM_PATH, SM, "RegisterClient",
                                          g_variant_new("(ss)", BIOS_APP, ""),
-                                         G_VARIANT_TYPE("(o)"), &error);
+                                         G_VARIANT_TYPE("(o)"), NULL, &error);
         if (reply) g_variant_get(reply, "(o)", &p->client);
     }
     if (error) g_task_return_error(task, g_steal_pointer(&error));
@@ -302,13 +312,13 @@ static void registered(GObject *source, GAsyncResult *result, gpointer data)
                                                   NULL, G_DBUS_SIGNAL_FLAGS_NONE, session_signal, p, NULL);
     p->watch = g_bus_watch_name_on_connection(p->session, p->manager, G_BUS_NAME_WATCHER_FLAGS_NONE,
                                               NULL, owner_lost, p, NULL);
-    g_autoptr(GTask) task = g_task_new(NULL, NULL, preflight_done, NULL);
+    g_autoptr(GTask) task = g_task_new(NULL, g_task_get_cancellable(G_TASK(result)), preflight_done, NULL);
     g_task_set_task_data(task, g_atomic_rc_box_acquire(p), release);
     g_task_run_in_thread(task, check_thread);
 }
 
 void session_request_power(GDBusConnection *system, GDBusConnection *control, const char *service_owner,
-                           const char *request, const char *desktop, const char *action,
+                           const char *request, const char *desktop, const char *action, GCancellable *preflight,
                            PowerNotice notice, PowerDone done, gpointer data)
 {
     if ((system == control ? !service_owner || !g_dbus_is_unique_name(service_owner) : service_owner != NULL) ||
@@ -328,7 +338,7 @@ void session_request_power(GDBusConnection *system, GDBusConnection *control, co
     p->done = done;
     p->notice = notice;
     p->data = data;
-    g_autoptr(GTask) task = g_task_new(NULL, NULL, registered, NULL);
+    g_autoptr(GTask) task = g_task_new(NULL, preflight, registered, NULL);
     g_task_set_task_data(task, g_atomic_rc_box_acquire(p), release);
     g_task_run_in_thread(task, register_thread);
 }

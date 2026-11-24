@@ -20,6 +20,7 @@ if sys.platform == "linux":
     repo = Path(__file__).resolve().parents[1]
     sys.path[:0] = [str(repo / "backend"), str(repo)]
     from engine import Engine
+    from firmware_api import fw
     from journal import Conflict, Journal
     from platform_linux import DBUS, LOGIN, Platform
     from portable_service import NAME, SEALS, PeerServer, PortablePlatform, open_verified_gui, pkexec_uid
@@ -238,6 +239,92 @@ class PortablePeerTest(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "linux", "Linux worker accounts and directory locks")
 class PortablePlatformTest(unittest.TestCase):
+    def test_declined_authorization_removes_only_the_matching_marker(self):
+        import uuid
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            boot = str(uuid.uuid4())
+            boot_file = root / "boot"
+            boot_file.write_text(boot, encoding="ascii")
+            platform = object.__new__(Platform)
+            plan = dict(id=str(uuid.uuid4()), boot=boot)
+            real_fstat = os.fstat
+
+            def root_metadata(fd):
+                info = real_fstat(fd)
+                return SimpleNamespace(st_uid=0, st_mode=info.st_mode, st_nlink=info.st_nlink)
+
+            with patch.multiple(fw, BOOT_ID=boot_file, LOCK_DIR=root, LEGACY_LOCK_DIR=root / "legacy"):
+                with platform.claim(plan):
+                    pass
+                marker = fw.marker_path()
+                entry = marker / "gui-operation"
+                with patch("hardware.os.fstat", side_effect=root_metadata):
+                    with self.assertRaises(Conflict):
+                        platform.release_claim(dict(plan, id=str(uuid.uuid4())))
+                    self.assertEqual(entry.read_text(encoding="ascii"), plan["id"])
+                    platform.release_claim(plan)
+                    self.assertFalse(marker.exists())
+                    platform.release_claim(plan)
+
+    def test_failed_marker_write_leaves_no_claim(self):
+        import errno
+
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / "request"
+            platform = object.__new__(Platform)
+            with patch("platform_linux.fw.marker_path", return_value=marker), patch(
+                    "platform_linux.os.fchmod", side_effect=OSError(errno.ENOSPC, "disk full")):
+                with self.assertRaises(OSError), platform.claim({"id": "fixture"}):
+                    self.fail("A marker that could not be written yielded permission to issue")
+            self.assertFalse(marker.exists())
+
+    def test_issue_rollback_releases_claim_but_committed_issue_keeps_it(self):
+        import sqlite3
+        from contextlib import closing, contextmanager
+
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / "request"
+            journal = Journal(Path(temp) / "state")
+            platform = object.__new__(Platform)
+            plan = dict(id="fixture", boot="boot", machine="pc")
+            transaction = journal.transaction
+
+            @contextmanager
+            def failed_commit():
+                with transaction() as db:
+                    yield db
+                    raise sqlite3.OperationalError("simulated failed commit")
+
+            @contextmanager
+            def failed_after_commit():
+                with transaction() as db:
+                    yield db
+                raise sqlite3.OperationalError("simulated post-commit failure")
+
+            with patch("platform_linux.fw.marker_path", return_value=marker):
+                with closing(sqlite3.connect(journal.path)) as raw:
+                    raw.execute("""CREATE TRIGGER broken BEFORE INSERT ON operation
+                                   BEGIN SELECT unknown_write_hook(); END""")
+                    raw.commit()
+                    with self.assertRaises(Conflict), platform.claim(plan):
+                        journal.issue(plan, ":1.2", ":1.6", "bus")
+                    self.assertFalse(marker.exists())
+                    raw.execute("DROP TRIGGER broken")
+                    raw.commit()
+                with patch.object(journal, "transaction", failed_commit):
+                    with self.assertRaises(Conflict), platform.claim(plan):
+                        journal.issue(plan, ":1.2", ":1.6", "bus")
+                self.assertFalse(marker.exists())
+                self.assertIsNone(journal.active())
+                with patch.object(journal, "transaction", failed_after_commit):
+                    with self.assertRaises(sqlite3.OperationalError), platform.claim(plan):
+                        journal.issue(plan, ":1.2", ":1.6", "bus")
+                self.assertEqual((marker / "gui-operation").read_text(encoding="ascii"), plan["id"])
+                self.assertEqual(journal.active()["id"], plan["id"])
+
     def test_directory_is_locked_across_instances_and_released_on_exit(self):
         from types import SimpleNamespace
         old_umask = os.umask(0o077)

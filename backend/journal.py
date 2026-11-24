@@ -6,8 +6,9 @@ import re
 import secrets
 import sqlite3
 import uuid
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 
 class Conflict(Exception):
@@ -27,7 +28,9 @@ class Journal:
                 plan TEXT NOT NULL, sender TEXT NOT NULL, daemon TEXT NOT NULL, bus TEXT NOT NULL,
                 issued TEXT NOT NULL, receipt TEXT NOT NULL DEFAULT 'unknown',
                 active INTEGER NOT NULL DEFAULT 1, outcome TEXT, observed TEXT, ended TEXT,
-                power_id TEXT, power_sender TEXT, power_bus TEXT)""")
+                power_id TEXT, power_sender TEXT, power_bus TEXT, observed_boot TEXT)""")
+            if not any(row["name"] == "observed_boot" for row in db.execute("PRAGMA table_info(operation)")):
+                db.execute("ALTER TABLE operation ADD COLUMN observed_boot TEXT")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS single_pending ON operation(active) WHERE active=1")
             db.execute("CREATE TABLE IF NOT EXISTS setting (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS approval (slot INTEGER PRIMARY KEY CHECK(slot=1), id TEXT, plan TEXT)")
@@ -98,18 +101,42 @@ class Journal:
                            (plan["id"], plan["boot"], plan["machine"], json.dumps(plan), sender, daemon, bus, now()))
         except sqlite3.IntegrityError as exc:
             raise Conflict("更新の依頼記録があります。状態を再確認してください。") from exc
+        except sqlite3.Error as exc:
+            # A failed write may have rolled back or committed before failing.
+            # Allow the caller to remove its marker only if the journal proves no issue exists.
+            try:
+                uri = Path(self.path).resolve().as_uri() + "?mode=ro"
+                with closing(sqlite3.connect(uri, uri=True, timeout=8)) as db:
+                    recorded = db.execute("SELECT 1 FROM operation WHERE id=?", (plan["id"],)).fetchone()
+            except sqlite3.Error:
+                raise exc
+            if recorded is None:
+                raise Conflict("更新の依頼記録を保存できませんでした。保存先を確認してください。") from exc
+            raise
 
     def report(self, op, sender, bus, accepted):
         with self.transaction() as db:
-            changed = db.execute("""UPDATE operation SET receipt=CASE WHEN ? THEN 'accepted' ELSE receipt END
+            changed = db.execute("""UPDATE operation SET receipt=CASE WHEN ? THEN 'accepted'
+                                        WHEN receipt='unknown' THEN 'unconfirmed' ELSE receipt END
                                     WHERE id=? AND sender=? AND bus=?""", (bool(accepted), op, sender, bus))
             if not changed.rowcount:
                 raise Conflict("更新依頼と応答元の接続が一致しません。")
 
-    def finish(self, op, outcome, current):
+    def decline_authorization(self, op, sender, bus, release_claim):
+        # Only the GUI that received this permit can acknowledge it stopped before Install.
         with self.transaction() as db:
-            db.execute("UPDATE operation SET active=0,outcome=?,observed=?,ended=? WHERE id=? AND active=1",
-                       (outcome, current, now(), op))
+            row = db.execute("""SELECT * FROM operation WHERE id=? AND sender=? AND bus=?
+                                AND active=1 AND receipt='unknown' AND power_id IS NULL""",
+                             (op, sender, bus)).fetchone()
+            if row is None:
+                raise Conflict("未送信の許可を取り消せる接続・状態ではありません。")
+            release_claim(self.unpack(row))
+            db.execute("DELETE FROM operation WHERE id=?", (op,))
+
+    def finish(self, op, outcome, current, *, observed_boot=None):
+        with self.transaction() as db:
+            db.execute("""UPDATE operation SET active=0,outcome=?,observed=?,ended=?,observed_boot=?
+                          WHERE id=? AND active=1""", (outcome, current, now(), observed_boot, op))
 
     def history(self, machine, boot=""):
         with self.transaction() as db:

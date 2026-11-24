@@ -11,6 +11,8 @@ from engine import Actor, Engine
 
 
 class Machine:
+    bus_id = "bus"
+
     def __init__(self):
         self.observation = dict(model="NB-14", current="1.20", device="a" * 40, guid="g", boot="boot-1",
                                 machine="uuid", can_identify=True, reservation="clear", running=False, detail="",
@@ -48,7 +50,7 @@ class Machine:
             raise Conflict("daemon changed")
 
     def actor(self, sender):
-        return Actor(sender, 1000, "s1", "bus", sender != ":2.0", "gnome", "pid:42")
+        return Actor(sender, 1000, "s1", self.bus_id, sender != ":2.0", "gnome", "pid:42")
 
 
 class EngineTest(unittest.TestCase):
@@ -103,6 +105,44 @@ class EngineTest(unittest.TestCase):
         with self.assertRaises(Conflict):
             self.engine.prepare(self.user, "candidate")
 
+    def test_equivalent_versions_after_boot_record_installation(self):
+        self.machine.candidate["target"] = "1.024"
+        view = self.review()
+        *_, cabinet = self.engine.authorize(self.user, view["plan"])
+        cabinet.close()
+        self.machine.observation.update(boot="boot-2", current="1.24")
+        self.assertEqual(self.engine.status(self.user)["state"], "complete")
+        self.assertEqual(self.db.last(self.db.machine_key("uuid"), "boot-2")["outcome"], "installed")
+
+    def test_boot_result_is_visible_to_every_reader_for_that_boot(self):
+        for installed in (True, False):
+            with self.subTest(installed=installed):
+                old_boot = "installed-issue" if installed else "unapplied-issue"
+                result_boot = old_boot + "-result"
+                self.machine.observation.update(boot=old_boot, current="1.20")
+                self.machine.candidate.update(current="1.20", target="1.24")
+                review = self.review()
+                *_, cabinet = self.engine.authorize(self.user, review["plan"])
+                cabinet.close()
+                current = "1.24" if installed else "1.20"
+                state = "complete" if installed else "hold"
+                self.machine.observation.update(boot=result_boot, current=current)
+                first = self.engine.status(self.user)
+                self.assertEqual(first["state"], state)
+                result = self.engine.status(self.machine.actor(":2.0"))
+                self.assertEqual(result["state"], state)
+                self.assertTrue(result.get("result_this_boot"))
+                self.assertTrue(first.get("result_this_boot"))
+                self.assertFalse(result["can_check"])
+                reopened = Engine(Journal(self.db.path), self.machine)
+                result = reopened.status(self.machine.actor(":2.0"))
+                self.assertEqual(result["state"], state)
+                self.assertTrue(result.get("result_this_boot"))
+                self.machine.candidate.update(current=current, target="1.25")
+                self.assertEqual(self.engine.check(self.user)["state"], "available")
+                self.machine.observation["boot"] += "-later"
+                self.assertFalse(reopened.status(self.user).get("result_this_boot"))
+
     def test_failed_device_preflight_shows_the_reason_and_changes_the_next_action(self):
         candidate = self.engine.check(self.user)
 
@@ -139,6 +179,61 @@ class EngineTest(unittest.TestCase):
         with self.assertRaises(Conflict):
             self.engine.authorize(self.user, review["plan"])
         self.assertIsNone(self.db.active())
+
+    def authorize_after_catalog_wait(self, change):
+        review = self.review()
+        original = self.engine.catalog_lock
+
+        class CatalogLock:
+            entries = 0
+
+            def __enter__(self):
+                original.acquire()
+                self.entries += 1
+                if self.entries == 2:  # State at the end of a competing catalog request.
+                    change()
+
+            def __exit__(self, *exc):
+                original.release()
+
+        self.engine.catalog_lock = CatalogLock()
+        with self.assertRaises(Conflict):
+            *_, cabinet = self.engine.authorize(self.user, review["plan"])
+            cabinet.close()
+        self.assertIsNone(self.db.active())
+
+    def test_authorize_rechecks_reservation_after_catalog_wait(self):
+        self.authorize_after_catalog_wait(lambda: self.machine.observation.update(reservation="foreign"))
+
+    def test_authorize_rechecks_power_after_catalog_wait(self):
+        def power_lost():
+            def preflight(plan):
+                raise Conflict("AC disconnected")
+            self.machine.preflight = preflight
+
+        self.authorize_after_catalog_wait(power_lost)
+
+    def test_can_replan_after_reboot_without_esrt_attempt_result(self):
+        review = self.review()
+        operation, _, _, cabinet = self.engine.authorize(self.user, review["plan"])
+        cabinet.close()
+        self.engine.report(self.user, operation, True)
+        self.machine.observation.update(boot="boot-2", attempt_status=None, attempt_comparable=False)
+        for _ in range(2):
+            view = self.engine.status(self.user)
+            self.assertEqual(view["state"], "hold")
+            self.assertIn("確定できません", view["detail"])
+            self.assertTrue(view["can_replan"])
+            self.assertFalse(view["can_power"])
+
+        self.assertFalse(self.engine.status(self.machine.actor(":2.0"))["can_replan"])
+        self.machine.observation["machine"] = "different"
+        self.assertFalse(self.engine.status(self.user)["can_replan"])
+        with self.assertRaises(Conflict):
+            self.engine.replan(self.user, operation)
+        self.machine.observation["machine"] = "uuid"
+        self.assertEqual(self.engine.replan(self.user, operation)["state"], "available")
+        self.assertEqual(self.db.last(self.db.machine_key("uuid"), "boot-2")["outcome"], "unattributed")
 
     def test_saved_consent_before_permission_is_recoverable_without_automatic_send(self):
         review = self.review()

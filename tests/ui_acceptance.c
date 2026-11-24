@@ -1,22 +1,40 @@
 /* Native GTK controls, real GDBus serialization and FD passing, private bus.
  * No method in this test can reach the machine's system or session bus. */
+#define _GNU_SOURCE
+#include <gio/gio.h>
+#include <gio/gunixfdlist.h>
+
+static void call_with_fds(GDBusConnection *connection, const char *bus_name, const char *path,
+                          const char *interface, const char *method, GVariant *parameters,
+                          const GVariantType *reply_type, GDBusCallFlags flags, gint timeout_msec,
+                          GUnixFDList *fds, GCancellable *cancel, GAsyncReadyCallback callback,
+                          gpointer data);
+
+#define g_dbus_connection_call_with_unix_fd_list call_with_fds
 #define main application_main
 #define portable_connect_async mock_portable_connect_async
 #include "../src/main.c"
 #undef portable_connect_async
 #undef main
+#undef g_dbus_connection_call_with_unix_fd_list
 #include <sys/mman.h>
 
 static const char *mock_state = "idle", *mock_desktop = "gnome", *mock_power = "reboot";
 static gboolean allowed = TRUE, withhold, hold_prepare, logout_block, ac = TRUE, fail_install;
+static gboolean delay_authorize, hold_status, hold_authorize, hold_install, hold_recheck, result_this_boot;
+static gboolean hold_candidates;
+static gboolean hold_power, hold_power_reply;
+static const char *desktop_error, *mock_plan = "plan-1", *mock_recovery_detail = "";
 enum { VALID_SHA512, CONFLICTING_DIGESTS, WRONG_REMOTE, WRONG_COMPONENT, VALID_BOTH };
 static guint release_mode;
 static gboolean can_replan_test, swapped_operation;
 static const char *help_url = "", *recovery_url = "";
 static guint checks_sent, prepares, permits, installs, reports, powers, desktop_calls;
-static guint rechecks, cancelled, responses, stopped;
+static guint rechecks, cancelled, responses, stopped, declined;
 static gboolean last_response;
-static GDBusMethodInvocation *held_check, *held_prepare;
+static GDBusMethodInvocation *held_check, *held_prepare, *held_status, *held_authorize, *held_install, *held_recheck;
+static GDBusMethodInvocation *held_power, *held_power_reply;
+static GDBusMethodInvocation *held_candidates, *held_decline;
 static GDBusConnection *service, *fwupd, *desktop;
 static GDBusConnection *peer_service;
 static GDBusServer *peer_server;
@@ -36,6 +54,7 @@ static const char mock_xml[] =
     "<method name='Replan'><arg type='s' direction='in'/><arg type='s' direction='out'/></method>"
     "<method name='Authorize'><arg type='s' direction='in'/><arg type='s' direction='out'/>"
     "<arg type='s' direction='out'/><arg type='s' direction='out'/><arg type='h' direction='out'/></method>"
+    "<method name='DeclineAuthorization'><arg type='s' direction='in'/></method>"
     "<method name='Report'><arg type='s' direction='in'/><arg type='b' direction='in'/>"
     "<arg type='s' direction='out'/></method><method name='Power'><arg type='s' direction='in'/>"
     "<arg type='s' direction='out'/><arg type='s' direction='out'/><arg type='s' direction='out'/></method>"
@@ -65,6 +84,8 @@ static void return_view(GDBusMethodInvocation *inv, const char *s)
     const char *title = g_str_equal(s, "review") ? "更新内容を確認してください" :
                         g_str_equal(s, "available") ? "この機種に適用できる更新があります" :
                         g_str_equal(s, "pending") ? "再起動待ち" : "この PC の更新を確認";
+    gboolean planless = g_str_equal(s, "idle") || g_str_equal(s, "available") ||
+                        g_str_equal(s, "complete") || (g_str_equal(s, "hold") && result_this_boot);
     g_autofree char *text = g_strdup_printf(
         "{\"model\":\"検証用ノート NB-14\",\"current\":\"1.20\",\"state\":\"%s\",\"title\":\"%s\","
         "\"target\":\"1.24\",\"source\":\"LVFS 安定版\",\"scope\":\"システム BIOS\","
@@ -73,14 +94,14 @@ static void return_view(GDBusMethodInvocation *inv, const char *s)
         "\"checksum\":\"" DIGEST256 "\",\"cab_sha512\":\"" DIGEST512 "\","
         "\"remote_id\":\"lvfs\",\"appstream_id\":\"com.example.Bios\",\"can_replan\":%s,"
         "\"support_url\":\"%s\",\"recovery_url\":\"%s\","
-        "\"recovery_required\":true,\"can_check\":%s,\"can_prepare\":true,"
-        "\"can_approve\":true,\"can_power\":%s}", s, title,
-        (g_str_equal(s, "idle") || g_str_equal(s, "available")) ? "" : "plan-1",
+        "\"recovery_required\":true,\"recovery_detail\":\"%s\",\"can_check\":%s,\"can_prepare\":true,"
+        "\"can_approve\":true,\"can_power\":%s,\"result_this_boot\":%s}", s, title,
+        planless ? "" : mock_plan,
         mock_power, g_dbus_connection_get_unique_name(fwupd), device_id,
         can_replan_test ? "true" : "false",
-        help_url, recovery_url,
+        help_url, recovery_url, mock_recovery_detail,
         g_str_equal(s, "pending") ? "false" : "true",
-        allowed ? "true" : "false");
+        allowed ? "true" : "false", result_this_boot ? "true" : "false");
     g_dbus_method_invocation_return_value(inv, g_variant_new("(s)", text));
 }
 
@@ -88,6 +109,37 @@ static void client_signal(const char *name, GVariant *args)
 {
     g_assert_true(g_dbus_connection_emit_signal(desktop, client_sender, "/test/client",
                                                 "org.gnome.SessionManager.ClientPrivate", name, args, NULL));
+}
+
+static void call_with_fds(GDBusConnection *connection, const char *bus_name, const char *path,
+                          const char *interface, const char *method, GVariant *parameters,
+                          const GVariantType *reply_type, GDBusCallFlags flags, gint timeout_msec,
+                          GUnixFDList *fds, GCancellable *cancel, GAsyncReadyCallback callback,
+                          gpointer data)
+{
+    /* Compress finite deadlines so the slow verification regression runs quickly. */
+    if (delay_authorize && g_str_equal(method, "Authorize") && timeout_msec != G_MAXINT)
+        timeout_msec = MAX(1, timeout_msec / 1000);
+    g_dbus_connection_call_with_unix_fd_list(connection, bus_name, path, interface, method, parameters,
+                                            reply_type, flags, timeout_msec, fds, cancel, callback, data);
+}
+
+static gboolean grant_authorization(gpointer data)
+{
+    GDBusMethodInvocation *inv = data;
+    int fd = memfd_create("mock", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(write(fd, "simulated", 9), ==, 9);
+    g_assert_cmpint(lseek(fd, 0, SEEK_SET), ==, 0);
+    g_assert_cmpint(fcntl(fd, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL), ==, 0);
+    g_autoptr(GUnixFDList) fds = g_unix_fd_list_new();
+    g_assert_cmpint(g_unix_fd_list_append(fds, fd, NULL), ==, 0);
+    close(fd);
+    if (swapped_operation) mock_state = "uncertain";
+    g_dbus_method_invocation_return_value_with_unix_fd_list(inv,
+        g_variant_new("(sssh)", swapped_operation ? "other-plan" : "plan-1",
+                      g_dbus_connection_get_unique_name(fwupd), device_id, 0), fds);
+    return G_SOURCE_REMOVE;
 }
 
 static void method_call(GDBusConnection *bus, const char *sender, const char *path,
@@ -103,6 +155,10 @@ static void method_call(GDBusConnection *bus, const char *sender, const char *pa
     }
     if (g_str_equal(method, "Status")) {
         status_calls++;
+        if (hold_status) {
+            held_status = g_object_ref(inv);
+            return;
+        }
     } else if (g_str_equal(method, "Check")) {
         checks_sent++;
         if (withhold) {
@@ -131,6 +187,10 @@ static void method_call(GDBusConnection *bus, const char *sender, const char *pa
         const char *selected;
         g_variant_get(args, "(&s)", &selected);
         g_assert_cmpstr(selected, ==, device_id);
+        if (hold_candidates) {
+            held_candidates = g_object_ref(inv);
+            return;
+        }
         GVariantBuilder entries, release;
         g_variant_builder_init(&entries, G_VARIANT_TYPE("aa{sv}"));
         g_variant_builder_init(&release, G_VARIANT_TYPE_VARDICT);
@@ -150,18 +210,22 @@ static void method_call(GDBusConnection *bus, const char *sender, const char *pa
         g_assert_cmpstr(reader, ==, ui.portable ? g_dbus_connection_get_unique_name(ui.bus) : sender);
         g_free(permit_sender);
         permit_sender = g_strdup(reader);
-        int fd = memfd_create("mock", MFD_CLOEXEC | MFD_ALLOW_SEALING);
-        g_assert_cmpint(fd, >=, 0);
-        g_assert_cmpint(write(fd, "simulated", 9), ==, 9);
-        g_assert_cmpint(lseek(fd, 0, SEEK_SET), ==, 0);
-        g_assert_cmpint(fcntl(fd, F_ADD_SEALS, F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_SEAL), ==, 0);
-        g_autoptr(GUnixFDList) fds = g_unix_fd_list_new();
-        g_assert_cmpint(g_unix_fd_list_append(fds, fd, NULL), ==, 0);
-        close(fd);
-        if (swapped_operation) mock_state = "uncertain";
-        g_dbus_method_invocation_return_value_with_unix_fd_list(inv,
-            g_variant_new("(sssh)", swapped_operation ? "other-plan" : "plan-1",
-                          g_dbus_connection_get_unique_name(fwupd), device_id, 0), fds);
+        if (hold_authorize) {
+            mock_state = "issuing";
+            held_authorize = g_object_ref(inv);
+        } else if (delay_authorize)
+            g_timeout_add_full(G_PRIORITY_DEFAULT, 250, grant_authorization, g_object_ref(inv), g_object_unref);
+        else grant_authorization(inv);
+        return;
+    } else if (g_str_equal(method, "DeclineAuthorization")) {
+        const char *plan;
+        g_variant_get(args, "(&s)", &plan);
+        g_assert_cmpstr(plan, ==, "plan-1");
+        g_assert_cmpstr(permit_sender, ==, ui.portable ? g_dbus_connection_get_unique_name(ui.bus) : sender);
+        g_assert_cmpstr(mock_state, ==, "issuing");
+        declined++;
+        mock_state = "idle";
+        held_decline = g_object_ref(inv);
         return;
     } else if (g_str_equal(method, "Install")) {
         installs++;
@@ -181,6 +245,10 @@ static void method_call(GDBusConnection *bus, const char *sender, const char *pa
         g_assert_cmpstr(reason, ==, "user-action");
         g_assert_true(g_variant_lookup(opts, "install-flags", "t", &flags));
         g_assert_cmpuint(flags, ==, 0);
+        if (hold_install) {
+            held_install = g_object_ref(inv);
+            return;
+        }
         if (fail_install) {
             g_dbus_method_invocation_return_dbus_error(inv, FWUPD ".Failed", "simulated after dispatch");
             return;
@@ -197,9 +265,17 @@ static void method_call(GDBusConnection *bus, const char *sender, const char *pa
         mock_state = accepted ? "pending" : "uncertain";
     } else if (g_str_equal(method, "Power")) {
         powers++;
+        if (hold_power) {
+            held_power = g_object_ref(inv);
+            return;
+        }
         result = g_variant_new("(sss)", "request-1", mock_desktop, mock_power);
     } else if (g_str_equal(method, "RecheckPower")) {
         rechecks++;
+        if (hold_recheck) {
+            held_recheck = g_object_ref(inv);
+            return;
+        }
         if (!ac) {
             g_dbus_method_invocation_return_dbus_error(inv, BIOS_BUS ".Hold", "AC を接続してください。");
             return;
@@ -211,6 +287,15 @@ static void method_call(GDBusConnection *bus, const char *sender, const char *pa
         g_assert_cmpstr(id, ==, "request-1");
         if (definitely_cancelled) cancelled++;
         else stopped++;
+        if (held_recheck) {
+            /* The remote check may still finish after its caller cancels. */
+            g_dbus_method_invocation_return_value(held_recheck, NULL);
+            g_clear_object(&held_recheck);
+        }
+        if (hold_power_reply) {
+            held_power_reply = g_object_ref(inv);
+            return;
+        }
     } else if (g_str_equal(method, "RegisterClient")) {
         g_free(client_sender);
         client_sender = g_strdup(sender);
@@ -233,6 +318,10 @@ static void method_call(GDBusConnection *bus, const char *sender, const char *pa
         const char *expected = g_str_equal(mock_power, "reboot") ? (gnome ? "Reboot" : "RequestReboot")
                                                                  : (gnome ? "Shutdown" : "RequestShutdown");
         g_assert_cmpstr(method, ==, expected);
+        if (desktop_error) {
+            g_dbus_method_invocation_return_dbus_error(inv, desktop_error, "simulated session manager error");
+            return;
+        }
     } else if (g_str_equal(method, "EndSessionResponse")) {
         const char *reason;
         g_variant_get(args, "(b&s)", &last_response, &reason);
@@ -336,6 +425,172 @@ static void advance(const char *s)
     WAIT_FOR(state(s) && writable() && !ui.timer);
 }
 
+static void review_power(const char *action, const char *confirmation)
+{
+    guint service_calls = powers, session_calls = desktop_calls;
+    click(action);
+    while (g_main_context_iteration(NULL, FALSE)) {}
+    g_assert_cmpuint(powers, ==, service_calls);
+    g_assert_cmpuint(desktop_calls, ==, session_calls);
+    g_assert_nonnull(action_button(confirmation));
+    g_assert_nonnull(action_button("キャンセル"));
+    g_assert_true(gtk_window_get_focus(ui.window) == action_button("キャンセル"));
+}
+
+static void notify_change(const char *s)
+{
+    guint before = status_calls;
+    g_assert_true(g_dbus_connection_emit_signal(ui.portable ? peer_service : service, NULL, BIOS_PATH,
+                                               BIOS_BUS, "Changed", NULL, NULL));
+    WAIT_FOR(status_calls > before);
+    advance(s);
+}
+
+static GtkExpander *details_expander(void)
+{
+    for (GtkWidget *w = gtk_widget_get_first_child(ui.page); w; w = gtk_widget_get_next_sibling(w)) {
+        if (GTK_IS_EXPANDER(w)) return GTK_EXPANDER(w);
+    }
+    g_assert_not_reached();
+}
+
+static void test_review_refresh(void)
+{
+    gtk_expander_set_expanded(details_expander(), TRUE);
+    g_assert_true(gtk_widget_grab_focus(GTK_WIDGET(details_expander())));
+    notify_change("review");
+    g_assert_true(gtk_expander_get_expanded(details_expander()));
+    g_assert_true(gtk_check_button_get_active(GTK_CHECK_BUTTON(ui.recovery)));
+    g_assert_true(gtk_window_get_focus(ui.window) == GTK_WIDGET(details_expander()));
+    g_assert_true(gtk_widget_grab_focus(ui.approve));
+    notify_change("review");
+    g_assert_true(gtk_window_get_focus(ui.window) == ui.approve);
+
+    mock_recovery_detail = "新しい回復条件を確認してください。";
+    notify_change("review");
+    g_assert_false(gtk_expander_get_expanded(details_expander()));
+    g_assert_false(gtk_check_button_get_active(GTK_CHECK_BUTTON(ui.recovery)));
+    g_assert_false(gtk_widget_is_sensitive(ui.approve));
+    g_assert_true(gtk_window_get_focus(ui.window) == action_button("今回は見送る"));
+
+    gtk_expander_set_expanded(details_expander(), TRUE);
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(ui.recovery), TRUE);
+    mock_plan = "replacement";
+    notify_change("review");
+    g_assert_false(gtk_expander_get_expanded(details_expander()));
+    g_assert_false(gtk_check_button_get_active(GTK_CHECK_BUTTON(ui.recovery)));
+    mock_plan = "plan-1";
+    mock_recovery_detail = "";
+    notify_change("review");
+}
+
+static void test_desktop_replies(void)
+{
+    mock_desktop = "gnome";
+    const char *rejections[] = {"org.gnome.SessionManager.LockedDown", "org.gnome.SessionManager.NotInRunning"};
+    for (guint i = 0; i < G_N_ELEMENTS(rejections); i++) {
+        guint before = cancelled;
+        desktop_error = rejections[i];
+        review_power("電源を切る", "電源を切る操作を続ける");
+        click("電源を切る操作を続ける");
+        WAIT_FOR(cancelled == before + 1);
+        advance("pending");
+    }
+    guint before = cancelled, response_count = responses;
+    desktop_error = "org.freedesktop.DBus.Error.NoReply";
+    review_power("電源を切る", "電源を切る操作を続ける");
+    click("電源を切る操作を続ける");
+    WAIT_FOR(strstr(gtk_label_get_text(GTK_LABEL(ui.notice)), "受付結果が未確定") != NULL);
+    g_assert_cmpuint(cancelled, ==, before);
+    g_assert_true(ui.busy);
+    client_signal("QueryEndSession", g_variant_new("(u)", 0u));
+    WAIT_FOR(responses == response_count + 1);
+    g_assert_true(last_response);
+    client_signal("CancelEndSession", NULL);
+    WAIT_FOR(cancelled == before + 1);
+    advance("pending");
+    desktop_error = NULL;
+}
+
+static void test_portable_close(const char *operation)
+{
+    advance("available");
+    if (g_str_equal(operation, "status")) {
+        hold_status = TRUE;
+        click("状態を再確認");
+        WAIT_FOR(held_status);
+    } else if (g_str_equal(operation, "check")) {
+        withhold = TRUE;
+        click("配布情報を再確認");
+        WAIT_FOR(held_check);
+    } else if (g_str_equal(operation, "prepare")) {
+        hold_prepare = TRUE;
+        click("更新する");
+        WAIT_FOR(held_prepare);
+    } else if (g_str_equal(operation, "power") || g_str_equal(operation, "power-request")) {
+        mock_state = "pending";
+        click("状態を再確認");
+        advance("pending");
+        hold_power = g_str_equal(operation, "power-request");
+        hold_recheck = !hold_power;
+        hold_power_reply = TRUE;
+        review_power("再起動する", "再起動を続ける");
+        click("再起動を続ける");
+        WAIT_FOR(held_recheck || held_power);
+    } else {
+        click("更新する");
+        advance("review");
+        gtk_check_button_set_active(GTK_CHECK_BUTTON(ui.recovery), TRUE);
+        if (g_str_equal(operation, "candidates")) hold_candidates = TRUE;
+        else if (g_str_equal(operation, "authorize")) hold_authorize = TRUE;
+        else {
+            g_assert_cmpstr(operation, ==, "install");
+            hold_install = TRUE;
+        }
+        click("この更新を承認");
+        WAIT_FOR(held_candidates || held_authorize || held_install);
+    }
+    gint64 closed_at = g_get_monotonic_time();
+    gtk_window_close(ui.window);
+    if (held_power) {
+        g_assert_false(g_dbus_connection_is_closed(peer_service));
+        g_dbus_method_invocation_return_value(held_power, g_variant_new("(sss)", "request-1", mock_desktop, mock_power));
+        g_clear_object(&held_power);
+    }
+    if (hold_power_reply) {
+        WAIT_FOR(held_power_reply);
+        g_assert_false(g_dbus_connection_is_closed(peer_service));
+        g_dbus_method_invocation_return_value(held_power_reply, NULL);
+        g_clear_object(&held_power_reply);
+    }
+    if (held_authorize) {
+        g_assert_nonnull(ui.control);
+        g_assert_false(g_dbus_connection_is_closed(peer_service));
+        grant_authorization(held_authorize);
+        g_clear_object(&held_authorize);
+        WAIT_FOR(held_decline);
+        g_assert_false(g_dbus_connection_is_closed(peer_service));
+        g_dbus_method_invocation_return_value(held_decline, NULL);
+        g_clear_object(&held_decline);
+    }
+    if (hold_install) {
+        g_assert_false(g_dbus_connection_is_closed(peer_service));
+        fail_install = TRUE;
+        g_dbus_method_invocation_return_dbus_error(held_install, "org.freedesktop.DBus.Error.NoReply",
+                                                    "simulated reply lost after dispatch");
+        g_clear_object(&held_install);
+    }
+    WAIT_FOR(g_dbus_connection_is_closed(peer_service));
+    g_assert_true(g_get_monotonic_time() - closed_at < 2 * G_TIME_SPAN_SECOND);
+    g_assert_cmpuint(cancelled, ==, hold_power_reply ? 1 : 0);
+    g_assert_cmpuint(rechecks, ==, hold_recheck ? 1 : 0);
+    g_assert_cmpuint(desktop_calls, ==, 0);
+    g_assert_cmpuint(permits, ==, hold_authorize || hold_install ? 1 : 0);
+    g_assert_cmpuint(declined, ==, hold_authorize ? 1 : 0);
+    g_assert_cmpuint(installs, ==, hold_install ? 1 : 0);
+    g_assert_cmpuint(reports, ==, hold_install ? 1 : 0);
+}
+
 static void painted(GdkFrameClock *clock, gpointer data)
 {
     (void) clock;
@@ -372,17 +627,29 @@ int main(int argc, char **argv)
 {
     gboolean status_start = argc == 2 && g_str_equal(argv[1], "--test-status-start");
     gboolean pending_start = argc == 2 && g_str_equal(argv[1], "--test-pending-start");
-    gboolean silent_start = argc == 2 && g_str_equal(argv[1], "--test-login-start");
+    gboolean login_start = argc == 2 && g_str_has_prefix(argv[1], "--test-login-");
     gboolean portable = argc == 2 && g_str_has_prefix(argv[1], "--test-portable-");
     gboolean portable_status = portable && g_str_equal(argv[1], "--test-portable-status");
-    if (status_start || pending_start || silent_start || portable) {
+    const char *close_prefix = "--test-portable-close-";
+    const char *close_operation = portable && g_str_has_prefix(argv[1], close_prefix) ? argv[1] + strlen(close_prefix) : NULL;
+    if (login_start) {
+        if (g_str_equal(argv[1], "--test-login-installed") || g_str_equal(argv[1], "--test-login-old-result"))
+            mock_state = "complete";
+        if (g_str_equal(argv[1], "--test-login-unapplied")) mock_state = "hold";
+        result_this_boot = g_str_equal(argv[1], "--test-login-installed") || g_str_equal(argv[1], "--test-login-unapplied");
+    }
+    if (status_start || pending_start || login_start || portable) {
         argc = 1;
         argv[1] = NULL;
     }
     g_test_init(&argc, &argv, NULL);
-    if (!status_start && !pending_start && !silent_start && !portable) {
+    if (!status_start && !pending_start && !login_start && !portable) {
         char *modes[] = {"--test-status-start", "--test-pending-start", "--test-login-start",
-                         "--test-portable-status", "--test-portable-plan"};
+                         "--test-login-installed", "--test-login-unapplied", "--test-login-old-result",
+                         "--test-portable-status", "--test-portable-plan", "--test-portable-close-status",
+                         "--test-portable-close-check", "--test-portable-close-prepare", "--test-portable-close-power",
+                         "--test-portable-close-power-request", "--test-portable-close-candidates",
+                         "--test-portable-close-authorize", "--test-portable-close-install"};
         for (guint i = 0; i < G_N_ELEMENTS(modes); i++) {
             char *child[] = {argv[0], modes[i], NULL};
             int result;
@@ -419,9 +686,9 @@ int main(int argc, char **argv)
     ui.app = gtk_application_new(BIOS_APP, G_APPLICATION_NON_UNIQUE);
     g_assert_true(g_application_register(G_APPLICATION(ui.app), NULL, NULL));
     g_object_set(gtk_settings_get_default(), "gtk-font-name", "Sans 22", NULL);
-    ui.login = silent_start;
+    ui.login = login_start;
     ui.portable = portable;
-    ui.read_only = status_start || silent_start || portable_status;
+    ui.read_only = status_start || login_start || portable_status;
     if (pending_start) mock_state = "pending";
     activate(ui.app, NULL);
     if (portable) {
@@ -461,16 +728,22 @@ int main(int argc, char **argv)
         g_assert_cmpuint(helper_starts, ==, 2);
         g_assert_true(ui.control != ui.bus);
         g_assert_null(ui.owner);
+        if (close_operation) {
+            test_portable_close(close_operation);
+            g_test_dbus_stop(sandbox);
+            return 0;
+        }
     }
-    if (status_start || pending_start || silent_start) {
+    if (status_start || pending_start || login_start) {
         WAIT_FOR(ui.fresh && !ui.busy && !ui.reading);
         g_assert_cmpuint(checks_sent, ==, 0);
         g_assert_cmpuint(installs, ==, 0);
         g_assert_cmpuint(powers, ==, 0);
         g_assert_nonnull(action_button("状態を再確認"));
         if (pending_start) g_assert_true(state("pending"));
-        if (status_start) g_assert_null(action_button("配布情報を再確認"));
-        g_assert_cmpint(gtk_widget_get_visible(GTK_WIDGET(ui.window)), ==, !silent_start);
+        if (status_start || login_start) g_assert_null(action_button("配布情報を再確認"));
+        if (login_start) g_assert_true(state(mock_state));
+        g_assert_cmpint(gtk_widget_get_visible(GTK_WIDGET(ui.window)), ==, !login_start || result_this_boot);
         g_test_dbus_stop(sandbox);
         return 0;
     }
@@ -494,6 +767,7 @@ int main(int argc, char **argv)
     gtk_check_button_set_active(GTK_CHECK_BUTTON(ui.recovery), TRUE);
     g_assert_true(gtk_widget_child_focus(ui.actions, GTK_DIR_TAB_BACKWARD));
     g_assert_true(gtk_window_get_focus(ui.window) == ui.approve);
+    test_review_refresh();
     click("今回は見送る");
     advance("idle");
     g_assert_cmpuint(installs, ==, 0);
@@ -503,9 +777,13 @@ int main(int argc, char **argv)
     advance("review");
     g_assert_false(gtk_widget_is_sensitive(ui.approve));
     gtk_check_button_set_active(GTK_CHECK_BUTTON(ui.recovery), TRUE);
+    delay_authorize = TRUE;
     click("この更新を承認");
     action_clicked(NULL, "Authorize"); /* another activation in the same event loop turn */
+    WAIT_FOR(permits == 1);
+    g_assert_cmpuint(installs, ==, 0);
     advance("pending");
+    delay_authorize = FALSE;
     g_assert_cmpuint(permits, ==, 1);
     g_assert_cmpuint(installs, ==, 1);
     g_assert_cmpuint(reports, ==, 1);
@@ -519,15 +797,30 @@ int main(int argc, char **argv)
     allowed = TRUE;
     click("状態を再確認");
     advance("pending");
+    review_power("再起動する", "再起動を続ける");
+    mock_power = "shutdown";
+    notify_change("pending");
+    g_assert_null(action_button("再起動を続ける"));
+    g_assert_cmpuint(powers, ==, 0);
+    mock_power = "reboot";
+    notify_change("pending");
     logout_block = TRUE;
-    click("再起動する");
+    review_power("再起動する", "再起動を続ける");
+    click("再起動を続ける");
     WAIT_FOR(cancelled == 1);
     advance("pending");
     g_assert_cmpuint(desktop_calls, ==, 0);
     logout_block = FALSE;
     for (guint i = 0; i < 2; i++) {
         mock_desktop = i ? "cinnamon" : "gnome";
-        click("再起動する");
+        guint service_calls = powers, session_calls = desktop_calls;
+        review_power("再起動する", "再起動を続ける");
+        click("キャンセル");
+        while (g_main_context_iteration(NULL, FALSE)) {}
+        g_assert_cmpuint(powers, ==, service_calls);
+        g_assert_cmpuint(desktop_calls, ==, session_calls);
+        review_power("再起動する", "再起動を続ける");
+        click("再起動を続ける");
         WAIT_FOR(desktop_calls == i + 1);
         ac = i != 0;
         client_signal("QueryEndSession", g_variant_new("(u)", 0u));
@@ -543,7 +836,8 @@ int main(int argc, char **argv)
     click("状態を再確認");
     advance("pending");
     g_assert_null(action_button("再起動する"));
-    click("電源を切る");
+    review_power("電源を切る", "電源を切る操作を続ける");
+    click("電源を切る操作を続ける");
     WAIT_FOR(desktop_calls == 3);
     client_signal("QueryEndSession", g_variant_new("(u)", 0u));
     WAIT_FOR(responses == 3);
@@ -554,6 +848,7 @@ int main(int argc, char **argv)
     client_signal("Stop", NULL);
     WAIT_FOR(stopped == 1);
     advance("pending");
+    test_desktop_replies();
     mock_power = "reboot";
     g_assert_cmpuint(installs, ==, 1);
     mock_state = "idle";

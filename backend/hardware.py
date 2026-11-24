@@ -26,6 +26,21 @@ SHA256 = re.compile(r"[0-9a-f]{64}")
 UX_GUID = "3b8c8162-188c-46a4-aec9-be43f1d65697"
 
 
+def target_version_matches(plan, obs):
+    fmt = obs["version_format"]
+    if not fmt or plan.get("version_format") != fmt:
+        return False
+    try:
+        return fw.version_key(obs["current"], fmt) == fw.version_key(plan.get("target"), fmt)
+    except (Hold, ValueError):
+        return False
+
+
+def target_installed(plan, obs):
+    raw = plan.get("target_raw")
+    return (type(raw) is not int or obs.get("fw_version") == raw) and target_version_matches(plan, obs)
+
+
 def _uuid(path):
     try:
         value = uuid.UUID(path.read_text(encoding="ascii").strip())
@@ -283,7 +298,9 @@ def _nvram_files(esp, plan, route, next_boot):
     option_start = 12 + len(label.encode("utf-16-le")) + len(path)
     options = boot[option_start:]
     if route["secure_boot"]:
-        if name != route["shim"].casefold() or options.decode("utf-16-le").lower() != "fwupdx64.efi\0":
+        # fwupd writes the shim argument as a UTF-16LE EFI path with one leading backslash.
+        loader_option = options.decode("utf-16-le").lower()
+        if name != route["shim"].casefold() or loader_option not in ("\\fwupdx64.efi\0", "fwupdx64.efi\0"):
             raise Hold("次回起動のshimとローダー引数を確認できません。")
         if fw.efi_asset_sha256(esp / route["shim"]) != route["shim_sha256"]:
             raise Hold("配置済みshimの内容が一致しません。")
@@ -410,7 +427,7 @@ def _esp_reservation(plan, obs, waiting, device, profile, facts):
         _matches_file(esp, plan, route)
         if not cod:
             if (not waiting and obs["boot"] and plan.get("boot") and obs["boot"] != plan["boot"]
-                    and obs["current"] == plan.get("target") and obs["running"] is False
+                    and obs["can_identify"] and target_installed(plan, obs) and obs["running"] is False
                     and obs["attempt_comparable"] and not obs["new_failure"]):
                 return "clear", "配送指示は解除され、承認したカプセルのファイルだけが残っています。"
             raise Hold("カプセルは配置済みですが、ディスク配送指示がありません。")
@@ -549,7 +566,7 @@ def observe(plan=None):
             raw = obs["fw_version"]
             target_raw = plan.get("target_raw") if plan else None
             if (raw is None or (device.get("VersionRaw") is not None and device["VersionRaw"] != raw)
-                    or (type(target_raw) is int and obs["current"] == plan.get("target") and raw != target_raw)):
+                    or (type(target_raw) is int and target_version_matches(plan, obs) and raw != target_raw)):
                 obs["can_identify"] = False
                 reasons.append("ESRTで読み取った現在版とfwupdの実機版を照合できません。")
             history = _local_rows("get_history")

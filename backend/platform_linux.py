@@ -126,15 +126,30 @@ class Platform:
         except FileExistsError as exc:
             raise Conflict("この起動中に別の更新依頼が記録されました。") from exc
         entry = marker / "gui-operation"
-        with entry.open("x", encoding="ascii") as output:
-            os.fchmod(output.fileno(), 0o600)
-            output.write(plan["id"])
+        written = False
         try:
+            with entry.open("x", encoding="ascii") as output:
+                os.fchmod(output.fileno(), 0o600)
+                output.write(plan["id"])
+            written = True
             yield
-        except Conflict:
-            entry.unlink()
-            marker.rmdir()
+        except BaseException as exc:
+            if not written or isinstance(exc, Conflict):
+                entry.unlink(missing_ok=True)
+                marker.rmdir()
             raise
+
+    def release_claim(self, plan):
+        boot = hardware._uuid(fw.BOOT_ID)
+        if not boot or plan["boot"] != boot:
+            raise Conflict("更新の送信許可を記録した起動と一致しません。")
+        marker = fw.marker_path()
+        if not fw.marker_exists(marker):
+            return
+        if not hardware._owns_marker(marker, plan, boot) or {item.name for item in marker.iterdir()} != {"gui-operation"}:
+            raise Conflict("この更新の送信許可の記録を確認できません。")
+        (marker / "gui-operation").unlink()
+        marker.rmdir()
 
     def power_allowed(self, actor, action):
         if not actor.desktop:

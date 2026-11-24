@@ -11,9 +11,12 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from test_engine import Machine
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 import hardware as hw
+from engine import Engine
+from journal import Journal
 
 fw = hw.fw
 GUID = "156ae31e-05bd-41cf-833d-d47e8534dc7e"
@@ -240,6 +243,48 @@ class ObservationTest(unittest.TestCase):
         self.disk.return_value = "replacement-disk-with-cloned-partuuid"
         self.assertEqual(hw.observe(self.plan)["reservation"], "unknown")
 
+    def test_completed_cod_file_stays_visible_after_reopen_but_foreign_changes_hold(self):
+        capsule = self.stage_cod()
+        self.device["Version"] = "2"
+        (self.esrt / "fw_version").write_text("2")
+        fw.BOOT_ID.write_text(str(uuid.uuid4()))
+        self.var("OsIndications", struct.pack("<Q", 0))
+        platform = Machine()
+        platform.observe = hw.observe
+        actor = platform.actor(":1.2")
+        journal = Journal(self.root / "journal")
+        journal.issue(dict(self.plan, machine=journal.machine_key(MACHINE), id="completed", uid=actor.uid),
+                      actor.sender, ":1.6", actor.bus)
+        engine = Engine(journal, platform)
+        self.assertEqual(engine.status(actor)["state"], "complete")
+
+        engine = Engine(Journal(journal.path), platform)
+        status = engine.status(actor)
+        self.assertEqual(status["state"], "complete")
+        self.assertTrue(status["can_check"])
+        self.assertFalse(status["can_power"])
+        self.assertIn("残っています", status["detail"])
+        platform.candidate.update(guid=GUID, current="2", version_format="number", target="3")
+        self.assertEqual(engine.check(actor)["state"], "available")
+        with self.assertRaises(hw.Hold):
+            hw.preflight(dict(self.plan, boot=fw.BOOT_ID.read_text(), current="2", target="3"))
+
+        for change in ("foreign-capsule", "new-delivery-flag", "new-machine"):
+            with self.subTest(change=change):
+                if change == "foreign-capsule":
+                    capsule.write_bytes(b"other firmware")
+                elif change == "new-delivery-flag":
+                    self.var("OsIndications", struct.pack("<Q", 4))
+                else:
+                    (fw.DMI / "product_uuid").write_text(str(uuid.uuid4()))
+                status = engine.status(actor)
+                self.assertEqual(status["state"], "hold")
+                self.assertFalse(status["can_check"])
+                self.assertFalse(status["can_power"])
+                capsule.write_bytes(self.payload)
+                self.var("OsIndications", struct.pack("<Q", 0))
+                (fw.DMI / "product_uuid").write_text(MACHINE)
+
     def test_read_failure_keeps_independent_evidence(self):
         actual = fw.esp_has_entry
         def phase(esp, relative, **kw):
@@ -271,6 +316,18 @@ class ObservationTest(unittest.TestCase):
         self.device["VersionRaw"] = 1
         self.assertFalse(hw.observe(self.plan)["can_identify"])
 
+    def test_equivalent_version_spelling_still_requires_matching_esrt_raw(self):
+        self.plan.update(target="002", target_raw=2)
+        self.stage_cod()
+        self.device["Version"] = "2"
+        fw.BOOT_ID.write_text(str(uuid.uuid4()))
+        self.var("OsIndications", struct.pack("<Q", 0))
+        self.assertFalse(hw.observe(self.plan)["can_identify"])
+        (self.esrt / "fw_version").write_text("2")
+        status = hw.observe(self.plan)
+        self.assertTrue(status["can_identify"])
+        self.assertEqual(status["reservation"], "clear")
+
     def test_foreign_update_and_low_battery_hold_preparation(self):
         self.history.append(dict(DeviceId="b" * 40, UpdateState=1))
         self.assertEqual(hw.observe()["reservation"], "foreign")
@@ -287,9 +344,10 @@ class ObservationTest(unittest.TestCase):
         with self.assertRaisesRegex(hw.Hold, "空き容量"):
             hw.preflight(self.plan)
 
-    def test_nvram_requires_device_file_loader_and_the_registered_partition(self):
-        self.var("SecureBoot", b"\0")
-        self.profile["secure_boot"] = {"delivery": "nvram", "efi_app_dir": str(self.root), "esp_vendor_dir": "ubuntu"}
+    def stage_nvram(self, secure):
+        self.var("SecureBoot", bytes([secure]))
+        self.profile["secure_boot"] = {"delivery": "shim" if secure else "nvram",
+                                       "efi_app_dir": str(self.root), "esp_vendor_dir": "ubuntu"}
         dos = bytearray(64)
         dos[:2] = b"MZ"
         struct.pack_into("<I", dos, 60, 64)
@@ -298,7 +356,14 @@ class ObservationTest(unittest.TestCase):
         struct.pack_into("<H", optional, 0, 0x20b)
         struct.pack_into("<H", optional, 68, 10)
         loader = bytes(dos) + coff + optional + bytes(40)
-        (self.root / "fwupdx64.efi").write_bytes(loader)
+        (self.root / ("fwupdx64.efi.signed" if secure else "fwupdx64.efi")).write_bytes(loader)
+        if secure:
+            (self.root / "shimx64.efi.signed").write_bytes(loader)
+            digest = hashlib.sha256(loader).hexdigest()
+            self.profile["secure_boot"].update(fwupd_efi_sha256=digest, shim_sha256=[digest])
+            shim = self.esp / "EFI/ubuntu/shimx64.efi"
+            shim.parent.mkdir(parents=True)
+            shim.write_bytes(loader)
         route = hw.preflight(self.plan)
         self.plan["binding"] = route
         image = self.esp / route["file"]
@@ -306,15 +371,32 @@ class ObservationTest(unittest.TestCase):
         image.write_bytes(self.payload)
         (self.esp / route["loader"]).write_bytes(loader)
         self.var("BootNext", struct.pack("<H", 7))
-        self.var("Boot0007", boot_option("Linux Firmware Updater", file_path(route["loader"])))
         info = struct.pack("<I16sIQ16sI", 7, uuid.UUID(GUID).bytes_le, 0, 0, bytes(16), 1)
         self.var(f"fwupd-{GUID}-0", info + file_path(route["file"]), fw.FWUPDATE_GUID)
+        return route, info
+
+    def test_nvram_requires_device_file_loader_and_the_registered_partition(self):
+        route, info = self.stage_nvram(False)
+        self.var("Boot0007", boot_option("Linux Firmware Updater", file_path(route["loader"])))
         obs = hw.observe(self.plan)
         self.assertEqual(obs["reservation"], "matching", obs["detail"])
         self.assertEqual(hw.check_power_action(self.plan, obs), "reboot")
         self.var(f"fwupd-{GUID}-0", info + file_path(route["file"], number=2), fw.FWUPDATE_GUID)
         with self.assertRaisesRegex(hw.Hold, "ESP"):
             hw.check_power_action(self.plan, hw.observe(self.plan))
+
+    def test_secure_boot_shim_load_option_matches_fwupd_2_0_20(self):
+        route, _ = self.stage_nvram(True)
+        for path in ("\\fwupdx64.efi\0", "fwupdx64.efi\0"):
+            with self.subTest(path=path):
+                self.var("Boot0007", boot_option("Linux Firmware Updater", file_path(route["shim"]),
+                                                path.encode("utf-16-le")))
+                obs = hw.observe(self.plan)
+                self.assertEqual(obs["reservation"], "matching", obs["detail"])
+                self.assertEqual(hw.check_power_action(self.plan, obs), "reboot")
+        self.var("Boot0007", boot_option("Linux Firmware Updater", file_path(route["shim"]),
+                                        "\\different.efi\0".encode("utf-16-le")))
+        self.assertEqual(hw.observe(self.plan)["reservation"], "unknown")
 
     def test_recovery_prompt_uses_local_media_flag_and_operator_report(self):
         block = fw.UDISKS + ".Block"

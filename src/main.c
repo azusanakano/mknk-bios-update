@@ -12,6 +12,7 @@
 
 #define UNKNOWN "確認できません"
 #define FWUPD "org.freedesktop.fwupd"
+#define FOCUS_KEY "mknk-review-focus"
 
 /* fwupd and logind use the GUI's system bus. Portable app methods use a
  * separate root-authenticated peer with no D-Bus destination name. */
@@ -19,17 +20,18 @@ static struct {
     GtkApplication *app;
     GtkWindow *window;
     GtkWidget *model, *current, *stack, *page, *history, *history_text, *notice;
-    GtkWidget *approve, *recovery, *actions;
+    GtkWidget *approve, *recovery, *details, *actions;
     GDBusConnection *bus, *control;
-    GCancellable *startup;
-    JsonObject *view;
-    char *owner, *stage, *previous_state, *deferred_plan;
+    GCancellable *startup, *power_preflight;
+    JsonObject *view, *rendered_review;
+    const char *review_focus;
+    char *owner, *stage, *previous_state, *deferred_plan, *power_plan, *power_action;
     guint watch, changes, timer, startup_timeout;
     gulong closed;
     int appdir_fd;
     guint64 generation;
     gboolean opening, busy, reading, fresh, read_only, explicit_plan, closing, first_status, login;
-    gboolean preparing, abandon_prepare, portable;
+    gboolean preparing, abandon_prepare, portable, wait_on_close, review_ready;
 } ui;
 
 typedef struct {
@@ -73,18 +75,20 @@ static gboolean same_service(Request *r)
     return r->control == ui.control && r->system == ui.bus && g_strcmp0(r->owner, ui.owner) == 0;
 }
 
-static const char *field(const char *key)
+static const char *view_field(JsonObject *view, const char *key)
 {
-    JsonNode *n = ui.view ? json_object_get_member(ui.view, key) : NULL;
+    JsonNode *n = view ? json_object_get_member(view, key) : NULL;
     return n && json_node_get_value_type(n) == G_TYPE_STRING ? json_node_get_string(n) : "";
 }
 
-static gboolean flag(const char *key)
+static gboolean view_flag(JsonObject *view, const char *key)
 {
-    JsonNode *n = ui.view ? json_object_get_member(ui.view, key) : NULL;
+    JsonNode *n = view ? json_object_get_member(view, key) : NULL;
     return n && json_node_get_value_type(n) == G_TYPE_BOOLEAN && json_node_get_boolean(n);
 }
 
+static const char *field(const char *key) { return view_field(ui.view, key); }
+static gboolean flag(const char *key) { return view_flag(ui.view, key); }
 static gboolean state(const char *value) { return g_str_equal(field("state"), value); }
 
 static gboolean hex_id(const char *s, size_t length)
@@ -125,6 +129,7 @@ static void info(GtkWidget *box, const char *name, const char *value)
     g_autofree char *line = g_strdup_printf("%s　%s", name, value);
     GtkWidget *w = label(line, NULL);
     gtk_label_set_selectable(GTK_LABEL(w), TRUE);
+    g_object_set_data(G_OBJECT(w), FOCUS_KEY, (gpointer) name);
     append(box, w);
 }
 
@@ -188,6 +193,24 @@ static gboolean can_check(void)
                                  state("complete") || state("hold"));
 }
 
+static gboolean can_request_power(void)
+{
+    return !ui.read_only && state("pending") && flag("can_power") && *field("plan") &&
+           (g_str_equal(field("power"), "reboot") || g_str_equal(field("power"), "shutdown"));
+}
+
+static gboolean matching_power_confirmation(void)
+{
+    return ui.power_plan && can_request_power() && g_str_equal(ui.power_plan, field("plan")) &&
+           g_str_equal(ui.power_action, field("power"));
+}
+
+static void clear_power_confirmation(void)
+{
+    g_clear_pointer(&ui.power_plan, g_free);
+    g_clear_pointer(&ui.power_action, g_free);
+}
+
 static void refresh(void);
 static void connect_service(void);
 static void action_clicked(GtkButton *button, gpointer data);
@@ -199,6 +222,7 @@ static GtkWidget *button(GtkWidget *box, const char *text, const char *action, g
     if (GTK_IS_LABEL(caption)) gtk_label_set_wrap(GTK_LABEL(caption), TRUE);
     if (primary) gtk_widget_add_css_class(w, "suggested-action");
     gtk_widget_set_halign(w, GTK_ALIGN_START);
+    g_object_set_data(G_OBJECT(w), FOCUS_KEY, (gpointer) action);
     g_signal_connect(w, "clicked", G_CALLBACK(action_clicked), (gpointer) action);
     gtk_flow_box_insert(GTK_FLOW_BOX(box), w, -1);
     GtkWidget *item = gtk_widget_get_parent(w);
@@ -226,16 +250,67 @@ static void recovery_toggled(GtkCheckButton *check, gpointer data)
         gtk_widget_set_sensitive(ui.approve, can_approve() && gtk_check_button_get_active(check));
 }
 
+static gboolean same_review(void)
+{
+    if (!ui.rendered_review || !state("review") || !*field("plan")) return FALSE;
+    const char *content[] = {
+        "plan", "model", "current", "target", "scope", "source", "checked", "changes", "power",
+        "signed", "synced", "checksum", "cab_sha512", "remote_id", "appstream_id", "device", "daemon_owner",
+        "recovery_detail",
+    };
+    for (guint i = 0; i < G_N_ELEMENTS(content); i++) {
+        if (!g_str_equal(view_field(ui.rendered_review, content[i]), field(content[i]))) return FALSE;
+    }
+    return view_flag(ui.rendered_review, "recovery_required") == flag("recovery_required") &&
+           view_flag(ui.rendered_review, "cached") == flag("cached");
+}
+
+static const char *widget_focus_key(GtkWidget *widget)
+{
+    for (; widget; widget = gtk_widget_get_parent(widget)) {
+        const char *key = g_object_get_data(G_OBJECT(widget), FOCUS_KEY);
+        if (key) return key;
+    }
+    return NULL;
+}
+
+static GtkWidget *find_focus(GtkWidget *root, const char *key)
+{
+    if (g_strcmp0(g_object_get_data(G_OBJECT(root), FOCUS_KEY), key) == 0) return root;
+    for (GtkWidget *child = gtk_widget_get_first_child(root); child; child = gtk_widget_get_next_sibling(child)) {
+        GtkWidget *match = find_focus(child, key);
+        if (match) return match;
+    }
+    return NULL;
+}
+
 static void render(void)
 {
     GtkWidget *page = column(14), *focus = NULL;
     const char *s = field("state");
-    const char *focus_state = (ui.busy || ui.reading || !ui.fresh) ? "" : s;
+    gboolean review = state("review") && *field("plan");
+    gboolean keep_review = same_review();
+    gboolean recovered = keep_review && ui.recovery && gtk_check_button_get_active(GTK_CHECK_BUTTON(ui.recovery));
+    gboolean expanded = keep_review && ui.details && gtk_expander_get_expanded(GTK_EXPANDER(ui.details));
+    if (!keep_review) {
+        ui.review_focus = NULL;
+        ui.review_ready = FALSE;
+    } else if (g_strcmp0(ui.previous_state, "review") == 0) {
+        /* GTK may move focus when the current button is disabled during a status read. */
+        ui.review_focus = widget_focus_key(gtk_window_get_focus(ui.window));
+    }
+    g_clear_pointer(&ui.rendered_review, json_object_unref);
+    if (review) ui.rendered_review = json_object_ref(ui.view);
+    if (!matching_power_confirmation()) clear_power_confirmation();
+    const char *focus_state = ui.power_plan ? "power-confirmation" : s;
+    if (ui.busy || ui.reading || !ui.fresh) focus_state = "";
     gboolean transition = g_strcmp0(ui.previous_state, focus_state) != 0;
+    gboolean entering_view = *focus_state && (review ? !ui.review_ready : transition);
     GtkWidget *old = ui.page;
     ui.page = page;
     ui.approve = NULL;
     ui.recovery = NULL;
+    ui.details = NULL;
     gtk_stack_add_child(GTK_STACK(ui.stack), page);
     gtk_stack_set_visible_child(GTK_STACK(ui.stack), page);
     if (old) gtk_stack_remove(GTK_STACK(ui.stack), old);
@@ -266,7 +341,8 @@ static void render(void)
     if (shutdown || g_str_equal(field("power"), "reboot"))
         info(page, "必要な起動操作", shutdown ? "電源を切り、次に電源を入れる" : "再起動");
     if (*field("signed") || *field("synced") || *field("plan") || *field("checksum")) {
-        GtkWidget *expander = gtk_expander_new("配布情報と計画の詳細");
+        ui.details = gtk_expander_new("配布情報と計画の詳細");
+        g_object_set_data(G_OBJECT(ui.details), FOCUS_KEY, "ReviewDetails");
         GtkWidget *details = column(6);
         info(details, "計画 ID", field("plan"));
         info(details, "配布元 ID", field("remote_id"));
@@ -275,15 +351,18 @@ static void render(void)
         info(details, "CAB の SHA-512", field("cab_sha512"));
         info(details, "署名日時", field("signed"));
         info(details, "上流との同期時点", field("synced"));
-        gtk_expander_set_child(GTK_EXPANDER(expander), details);
-        append(page, expander);
+        gtk_expander_set_child(GTK_EXPANDER(ui.details), details);
+        gtk_expander_set_expanded(GTK_EXPANDER(ui.details), expanded);
+        append(page, ui.details);
     }
     if (state("review") && *field("recovery_detail")) append(page, label(field("recovery_detail"), NULL));
     if (state("review") && flag("recovery_required") && !ui.read_only) {
         ui.recovery = gtk_check_button_new();
+        g_object_set_data(G_OBJECT(ui.recovery), FOCUS_KEY, "ReviewRecovery");
         const char *affirmation = "この PC が起動しなくても、暗号化した各 OS の回復手段を紙や別端末で参照できます（Ubuntu の TPM 暗号化・Windows の BitLocker など）";
         GtkWidget *caption = label(affirmation, NULL);
         gtk_check_button_set_child(GTK_CHECK_BUTTON(ui.recovery), caption);
+        gtk_check_button_set_active(GTK_CHECK_BUTTON(ui.recovery), recovered);
         gtk_accessible_update_property(GTK_ACCESSIBLE(ui.recovery), GTK_ACCESSIBLE_PROPERTY_LABEL, affirmation, -1);
         g_signal_connect(ui.recovery, "toggled", G_CALLBACK(recovery_toggled), NULL);
         append(page, ui.recovery);
@@ -311,16 +390,22 @@ static void render(void)
         focus = button(ui.actions, "今回は見送る", "Dismiss", FALSE);
         gtk_widget_set_sensitive(focus, writable());
         ui.approve = button(ui.actions, "この更新を承認", "Authorize", TRUE);
-        gtk_widget_set_sensitive(ui.approve, can_approve() && !ui.recovery);
+        gtk_widget_set_sensitive(ui.approve, can_approve() && (!ui.recovery || recovered));
     } else if (!ui.read_only && state("available") && flag("can_prepare") && *field("token")) {
         gtk_widget_set_sensitive(button(ui.actions, "更新する", "Prepare", TRUE), writable());
     } else if (state("pending")) {
-        if (ui.deferred_plan && g_str_equal(ui.deferred_plan, field("plan"))) {
+        if (ui.power_plan) {
+            append(page, label(shutdown ? "この PC の電源を切りますか？" : "この PC を再起動しますか？", "heading"));
+            append(page, label("開いている作業を保存してから進んでください。", NULL));
+            focus = button(ui.actions, "キャンセル", "CancelPower", FALSE);
+            gtk_widget_set_sensitive(button(ui.actions, shutdown ? "電源を切る操作を続ける" : "再起動を続ける",
+                                             "ConfirmPower", TRUE), writable());
+        } else if (ui.deferred_plan && g_str_equal(ui.deferred_plan, field("plan"))) {
             if (!ui.read_only) focus = button(ui.actions, "起動操作を表示", "ShowPower", FALSE);
         } else if (!ui.read_only) {
             focus = button(ui.actions, "あとで", "Later", FALSE);
             gtk_widget_set_sensitive(focus, !ui.busy);
-            if (flag("can_power") && *field("plan") && (shutdown || g_str_equal(field("power"), "reboot")))
+            if (can_request_power())
                 gtk_widget_set_sensitive(button(ui.actions, shutdown ? "電源を切る" : "再起動する", "Power", TRUE),
                                          writable());
         }
@@ -338,11 +423,18 @@ static void render(void)
     set_text(ui.history_text, *history ? history : ui.view ? "表示できる履歴はありません。" :
              ui.portable && !ui.read_only ? "「更新情報を確認」で端末の更新履歴を読み取れます。" :
              ui.portable ? "更新履歴は通常モードで管理者認証を行うと確認できます。" : "履歴を取得できません。");
-    if (focus && transition && *focus_state) gtk_widget_grab_focus(focus);
+    GtkWidget *restore_focus = NULL;
+    if (ui.review_focus) {
+        restore_focus = find_focus(page, ui.review_focus);
+        if (!restore_focus) restore_focus = find_focus(ui.actions, ui.review_focus);
+    }
+    if (restore_focus && gtk_widget_is_sensitive(restore_focus)) gtk_widget_grab_focus(restore_focus);
+    else if (focus && entering_view) gtk_widget_grab_focus(focus);
 #if GTK_CHECK_VERSION(4, 14, 0)
-    if (transition && *focus_state)
+    if (entering_view)
         gtk_accessible_announce(GTK_ACCESSIBLE(ui.stack), heading, GTK_ACCESSIBLE_ANNOUNCEMENT_PRIORITY_MEDIUM);
 #endif
+    if (review && *focus_state) ui.review_ready = TRUE;
     g_free(ui.previous_state);
     ui.previous_state = g_strdup(focus_state);
 }
@@ -390,7 +482,8 @@ static void status_done(GObject *source, GAsyncResult *result, gpointer data)
     }
     if (ui.login) {
         ui.login = FALSE;
-        if (!ui.fresh || (!*field("plan") && !state("pending") && !state("issuing") && !state("uncertain"))) {
+        if (!ui.fresh || (!*field("plan") && !flag("result_this_boot") &&
+                          !state("pending") && !state("issuing") && !state("uncertain"))) {
             g_application_quit(G_APPLICATION(ui.app));
             return;
         }
@@ -449,6 +542,7 @@ static void changed(GDBusConnection *bus, const char *sender, const char *path,
 static void clear_control(void)
 {
     ++ui.generation;
+    if (ui.power_preflight) g_cancellable_cancel(ui.power_preflight);
     if (ui.changes) g_dbus_connection_signal_unsubscribe(ui.control, ui.changes);
     if (ui.closed) g_signal_handler_disconnect(ui.control, ui.closed);
     ui.changes = 0;
@@ -459,6 +553,8 @@ static void clear_control(void)
     g_clear_object(&ui.control);
     g_clear_pointer(&ui.owner, g_free);
     g_clear_pointer(&ui.view, json_object_unref);
+    g_clear_pointer(&ui.rendered_review, json_object_unref);
+    clear_power_confirmation();
 }
 
 static void private_closed(GDBusConnection *bus, gboolean remote, GError *error, gpointer data)
@@ -591,11 +687,20 @@ static void begin(const char *stage)
     render();
 }
 
+static void close_and_quit(void)
+{
+    if (ui.portable && ui.control) g_dbus_connection_close(ui.control, NULL, NULL, NULL);
+    clear_control();
+    g_application_quit(G_APPLICATION(ui.app));
+}
+
 static void end(void)
 {
     ui.busy = FALSE;
+    ui.wait_on_close = FALSE;
+    g_clear_object(&ui.power_preflight);
     g_clear_pointer(&ui.stage, g_free);
-    if (ui.closing) g_application_quit(G_APPLICATION(ui.app));
+    if (ui.closing) close_and_quit();
     else render();
 }
 
@@ -606,6 +711,7 @@ static void view_done(GObject *source, GAsyncResult *result, gpointer data)
     g_autoptr(Request) r = data;
     g_autoptr(GError) error = NULL;
     g_autoptr(GVariant) reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), result, &error);
+    if (ui.closing && !ui.wait_on_close) return;
     gboolean attached = same_service(r);
     gboolean same = r->generation == ui.generation && attached;
     if (ui.preparing) {
@@ -683,6 +789,24 @@ static gboolean valid_cab(GUnixFDList *fds, gint index)
            S_ISREG(st.st_mode) && st.st_size > 0 && lseek(fd[0], 0, SEEK_CUR) == 0;
 }
 
+static void authorization_declined(GObject *source, GAsyncResult *result, gpointer data)
+{
+    g_autoptr(Request) r = data;
+    g_autoptr(GError) error = NULL;
+    g_autoptr(GVariant) reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), result, &error);
+    if (!reply && same_service(r))
+        error_notice("未送信の許可を取り消せませんでした。端末の記録を読み直します。", error);
+    schedule_status();
+    end();
+}
+
+static void decline_authorization(Request *r)
+{
+    g_dbus_connection_call(r->control, r->owner, BIOS_PATH, BIOS_BUS, "DeclineAuthorization",
+                           g_variant_new("(s)", r->id), G_VARIANT_TYPE_UNIT,
+                           G_DBUS_CALL_FLAGS_NO_AUTO_START, G_MAXINT, NULL, authorization_declined, r);
+}
+
 static void authorized(GObject *source, GAsyncResult *result, gpointer data)
 {
     g_autoptr(Request) r = data;
@@ -705,10 +829,10 @@ static void authorized(GObject *source, GAsyncResult *result, gpointer data)
         end();
         return;
     }
-    if (g_strcmp0(owner, r->fwupd) != 0 || g_strcmp0(device, r->device) != 0 || !valid_cab(fds, index) ||
-        ui.closing || !same_service(r) || g_dbus_connection_is_closed(r->control)) {
-        notice("対象または配布ファイルの送信条件を確認できません。端末の記録を読み直します。");
-        report(g_steal_pointer(&r), FALSE);
+    if (ui.closing || g_strcmp0(owner, r->fwupd) != 0 || g_strcmp0(device, r->device) != 0 || !valid_cab(fds, index) ||
+        !same_service(r) || g_dbus_connection_is_closed(r->control)) {
+        if (!ui.closing) notice("送信条件を確認できません。未使用の許可を取り消します。");
+        decline_authorization(g_steal_pointer(&r));
         return;
     }
     GVariantBuilder options;
@@ -763,7 +887,8 @@ static void user_candidates(GObject *source, GAsyncResult *result, gpointer data
     g_autoptr(Request) r = data;
     g_autoptr(GError) error = NULL;
     g_autoptr(GVariant) reply = g_dbus_connection_call_finish(bus, result, &error);
-    if (!reply || !has_reviewed_release(reply, r) || ui.closing || !same_service(r) ||
+    if (ui.closing) return;
+    if (!reply || !has_reviewed_release(reply, r) || !same_service(r) ||
         ui.generation != r->generation) {
         error_notice("この画面から確認した更新候補が承認内容と一致しません。配布情報を見直してください。", error);
         schedule_status();
@@ -771,11 +896,14 @@ static void user_candidates(GObject *source, GAsyncResult *result, gpointer data
         return;
     }
     Request *checked = g_steal_pointer(&r);
+    /* The permit is durable. Keep receiving while the service waits for the
+     * verification worker and machine locks. */
+    ui.wait_on_close = TRUE;
     g_dbus_connection_call_with_unix_fd_list(checked->control, checked->owner, BIOS_PATH, BIOS_BUS, "Authorize",
                                             g_variant_new("(s)", checked->id), G_VARIANT_TYPE("(sssh)"),
                                             G_DBUS_CALL_FLAGS_NO_AUTO_START |
                                             G_DBUS_CALL_FLAGS_ALLOW_INTERACTIVE_AUTHORIZATION,
-                                            120000, NULL, NULL, authorized, checked);
+                                            G_MAXINT, NULL, NULL, authorized, checked);
 }
 
 static void power_recorded(GObject *source, GAsyncResult *result, gpointer data)
@@ -794,7 +922,7 @@ static void power_complete(gboolean cancelled, const char *message, gpointer dat
     if (same_service(r)) notice(message);
     g_dbus_connection_call(r->control, r->owner, BIOS_PATH, BIOS_BUS, "ReplyPower",
                            g_variant_new("(sb)", r->id, cancelled), G_VARIANT_TYPE_UNIT,
-                           G_DBUS_CALL_FLAGS_NO_AUTO_START, 5000, NULL, power_recorded, r);
+                           G_DBUS_CALL_FLAGS_NO_AUTO_START, G_MAXINT, NULL, power_recorded, r);
 }
 
 static void power_ready(GObject *source, GAsyncResult *result, gpointer data)
@@ -819,11 +947,12 @@ static void power_ready(GObject *source, GAsyncResult *result, gpointer data)
         return;
     }
     g_free(ui.stage);
-    ui.stage = g_strdup("デスクトップの終了条件と確認画面を待っています。");
+    ui.stage = g_strdup("デスクトップの終了条件を確認しています。");
     render();
     Request *operation = g_steal_pointer(&r);
+    ui.power_preflight = g_cancellable_new();
     session_request_power(operation->system, operation->control, operation->owner, id, desktop, action,
-                          notice, power_complete, operation);
+                          ui.power_preflight, notice, power_complete, operation);
 }
 
 static void action_clicked(GtkButton *button_widget, gpointer data)
@@ -868,6 +997,11 @@ static void action_clicked(GtkButton *button_widget, gpointer data)
         refresh();
         return;
     }
+    if (g_str_equal(action, "CancelPower") && ui.power_plan) {
+        clear_power_confirmation();
+        render();
+        return;
+    }
     if (!writable()) return;
     if (g_str_equal(action, "Prepare") && state("available") && flag("can_prepare") && *field("token")) {
         ui.preparing = TRUE;
@@ -896,12 +1030,18 @@ static void action_clicked(GtkButton *button_widget, gpointer data)
         g_dbus_connection_call(ui.bus, r->fwupd, "/", FWUPD, "GetUpgrades", g_variant_new("(s)", r->device),
                                G_VARIANT_TYPE("(aa{sv})"), G_DBUS_CALL_FLAGS_NO_AUTO_START, 30000,
                                NULL, user_candidates, r);
-    } else if (g_str_equal(action, "Power") && state("pending") && flag("can_power") && *field("plan") &&
-               (g_str_equal(field("power"), "reboot") || g_str_equal(field("power"), "shutdown"))) {
+    } else if (g_str_equal(action, "Power") && !ui.power_plan && can_request_power()) {
+        ui.power_plan = g_strdup(field("plan"));
+        ui.power_action = g_strdup(field("power"));
+        render();
+    } else if (g_str_equal(action, "ConfirmPower") && matching_power_confirmation()) {
+        clear_power_confirmation();
         begin("給電状態・起動先・更新の予約を再確認しています。");
+        /* Keep the connection until an allocated request can be acknowledged. */
+        ui.wait_on_close = TRUE;
         g_dbus_connection_call(ui.control, ui.owner, BIOS_PATH, BIOS_BUS, "Power",
                                g_variant_new("(s)", field("plan")), G_VARIANT_TYPE("(sss)"),
-                               G_DBUS_CALL_FLAGS_NO_AUTO_START, 30000, NULL, power_ready,
+                               G_DBUS_CALL_FLAGS_NO_AUTO_START, G_MAXINT, NULL, power_ready,
                                request_new(field("power")));
     }
 }
@@ -911,11 +1051,9 @@ static gboolean closing(GtkWindow *window, gpointer data)
     (void) data;
     ui.closing = TRUE;
     if (ui.startup) g_cancellable_cancel(ui.startup);
-    if (ui.busy) {
-        gtk_widget_set_visible(GTK_WIDGET(window), FALSE);
-        return TRUE;
-    }
-    g_application_quit(G_APPLICATION(ui.app));
+    if (ui.power_preflight) g_cancellable_cancel(ui.power_preflight);
+    gtk_widget_set_visible(GTK_WIDGET(window), FALSE);
+    if (!ui.wait_on_close) close_and_quit();
     return TRUE;
 }
 
@@ -1023,6 +1161,7 @@ int main(int argc, char **argv)
     finish_startup();
     if (ui.portable && ui.control) g_dbus_connection_close_sync(ui.control, NULL, NULL);
     clear_control();
+    g_clear_object(&ui.power_preflight);
     if (ui.watch) g_bus_unwatch_name(ui.watch);
     if (ui.appdir_fd >= 0) close(ui.appdir_fd);
     g_clear_object(&ui.bus);

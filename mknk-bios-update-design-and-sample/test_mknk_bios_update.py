@@ -304,6 +304,16 @@ class StableCatalogTest(unittest.TestCase):
         self.exercise_check(self.published, xml=xml, expected_hold="条件を確認できません",
                             other_devices=[dict(self.bios, DeviceId="c" * 40)])
 
+    def test_firmware_guid_presence_does_not_require_a_unique_versioned_device(self):
+        peer_guid = "33333333-3333-3333-3333-333333333333"
+        xml = self.catalog_with_component_data(
+            f'<requires><firmware>{peer_guid}</firmware></requires>')
+        peer = {"DeviceId": "c" * 40, "Guid": [peer_guid]}
+        self.exercise_check(self.published, xml=xml, other_devices=[peer, dict(peer, DeviceId="d" * 40)])
+        self.exercise_check(self.published, xml=xml, expected_hold="必須条件を満たしません")
+        self.exercise_check(self.published, xml=xml, other_devices=[dict(peer, Guid=None)],
+                            expected_hold="必須条件を確認できません")
+
     def test_version_check_required_demands_a_component_hard_requirement(self):
         hard = '<requires><firmware compare="ge" version="1.0"/></requires>'
         soft = hard.replace("requires", "recommends")
@@ -405,6 +415,47 @@ class StableCatalogTest(unittest.TestCase):
         xml = self.signed_xml.replace(b'a' * 64, b'e' * 128).replace(b"sha256", b"sha512")
         self.exercise_check(dict(self.published, Checksum=["a" * 64, "e" * 128]), xml=xml)
 
+    def catalog_with_linked_release_records(self):
+        root = ET.fromstring(self.signed_xml)
+        releases = root.find("component/releases")
+        bridge = releases[0].find(".//artifact")
+        ET.SubElement(bridge, "checksum", type="sha512").text = "e" * 128
+        alias = ET.fromstring(ET.tostring(releases[0]))
+        alias.find(".//artifact").remove(alias.find(".//checksum[@type='sha256']"))
+        releases.append(alias)
+        return root, releases
+
+    def test_same_release_records_link_through_a_signed_hash_using_either_order(self):
+        for separate_components in (False, True):
+            with self.subTest(separate_components=separate_components):
+                root, releases = self.catalog_with_linked_release_records()
+                siblings = releases
+                if separate_components:
+                    component = ET.fromstring(ET.tostring(root[0]))
+                    component.find("releases").remove(component.find("releases/release"))
+                    releases.remove(releases[1])
+                    root.append(component)
+                    siblings = root
+                self.exercise_check(self.published, xml=ET.tostring(root))
+                siblings[:] = list(reversed(siblings))
+                self.exercise_check(self.published, xml=ET.tostring(root))
+
+    def test_linked_release_records_must_agree_on_the_cab(self):
+        root, releases = self.catalog_with_linked_release_records()
+        ET.SubElement(releases[1].find(".//artifact"), "checksum", type="sha256").text = "b" * 64
+        self.exercise_check(self.published, xml=ET.tostring(root), expected_hold="同じ方式で異なる")
+
+    def test_linked_release_records_must_agree_on_the_cab_size(self):
+        root, releases = self.catalog_with_linked_release_records()
+        for entry, size in zip(releases, ("100", "101")):
+            ET.SubElement(entry, "size", type="download").text = size
+        self.exercise_check(self.published, xml=ET.tostring(root), expected_hold="受信サイズが一致しません")
+
+    def test_linked_release_records_cannot_hide_an_unmet_requirement(self):
+        root, releases = self.catalog_with_linked_release_records()
+        releases[1].append(ET.fromstring('<requires><firmware compare="ge" version="2.0"/></requires>'))
+        self.exercise_check(self.published, xml=ET.tostring(root), expected_hold="必須条件を満たしません")
+
     def catalog_with_competitor(self, version, *, component_data=None):
         root = ET.fromstring(self.signed_xml)
         component = root.find("component")
@@ -476,10 +527,34 @@ class StableCatalogTest(unittest.TestCase):
         self.exercise_check(self.published, xml=xml, host_ids={key: "44444444-4444-4444-4444-444444444444"})
         self.exercise_check(self.published, xml=xml, host_ids={key: second_sku}, expected_hold="上位版")
 
+    def test_not_hardware_requires_real_chids_to_allow_or_exclude_a_model(self):
+        excluded = "33333333-3333-3333-3333-333333333333"
+        other = "44444444-4444-4444-4444-444444444444"
+        requirement = f"<requires><not_hardware>{excluded}</not_hardware></requires>"
+        xml = self.catalog_with_component_data(requirement)
+        host_ids = {"Manufacturer&Family": other, "ProductSku": excluded}
+        self.exercise_check(self.published, xml=xml, host_ids=host_ids)
+        self.exercise_check(self.published, xml=xml, host_ids={"Manufacturer&Family": excluded},
+                            expected_hold="機種条件を満たしません")
+        self.exercise_check(self.published, xml=xml, host_ids={"ProductSku": other},
+                            expected_hold="必須条件を確認できません")
+        self.exercise_check(self.published, xml=xml,
+                            host_ids={"Manufacturer&Family": other, "Manufacturer&ProductName": "invalid"},
+                            expected_hold="必須条件を確認できません")
+
+    def test_not_hardware_excludes_a_newer_release_only_when_a_chid_matches(self):
+        excluded = "33333333-3333-3333-3333-333333333333"
+        xml = self.catalog_with_competitor(
+            "196608", component_data=f"<requires><not_hardware>{excluded}</not_hardware></requires>")
+        self.exercise_check(self.published, xml=xml, host_ids={"Manufacturer&Family": excluded})
+        self.exercise_check(self.published, xml=xml, host_ids={}, expected_hold="上位版")
+        self.exercise_check(self.published, xml=xml, expected_hold="上位版",
+                            host_ids={"Manufacturer&Family": "44444444-4444-4444-4444-444444444444"})
+
     def test_allows_a_required_intermediate_version_and_ignores_older_entries(self):
         xml = self.catalog_with_competitor(
             "196608", component_data='<requires><firmware compare="ge" version="2.0"/></requires>')
-        self.exercise_check(self.published, xml=xml)
+        self.exercise_check(self.published, xml=xml, expected_output="新版 3.0　前提版 2.0")
         self.exercise_check(self.published, xml=self.catalog_with_competitor("65536"))
 
     def test_current_version_can_exclude_a_competitor_when_its_hardware_ids_are_unavailable(self):
@@ -504,7 +579,8 @@ class StableCatalogTest(unittest.TestCase):
     def exercise_apply(self, latest_xml, *, expected_error=None, secure_boot_before=b"\x01",
                        secure_boot_after=b"\x01", disk_support_after=4, boot_order_after=3,
                        boot_order_during_authorization=None, policy=(None, frozenset()), policy_after=None,
-                       initial_xml=None, initial_release=None, latest_release=None, cabinet_bytes=None):
+                       initial_xml=None, initial_release=None, latest_release=None, cabinet_bytes=None,
+                       expected_output=None):
         verify_path = "/proc/self/fd/23"
         with TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -519,7 +595,7 @@ class StableCatalogTest(unittest.TestCase):
             BootEntryTest.disk_boot_target(variables, uuid.UUID(self.guid))
             bios = dict(self.bios, Flags=["updatable"])
             profile = {"secure_boot": {"delivery": "capsule-on-disk"}}
-            cabinet = SimpleNamespace() if cabinet_bytes is None else io.BytesIO(cabinet_bytes)
+            cabinet = io.BytesIO(b"test CAB" if cabinet_bytes is None else cabinet_bytes)
             cabinet.fileno = lambda: 23
             catalog = Mock(side_effect=[(list(ET.fromstring(xml)), "2.0.20")
                                         for xml in (initial_xml or self.signed_xml, latest_xml)])
@@ -552,7 +628,7 @@ class StableCatalogTest(unittest.TestCase):
                     marker.rmdir()
                 return b""
 
-            with (redirect_stdout(io.StringIO()),
+            with (redirect_stdout(io.StringIO()) as output,
                   patch.object(sys, "argv", [SCRIPT.name, "--apply"]),
                   patch.object(sys.stdin, "isatty", return_value=True),
                   patch.object(sys.stdout, "isatty", return_value=True),
@@ -585,12 +661,19 @@ class StableCatalogTest(unittest.TestCase):
                                                   verify_path, bios["DeviceId"]], pass_fds=(23,))
                     self.assertTrue(marker.is_dir())
                 self.assertEqual(catalog.call_count, 2)
+                if expected_output:
+                    self.assertIn(expected_output, output.getvalue())
 
     def test_apply_rechecks_the_signed_catalog_after_approval(self):
         self.exercise_apply(self.signed_xml)
         self.exercise_apply(self.catalog_with_competitor("196608"), expected_error="上位版")
         xml = self.catalog_with_component_data('<requires><firmware compare="lt" version="1.0"/></requires>')
         self.exercise_apply(xml, expected_error="必須条件")
+
+    def test_apply_explains_a_blocked_newer_version_and_sends_only_the_selected_cab(self):
+        xml = self.catalog_with_competitor("196608")
+        self.exercise_apply(xml, initial_xml=xml, policy=(None, {"b" * 64}),
+                            expected_output="新版 3.0　明示ブロック")
 
     def test_apply_rechecks_the_signed_vendor_id_after_approval(self):
         xml = self.catalog_with_component_data(
@@ -623,6 +706,29 @@ class StableCatalogTest(unittest.TestCase):
 
     def test_apply_holds_a_cab_blocked_under_an_alias_added_after_approval(self):
         self.exercise_apply(self.catalog_with_cab_alias(), policy=(None, {"e" * 128}), expected_error="明示ブロック")
+
+    def test_apply_refuses_a_blocked_actual_digest_missing_from_the_metadata(self):
+        content = b"verified temporary CAB"
+        sha256 = hashlib.sha256(content).hexdigest()
+        xml = self.signed_xml.replace(b"a" * 64, sha256.encode())
+        for algorithm in ("sha1", "sha512"):
+            with self.subTest(algorithm=algorithm):
+                blocked = hashlib.new(algorithm, content).hexdigest()
+                self.exercise_apply(xml, cabinet_bytes=content, initial_xml=xml,
+                                    initial_release=dict(self.published, Checksum=[sha256]),
+                                    policy_after=(None, {blocked}), expected_error="明示ブロック")
+
+    def test_apply_requires_a_signed_strong_digest_for_approval(self):
+        content = b"verified temporary CAB"
+        sha256 = hashlib.sha256(content).hexdigest()
+        sha1 = hashlib.sha1(content).hexdigest()
+        root = ET.fromstring(self.signed_xml.replace(b"a" * 64, sha256.encode()))
+        ET.SubElement(root.find(".//artifact"), "checksum", type="sha1").text = sha1
+        self.exercise_apply(ET.tostring(root), cabinet_bytes=content,
+                            initial_xml=self.signed_xml.replace(b"a" * 64, sha256.encode()),
+                            initial_release=dict(self.published, Checksum=[sha256]),
+                            policy_after=({sha1, hashlib.sha512(content).hexdigest()}, set()),
+                            expected_error="承認一覧")
 
     def test_apply_rechecks_which_esp_boot_order_selects_after_approval(self):
         self.exercise_apply(self.signed_xml, boot_order_after=4, expected_error="Boot0004")
@@ -1449,6 +1555,37 @@ class ShellEntryTest(unittest.TestCase):
 
 
 class CabinetHandoffTest(unittest.TestCase):
+    def test_interrupt_during_revalidation_releases_the_unsent_marker(self):
+        def sudo(args, _purpose):
+            if args[0] == "/usr/bin/mkdir":
+                Path(args[-1]).mkdir()
+            elif args[0] == "/usr/bin/rmdir":
+                Path(args[-1]).rmdir()
+
+        with (TemporaryDirectory() as tmp,
+              patch.object(updater, "sudo_command", side_effect=sudo),
+              patch.object(updater.subprocess, "Popen") as popen):
+            marker = Path(tmp) / "marker"
+            with self.assertRaises(KeyboardInterrupt):
+                updater.send_once(marker, 23, Mock(side_effect=KeyboardInterrupt))
+            popen.assert_not_called()
+            self.assertFalse(marker.exists())
+
+    def test_interrupt_at_or_after_install_start_keeps_the_marker(self):
+        bios = {"DeviceId": "b" * 40}
+        for during_start in (True, False):
+            with (self.subTest(during_start=during_start), TemporaryDirectory() as tmp,
+                  patch.object(updater, "sudo_command", side_effect=lambda args, purpose: Path(args[-1]).mkdir()),
+                  patch.object(updater.subprocess, "Popen") as popen):
+                if during_start:
+                    popen.side_effect = KeyboardInterrupt
+                else:
+                    popen.return_value.wait.side_effect = [KeyboardInterrupt, 0]
+                marker = Path(tmp) / "marker"
+                with self.assertRaises(KeyboardInterrupt):
+                    updater.send_once(marker, 23, lambda: bios)
+                self.assertTrue(marker.is_dir())
+
     def test_uncertain_install_keeps_its_marker_after_session_cleanup(self):
         bios = {"DeviceId": "b" * 40}
         old_boot = "12345678-1234-1234-1234-123456789abc"

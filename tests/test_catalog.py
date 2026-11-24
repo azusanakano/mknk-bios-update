@@ -10,6 +10,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 from urllib.request import Request
@@ -114,6 +115,40 @@ class CatalogTests(unittest.TestCase):
         self.policy = ({CAB_DIGEST}, {CAB_DIGEST})
         self.assertIn("ブロック", catalog.query("check", GUID)["detail"])
 
+    def test_available_candidate_retains_the_excluded_higher_version_and_reason(self):
+        digest = "b" * 64
+        for requirements, blocked, reason in (
+                ("", {digest}, "明示ブロック"),
+                ('<requires><firmware compare="ge" version="2"/></requires>', set(), "前提版 2")):
+            with self.subTest(reason=reason):
+                entry = (f'<release version="3">{requirements}'
+                         f'<checksum target="container" type="sha256">{digest}</checksum></release>')
+                self.xml = metadata().replace(b"</releases>", entry.encode() + b"</releases>")
+                self.policy = (None, blocked)
+                report = catalog.query("check", GUID)
+                self.assertEqual(report["state"], "available", report)
+                self.assertEqual(report["target"], "2")
+                self.assertIn(f"新版 3　{reason}", report["detail"])
+                self.assertIn(f"新版 3　{reason}", report["higher_release_detail"])
+
+    def test_prepare_rechecks_that_the_higher_version_is_still_excluded(self):
+        digest = "b" * 64
+        entry = (f'<release version="3"><checksum target="container" type="sha256">{digest}'
+                 '</checksum></release>')
+        self.xml = metadata().replace(b"</releases>", entry.encode() + b"</releases>")
+        self.policy = (None, {digest})
+        with (patch.object(fw, "support_profile", return_value={}),
+              patch.object(catalog, "verified_payload", return_value=({}, {CAB_DIGEST})) as verify):
+            report = catalog.query("prepare", GUID, object())
+            self.assertEqual(report["state"], "available", report)
+            self.assertIn("新版 3　明示ブロック", report["higher_release_detail"])
+            self.assertEqual(verify.call_args.args[2], self.release)
+
+            self.session.policy.side_effect = [(None, {digest}), (None, set())]
+            report = catalog.query("prepare", GUID, object())
+            self.assertEqual(report["state"], "hold", report)
+            self.assertIn("上位版", report["detail"])
+
     def test_remote_generation_and_cache_evidence(self):
         self.cached = FileNotFoundError()
         report = catalog.query("check", GUID)
@@ -198,20 +233,23 @@ class CatalogTests(unittest.TestCase):
         xml = b'<component><id>com.example.Bios</id><releases><release version="2"/></releases></component>'
         details = [dict(Guid=[GUID], Releases=[dict(self.release, Flags=["trusted-payload"])])]
         self.session.rows.side_effect = lambda *args: details
-        with tempfile.TemporaryFile() as cabinet, patch.object(catalog, "sealed_size", return_value=3), patch.object(
-                fw, "read_cab_files", side_effect=lambda path, name=None:
-                {name: payload} if name else {"bios.metainfo.xml": xml}), patch.object(catalog, "fetch_release") as fetch:
-            cabinet.write(b"cab")
-            plan, actual = catalog.verified_payload(cabinet, "revalidate", self.release, REMOTE,
-                                    fw.CatalogCheck(3, True, {"sha256": CAB_DIGEST}, None),
-                                    self.device, self.devices, GUID, profile, self.session)
-        fetch.assert_not_called()
-        self.assertEqual(plan["payload_size"], len(payload))
-        self.assertEqual(plan["payload_sha256"], hashlib.sha256(payload).hexdigest())
-        self.assertEqual(plan["checksum"], CAB_DIGEST)
-        self.assertEqual(plan["cab_sha512"], hashlib.sha512(b"cab").hexdigest())
-        self.assertIn(CAB_DIGEST, actual)
-        self.assertEqual(plan["target_raw"], 2)
+        for display_version in ("2", "02"):
+            with (self.subTest(display_version=display_version), tempfile.TemporaryFile() as cabinet,
+                  patch.object(catalog, "sealed_size", return_value=3), patch.object(
+                      fw, "read_cab_files", side_effect=lambda path, name=None:
+                      {name: payload} if name else {"bios.metainfo.xml": xml}),
+                  patch.object(catalog, "fetch_release") as fetch):
+                cabinet.write(b"cab")
+                plan, actual = catalog.verified_payload(cabinet, "revalidate", dict(self.release, Version=display_version),
+                                         REMOTE, fw.CatalogCheck(3, True, {"sha256": CAB_DIGEST}, None),
+                                         self.device, self.devices, GUID, profile, self.session)
+            fetch.assert_not_called()
+            self.assertEqual(plan["payload_size"], len(payload))
+            self.assertEqual(plan["payload_sha256"], hashlib.sha256(payload).hexdigest())
+            self.assertEqual(plan["checksum"], CAB_DIGEST)
+            self.assertEqual(plan["cab_sha512"], hashlib.sha512(b"cab").hexdigest())
+            self.assertIn(CAB_DIGEST, actual)
+            self.assertEqual(plan["target_raw"], 2)
 
     @unittest.skipUnless(hasattr(os, "memfd_create"), "Linux sealable memfd")
     def test_metadata_fds_are_verified_sealed_and_rewound(self):
@@ -224,6 +262,44 @@ class CatalogTests(unittest.TestCase):
             for stream in (data, sig):
                 with self.assertRaises(OSError):
                     os.ftruncate(stream.fileno(), 0)
+
+
+class DaemonVersionTests(unittest.TestCase):
+    def setUp(self):
+        self.client = Mock()
+        self.client.set_feature_flags.return_value = True
+        fwupd = SimpleNamespace(Client=SimpleNamespace(new=lambda: self.client),
+                                FeatureFlags=SimpleNamespace(NONE=0))
+        glib = Mock()
+        gio = Mock()
+        gio.bus_get_sync.return_value.call_sync.return_value.unpack.return_value = (":1.4",)
+        self.enterContext(patch.object(fw, "fwupd_bindings", return_value=(fwupd, glib)))
+        self.enterContext(patch.dict(sys.modules, {"gi.repository": SimpleNamespace(Gio=gio)}))
+
+    def test_old_connected_daemon_cannot_check_or_prepare(self):
+        self.client.get_daemon_version.return_value = "2.0.19"
+        device = dict(DeviceId=DEVICE, Version="1", VersionFormat="number", Guid=[GUID],
+                      Flags=["internal", "updatable"], Protocols=[fw.PROTOCOL], Plugin="uefi_capsule")
+        with (patch.object(fw, "read_settings", return_value={}),
+              patch.object(catalog, "download") as download,
+              patch.object(catalog.Session, "remote", return_value=REMOTE),
+              patch.object(catalog.Session, "rows", return_value=[device])):
+            for mode in ("check", "prepare", "revalidate", "metadata"):
+                with self.subTest(mode=mode):
+                    report = catalog.run(mode, GUID)
+                    self.assertEqual(report["state"], "hold")
+                    self.assertIn("fwupd 2.0.20", report["detail"])
+                    self.assertIn("2.0.19", report["detail"])
+            download.assert_not_called()
+
+    def test_running_daemon_version_is_compared_numerically(self):
+        for version in ("2.0.20", "2.0.100", "2.1.0"):
+            with self.subTest(version=version):
+                self.client.get_daemon_version.return_value = version
+                self.assertEqual(catalog.Session().version, version)
+        self.client.get_daemon_version.return_value = "9.0.invalid"
+        with self.assertRaisesRegex(fw.Hold, "版を確認できません"):
+            catalog.Session()
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "Ubuntu system GI libraries")

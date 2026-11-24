@@ -44,6 +44,19 @@ class JournalTest(unittest.TestCase):
         self.db.power_reply(request, ":1.10", "bus", True)
         self.assertNotEqual(self.db.power("plan-a", ":1.10", "bus"), request)
 
+    def test_adds_observed_boot_to_an_existing_journal_without_losing_records(self):
+        self.db.issue(self.plan, ":1.10", ":1.4", "bus")
+        with closing(sqlite3.connect(self.path)) as conn:
+            conn.execute("ALTER TABLE operation DROP COLUMN observed_boot")
+            conn.commit()
+
+        reopened = Journal(self.path)
+        self.assertEqual(reopened.active()["id"], "plan-a")
+        self.assertIsNone(reopened.active()["observed_boot"])
+        reopened.finish("plan-a", "unapplied", "1.20", observed_boot="result-boot")
+        result = Journal(self.path).last("pc", "result-boot")
+        self.assertEqual((result["outcome"], result["observed_boot"]), ("unapplied", "result-boot"))
+
     def test_catalog_generation_persists_across_mirrors(self):
         self.db.catalog_generation(20, "a" * 64)
         self.db.catalog_generation(18, "a" * 64)

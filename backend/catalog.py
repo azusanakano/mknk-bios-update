@@ -18,6 +18,7 @@ from urllib.request import BaseHandler, HTTPRedirectHandler, build_opener
 from firmware_api import fw
 
 TRUST_DIRECTORIES = ("/etc/pki/fwupd", "/etc/pki/fwupd-metadata")
+MIN_DAEMON_VERSION = "2.0.20"
 
 
 def fingerprint(value):
@@ -60,8 +61,10 @@ class Session:
             raise fw.Hold("fwupdで画面の機能を登録できません。")
         self.owner = self.current_owner()
         self.version = self.client.get_daemon_version()
-        if not self.version:
+        if not isinstance(self.version, str) or not re.fullmatch(r"[0-9]{1,9}(?:\.[0-9]{1,9}){2}", self.version):
             raise fw.Hold("fwupdの版を確認できません。")
+        if fw.version_key(self.version, None) < fw.version_key(MIN_DAEMON_VERSION, None):
+            raise fw.Hold(f"更新機能には fwupd {MIN_DAEMON_VERSION} 以降が必要です（稼働中の版は {self.version}）。")
 
     def current_owner(self):
         return self.bus.call_sync(
@@ -360,11 +363,7 @@ def verified_payload(cabinet, mode, release, remote, result, device, devices, gu
         raise fw.Hold("固定した配布ファイルと署名サイズが一致しません。")
     path = fw.cabinet_path(cabinet.fileno())
     fw.verify_cabinet_hashes(cabinet, fw.release_hashes(release) | result.hashes)
-    actual = {}
-    for algorithm in ("sha1", "sha256", "sha512"):
-        cabinet.seek(0)
-        actual[algorithm] = hashlib.file_digest(cabinet, algorithm).hexdigest()
-    cabinet.seek(0)
+    actual = fw.cabinet_hashes(cabinet)
     parts = session.rows("get_details", path)
     scope, payload, raw = fw.verify_cab(path, release, guid, device, devices, profile,
                                         parts=parts, include_payload=True)
@@ -376,7 +375,9 @@ def verified_payload(cabinet, mode, release, remote, result, device, devices, gu
     target_raw = None
     if re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)", raw):
         number = int(raw, 16 if raw.lower().startswith("0x") else 10)
-        if 0 < number <= 0xffffffff and fw.esrt_version(raw, device["VersionFormat"]) == release["Version"]:
+        fmt = device["VersionFormat"]
+        if (0 < number <= 0xffffffff
+                and fw.version_key(fw.esrt_version(raw, fmt), fmt) == fw.version_key(release["Version"], fmt)):
             target_raw = number
     plan = dict(checksum=actual["sha256"], cab_sha512=actual["sha512"], payload_sha256=hashlib.sha256(payload).hexdigest(),
                 payload_size=len(payload), scope=scope, target_raw=target_raw)
@@ -480,10 +481,13 @@ def evaluate(mode, guid, cabinet, session, settings, remote, components, report,
         if (not latest or any(latest.get(k) != release.get(k) for k in ("AppstreamId", "Version", "Branch", "Flags"))
                 or fw.release_hashes(latest) != fw.release_hashes(release)):
             raise fw.Hold("配布ファイルの照合中に更新候補が変化しました。")
-        fw.require_catalog_release(components, device, devices, guid, release, remote,
-                                   daemon_version=session.version, verified_hashes=actual,
-                                   client_features=(), policy=session.policy(remote))
+        result = fw.require_catalog_release(components, device, devices, guid, release, remote,
+                                            daemon_version=session.version, verified_hashes=actual,
+                                            client_features=(), policy=session.policy(remote))
         plan.update(prepared)
+    if result.unavailable:
+        plan["higher_release_detail"] = result.unavailable
+        plan["detail"] += "\n" + result.unavailable
     return plan
 
 

@@ -472,6 +472,23 @@ def catalog_checksum_values(nodes):
     return {node.text.strip().lower() for node in nodes if node.text}
 
 
+def link_cab_aliases(hashes, aliases):
+    # 同じ強いハッシュで結ばれた記載を順序にかかわらず集める。
+    linked = []
+    while True:
+        digests = set(strong_hashes(hashes).values())
+        unlinked = []
+        for item, values in aliases:
+            if digests.isdisjoint(values):
+                unlinked.append((item, values))
+            else:
+                hashes.update(values)
+                linked.append(item)
+        if len(unlinked) == len(aliases):
+            return linked
+        aliases = unlinked
+
+
 def catalog_cab(release):
     primary = catalog_cab_artifact(release)
     legacy = catalog_checksum_values(release.findall("checksum[@target='container']"))
@@ -485,20 +502,8 @@ def catalog_cab(release):
     elif legacy:
         aliases.append((None, legacy))
 
-    # 別方式のハッシュが同じCABを結ぶ場合も、後続の記載を照合に含める。
-    while True:
-        digests = set(strong_hashes(hashes).values())
-        unlinked = []
-        for artifact, values in aliases:
-            if digests.isdisjoint(values):
-                unlinked.append((artifact, values))
-            else:
-                hashes.update(values)
-                if artifact is not None:
-                    matching.append(artifact)
-        if len(unlinked) == len(aliases):
-            return hashes, matching
-        aliases = unlinked
+    matching.extend(artifact for artifact in link_cab_aliases(hashes, aliases) if artifact is not None)
+    return hashes, matching
 
 
 def release_version_matches(raw, version, fmt):
@@ -524,8 +529,13 @@ def host_hardware_ids():
         return None
     if not isinstance(ids, dict) or not all(isinstance(value, str) for value in ids.values()):
         return None
-    # fwupdmgrはSMBIOSの属性値と、属性の組から得たCHIDを同じオブジェクトで返す。
-    hardware_ids = {value for value in ids.values() if GUID_TEXT.fullmatch(value)}
+    # fwupdmgrは属性値の後にCHIDを出力する。単一属性のCHIDはManufacturerだけ。
+    hardware_ids = {value.lower() for key, value in ids.items() if "&" in key}
+    if not all(GUID_TEXT.fullmatch(value) for value in hardware_ids):
+        return None
+    manufacturer = ids.get("Manufacturer", "").lower()
+    if GUID_TEXT.fullmatch(manufacturer):
+        hardware_ids.add(manufacturer)
     return hardware_ids or None
 
 
@@ -557,6 +567,8 @@ def catalog_vendor_matches(node, device):
 
 
 def catalog_model_matches(requirements, device, hardware_ids, *, emulated):
+    if {"hardware", "not_hardware"}.issubset(node.tag for node in requirements):
+        return None
     matches = True
     for node in requirements:
         if node.tag == "firmware":
@@ -566,21 +578,39 @@ def catalog_model_matches(requirements, device, hardware_ids, *, emulated):
             if vendor_matches is None:
                 matches = None
             continue
-        if node.tag == "not_hardware":
-            matches = None
-            continue
+        negative = node.tag == "not_hardware"
         alternatives = (node.text or "").strip().split("|")
         if node.attrib or len(node) or not all(GUID_TEXT.fullmatch(value) for value in alternatives):
             matches = None
             continue
         if emulated:
+            if negative:
+                matches = None
             continue
         ids = hardware_ids()
         if ids is None:
             matches = None
-        elif set(alternatives).isdisjoint(ids):
+        elif ids.isdisjoint(alternatives) != negative:
             return False
     return matches
+
+
+def firmware_guid_present(text, devices):
+    alternatives = set(text.lower().split("|"))
+    if not devices or not all(GUID_TEXT.fullmatch(guid) for guid in alternatives):
+        return None
+    complete = True
+    for peer in devices:
+        guids = peer.get("Guid", []) if isinstance(peer, dict) else None
+        if not isinstance(guids, list):
+            complete = False
+            continue
+        for guid in guids:
+            if not isinstance(guid, str) or not GUID_TEXT.fullmatch(guid.lower()):
+                complete = False
+            elif guid.lower() in alternatives:
+                return True
+    return False if complete else None
 
 
 def catalog_requirement_matches(node, device, devices, daemon_version, client_features=CLIENT_FEATURES):
@@ -590,6 +620,8 @@ def catalog_requirement_matches(node, device, devices, daemon_version, client_fe
     text = (node.text or "").strip()
     if node.tag == "client" and not node.attrib:
         return True if set(text.split("|")).issubset(client_features) else None
+    if node.tag == "firmware" and text and not node.attrib:
+        return firmware_guid_present(text, devices)
     compare = VERSION_COMPARISONS.get(node.get("compare"))
     if compare is None or set(node.attrib) != {"compare", "version"}:
         return None
@@ -685,6 +717,19 @@ def require_catalog_release(components, device, devices, guid, release, remote, 
     current = version_key(device["Version"], fmt)
     target = version_key(release["Version"], fmt) if release else current
     index_hashes = release_hashes(release) if release else {}
+    cab_info = cache(catalog_cab)
+    candidate_cabs = {}
+    if release:
+        components = tuple(components)
+        candidate_cabs = {
+            entry: cab_info(entry)[0] for component in components
+            if (component.findtext("id") == release["AppstreamId"]
+                and (component.findtext("branch") or "default") == branch
+                and guid in component_guids(component))
+            for entry in component.findall("releases/release")
+            if release_version_matches(entry.get("version"), release["Version"], fmt)
+        }
+    linked_entries = set(link_cab_aliases(set(index_hashes.values()), candidate_cabs.items()))
     hardware_ids = cache(host_hardware_ids)
     flags = strings(device, "Flags")
     emulated = "emulated" in flags
@@ -704,11 +749,10 @@ def require_catalog_release(components, device, devices, guid, release, remote, 
         component_requirements = catalog_requirements(component)
         missing_version_check = "version-check-required" in flags and not any(
             not node.text and not len(node) for node in component.findall("requires/firmware"))
-        app_id = component.findtext("id")
         for entry in component.findall("releases/release"):
             raw = entry.get("version")
-            candidate_version = (release and same_branch and esrt_matches and app_id == release["AppstreamId"]
-                                 and release_version_matches(raw, release["Version"], fmt))
+            candidate_version = entry in candidate_cabs
+            match = entry in linked_entries
             try:
                 display_version = catalog_version(raw, fmt) if same_branch else None
                 version = version_key(display_version, fmt) if same_branch else None
@@ -723,6 +767,8 @@ def require_catalog_release(components, device, devices, guid, release, remote, 
             if model_matches is False:
                 if candidate_version:
                     candidate_mismatch = "このBIOSは署名済みカタログにある更新候補の機種条件を満たしません。"
+                if match:
+                    raise Hold(candidate_mismatch)
                 continue
             if check_listing:
                 model_listed |= model_matches is True
@@ -732,13 +778,14 @@ def require_catalog_release(components, device, devices, guid, release, remote, 
             if not compatible:
                 if candidate_version:
                     candidate_mismatch = "このBIOSは署名済みカタログの配布条件（更新プロトコル・版形式）を満たしません。"
+                if match:
+                    raise Hold(candidate_mismatch)
                 continue
-            cab = catalog_cab(entry)
+            cab = cab_info(entry)
             hashes = cab[0]
-            match = candidate_version and same_cab(index_hashes, strong_hashes(hashes))
             if not (match or can_compete):
                 continue
-            report_exclusion = not release and version is not None and esrt_matches and model_matches is True
+            report_exclusion = (version is not None and version > target and esrt_matches and model_matches is True)
             if missing_version_check:
                 reason = "機器が要求する必須の版条件が署名済みカタログにありません。"
                 if match:
@@ -757,6 +804,8 @@ def require_catalog_release(components, device, devices, guid, release, remote, 
                     required = visible(node.get("version"))
                     if node.tag == "firmware" and node.get("compare") == "ge":
                         reason = f"前提版 {required} 以上が必要です。"
+                    elif node.tag == "firmware" and not node.attrib:
+                        reason = "必要なGUIDを持つ機器が見つかりません。"
                     else:
                         reason = f"必須の版条件（{node.get('compare')} {required}）を満たしていません。"
                     exclusions.append((version, display_version, reason))
@@ -781,6 +830,9 @@ def require_catalog_release(components, device, devices, guid, release, remote, 
                         exclusions.append((version, display_version, reason))
                     continue
             if client_reason:
+                if release and report_exclusion:
+                    exclusions.append((version, display_version, client_reason))
+                    continue
                 raise Hold(client_reason + f" 対象版 {visible(display_version if version is not None else raw)}")
             if version is None:
                 raise Hold("署名済みカタログに、版を比較できない候補があります。")
@@ -814,7 +866,7 @@ def admin_policy_reason(hashes, policy, *, other_block_hashes=()):
     approved, blocked = policy
     if not blocked.isdisjoint(hashes) or not blocked.isdisjoint(other_block_hashes):
         return "明示ブロック対象のCABです。"
-    if approved is not None and hashes.isdisjoint(approved):
+    if approved is not None and approved.isdisjoint(strong_hashes(hashes).values()):
         return "承認一覧にこのCABがありません。"
     return None
 
@@ -1438,6 +1490,15 @@ def verify_cabinet_hashes(cabinet, hashes):
             raise Hold("ダウンロードしたCABのハッシュがLVFSの配布情報と一致しません。")
 
 
+def cabinet_hashes(cabinet):
+    actual = {}
+    for algorithm in ("sha1", "sha256", "sha512"):
+        cabinet.seek(0)
+        actual[algorithm] = hashlib.file_digest(cabinet, algorithm).hexdigest()
+    cabinet.seek(0)
+    return actual
+
+
 def fetch_cab(release, remote, cabinet, settings, *, download_size=None, opener=None):
     if download_size is not None and not 0 < download_size <= CAB_DOWNLOAD_LIMIT:
         raise Hold("署名済みカタログに記載されたCABの受信量が上限を超えています。")
@@ -1770,11 +1831,16 @@ def send_once(path, cabinet_fd, revalidate):
     except Hold:
         check_marker(path)
         raise
+    starting_child = False
     try:
         device = revalidate()
-        child = subprocess.Popen([FWUPDMGR, "--no-reboot-check", "local-install",
-                                  cabinet_path(cabinet_fd), device["DeviceId"]], pass_fds=(cabinet_fd,))
-    except (Error, Hold, OSError, ValueError, subprocess.CalledProcessError) as exc:
+        args = [FWUPDMGR, "--no-reboot-check", "local-install", cabinet_path(cabinet_fd), device["DeviceId"]]
+        # Popen中の割り込みでは子プロセスの起動結果が不明になる。
+        starting_child = True
+        child = subprocess.Popen(args, pass_fds=(cabinet_fd,))
+    except (Error, Hold, OSError, ValueError, subprocess.CalledProcessError, KeyboardInterrupt) as exc:
+        if starting_child and isinstance(exc, KeyboardInterrupt):
+            raise
         # 検査で止まった場合と子プロセスを開始できなかった場合は、未送信なので記録を解除する。
         try:
             sudo_command(["/usr/bin/rmdir", "--", str(path)], "未送信の更新依頼記録の解除")
@@ -1963,6 +2029,8 @@ def main():
         print(message)
         return
     print("更新候補  ", visible(device["Version"]), "→", visible(release["Version"]), "（lvfs 安定版）")
+    if result.unavailable:
+        print(result.unavailable)
     if not opt.apply:
         print("予約する場合は --apply を付けて実行してください。")
         return
@@ -1973,6 +2041,7 @@ def main():
         print("配布ファイルを取得し、署名・ハッシュ・対象を照合します。", flush=True)
         cab = fetch_cab(release, remote, cabinet, settings, download_size=result.download_size)
         verify_cabinet_hashes(cabinet, {key: value for key, value in result.hashes.items() if key not in index_hashes})
+        actual_hashes = cabinet_hashes(cabinet)
         scope = verify_cab(cab, release, guid, device, devices, profile)
         print("対象     ", visible(release["AppstreamId"]))
         print("適用範囲  ", scope)
@@ -2019,7 +2088,7 @@ def main():
             active_remote = stable_remote(active_settings)
             compare_remote(remote, active_remote)
             fresh = require_catalog_release(catalog, current, peers, guid, updated, active_remote,
-                                            daemon_version=daemon_version, verified_hashes=approved_hashes.values())
+                                            daemon_version=daemon_version, verified_hashes=actual_hashes.values())
             fresh_hashes = release_hashes(updated) | fresh.hashes
             if not same_cab(approved_hashes, fresh_hashes):
                 raise Hold("承認後に配布候補のCABハッシュが変わりました。再確認してください。")

@@ -12,7 +12,7 @@ from threading import BoundedSemaphore
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gi.repository import Gio, GLib
-from engine import Engine
+from engine import Actor, Engine
 from firmware_api import fw
 from journal import Conflict, Journal
 from platform_linux import Platform
@@ -109,8 +109,22 @@ class Service:
         task.add_done_callback(lambda done: GLib.idle_add(self.reply, invocation, method, done))
 
     def dispatch(self, sender, method, args):
-        actor = self.engine.platform.actor(sender)
-        if self.peer_sender is not None and method != "Status" and not actor.writable:
+        platform = self.engine.platform
+        if method == "DeclineAuthorization":
+            self.engine.decline_authorization(sender, args[0])
+            return GLib.Variant("()", ()), None
+        if method == "ReplyPower":
+            self.engine.db.power_reply(args[0], sender, platform.bus_id, args[1])
+            return GLib.Variant("()", ()), None
+        try:
+            actor = platform.actor(sender)
+        except (Conflict, GLib.Error, OSError):
+            if method != "Report":
+                raise
+            # The journal binds the receipt to the original unique connection and bus.
+            # A session switch removes write access to the view but does not lose its receipt.
+            actor = Actor(sender, -1, "", platform.bus_id, False, "", "")
+        if self.peer_sender is not None and method not in ("Status", "Report") and not actor.writable:
             raise Conflict("操作するには、アクティブなローカル画面から開いてください。")
         views = {"Status": self.engine.status, "Check": self.engine.check, "Prepare": self.engine.prepare,
                  "Dismiss": self.engine.dismiss, "Report": self.engine.report, "Replan": self.engine.replan}
@@ -126,8 +140,6 @@ class Service:
             return GLib.Variant("(sss)", self.engine.power(actor, *args)), None
         if method == "RecheckPower":
             self.engine.recheck_power(actor, *args)
-        elif method == "ReplyPower":
-            self.engine.db.power_reply(args[0], actor.sender, actor.bus, args[1])
         else:
             raise Conflict("この操作を認識できません。")
         return GLib.Variant("()", ()), None
@@ -147,7 +159,7 @@ class Service:
         except Exception as exc:
             print(f"{method}: {type(exc).__name__}", file=sys.stderr, flush=True)
             invocation.return_dbus_error(NAME + ".Unavailable", "必要な機器・サービス情報を確認できません。状態を再確認してください。")
-        if method in ("Authorize", "Report", "Replan", "Dismiss", "Power", "ReplyPower"):
+        if method in ("Authorize", "DeclineAuthorization", "Report", "Replan", "Dismiss", "Power", "ReplyPower"):
             self.observation_changed()
         return False
 
