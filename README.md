@@ -35,6 +35,8 @@ mknk-bios-update
 3. 「この更新を承認」で、GUI が OS 標準の認可を通じて fwupd に準備を依頼する。実際の起動予約を照合すると、条件に応じて「再起動する」または「電源を切る」を選べる。アプリ内で実行を確認すると、デスクトップに終了を依頼する。「あとで」や確認の取り消しで予約は保持される。
 4. 次回ログイン時に現在版と試行結果を確認する。準備依頼の応答が失われた場合は、元の記録から照合を続ける。「状態を再確認」はローカルの読み直しである。
 
+別の利用者が承認した未送信の計画は「管理者として承認を解除」から解除できる。管理者認証と予約の再照合を済ませたら、現在の利用者が新しい計画を確認して承認する。
+
 デスクトップの終了処理と現在のセッションを照合できない場合、アプリ内の起動操作は保留になる。予約は保持される。作業を保存し、画面に表示された起動方法に従ってデスクトップの通常のメニューから再起動または電源オフを選べる。
 
 ## 対応機種と端末の設定
@@ -61,7 +63,7 @@ GUI 用の追加項目は次のとおり。
 リポジトリ直下で実行する。ビルド依存関係は `debian/control` に列挙している。
 
 ```sh
-sudo apt install build-essential debhelper meson ninja-build pkgconf libgtk-4-dev libjson-glib-dev python3-gi gir1.2-fwupd-2.0 gir1.2-jcat-1.0 openssl dbus-daemon xvfb xauth
+sudo apt install build-essential debhelper meson ninja-build pkgconf libgtk-4-dev libjson-glib-dev python3-gi gir1.2-fwupd-2.0 gir1.2-jcat-1.0 gir1.2-atspi-2.0 openssl dbus-daemon xvfb xauth python3-xlib xdotool
 dpkg-buildpackage -b -us -uc
 ```
 

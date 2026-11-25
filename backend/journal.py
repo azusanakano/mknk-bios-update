@@ -19,19 +19,35 @@ def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+OPERATION_TABLE = """CREATE TABLE IF NOT EXISTS operation (
+    id TEXT PRIMARY KEY, boot TEXT NOT NULL, machine TEXT NOT NULL,
+    plan TEXT NOT NULL, sender TEXT NOT NULL, daemon TEXT NOT NULL, bus TEXT NOT NULL,
+    issued TEXT NOT NULL, receipt TEXT NOT NULL DEFAULT 'unknown',
+    active INTEGER NOT NULL DEFAULT 1, outcome TEXT, observed TEXT, ended TEXT,
+    power_id TEXT, power_sender TEXT, power_bus TEXT, observed_boot TEXT, power_boot TEXT)"""
+
+
 class Journal:
     def __init__(self, path):
         self.path = path
         with self.transaction() as db:
-            db.execute("""CREATE TABLE IF NOT EXISTS operation (
-                id TEXT PRIMARY KEY, boot TEXT NOT NULL UNIQUE, machine TEXT NOT NULL,
-                plan TEXT NOT NULL, sender TEXT NOT NULL, daemon TEXT NOT NULL, bus TEXT NOT NULL,
-                issued TEXT NOT NULL, receipt TEXT NOT NULL DEFAULT 'unknown',
-                active INTEGER NOT NULL DEFAULT 1, outcome TEXT, observed TEXT, ended TEXT,
-                power_id TEXT, power_sender TEXT, power_bus TEXT, observed_boot TEXT)""")
-            if not any(row["name"] == "observed_boot" for row in db.execute("PRAGMA table_info(operation)")):
+            db.execute(OPERATION_TABLE)
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(operation)")}
+            if "observed_boot" not in columns:
                 db.execute("ALTER TABLE operation ADD COLUMN observed_boot TEXT")
+            if "power_boot" not in columns:
+                db.execute("ALTER TABLE operation ADD COLUMN power_boot TEXT")
+            if any(row["origin"] == "u" for row in db.execute("PRAGMA index_list(operation)")):
+                # SQLite cannot remove the original inline UNIQUE on boot in place.
+                db.execute("ALTER TABLE operation RENAME TO operation_with_unique_boot")
+                db.execute(OPERATION_TABLE)
+                columns = ",".join(row["name"] for row in db.execute("PRAGMA table_info(operation)"))
+                db.execute(f"INSERT INTO operation (rowid,{columns}) "
+                           f"SELECT rowid,{columns} FROM operation_with_unique_boot")
+                db.execute("DROP TABLE operation_with_unique_boot")
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS single_pending ON operation(active) WHERE active=1")
+            db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS single_issue_per_boot ON operation(boot)
+                          WHERE outcome IS NOT 'rejected'""")
             db.execute("CREATE TABLE IF NOT EXISTS setting (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS approval (slot INTEGER PRIMARY KEY CHECK(slot=1), id TEXT, plan TEXT)")
             db.execute("INSERT OR IGNORE INTO setting VALUES ('identity-key', ?)", (secrets.token_hex(32),))
@@ -72,8 +88,9 @@ class Journal:
     def last(self, machine, boot):
         with self.transaction() as db:
             return self.unpack(db.execute(
-                "SELECT * FROM operation WHERE (machine=? AND machine!='') OR boot=? ORDER BY rowid DESC LIMIT 1",
-                (machine, boot)).fetchone())
+                """SELECT * FROM operation WHERE (machine=? AND machine!='') OR boot=?
+                   OR (outcome='unattributed' AND observed_boot=?) ORDER BY rowid DESC LIMIT 1""",
+                (machine, boot, boot)).fetchone())
 
     def approval(self):
         with self.transaction() as db:
@@ -116,11 +133,20 @@ class Journal:
 
     def report(self, op, sender, bus, accepted):
         with self.transaction() as db:
-            changed = db.execute("""UPDATE operation SET receipt=CASE WHEN ? THEN 'accepted'
+            changed = db.execute("""UPDATE operation SET receipt=CASE WHEN receipt='rejected' THEN receipt
+                                        WHEN ? THEN 'accepted'
                                         WHEN receipt='unknown' THEN 'unconfirmed' ELSE receipt END
                                     WHERE id=? AND sender=? AND bus=?""", (bool(accepted), op, sender, bus))
             if not changed.rowcount:
                 raise Conflict("更新依頼と応答元の接続が一致しません。")
+
+    def report_rejection(self, op, sender, bus):
+        with self.transaction() as db:
+            changed = db.execute("""UPDATE operation SET receipt='rejected' WHERE id=? AND sender=? AND bus=?
+                                    AND active=1 AND receipt IN ('unknown','unconfirmed','rejected')""",
+                                 (op, sender, bus))
+            if not changed.rowcount:
+                raise Conflict("未送達・配置前の拒否を記録できる応答元と状態を確認できません。")
 
     def decline_authorization(self, op, sender, bus, release_claim):
         # Only the GUI that received this permit can acknowledge it stopped before Install.
@@ -133,31 +159,51 @@ class Journal:
             release_claim(self.unpack(row))
             db.execute("DELETE FROM operation WHERE id=?", (op,))
 
-    def finish(self, op, outcome, current, *, observed_boot=None):
+    def finish(self, op, outcome, current, *, observed_boot=None, release_claim=None):
         with self.transaction() as db:
+            if outcome == "rejected":
+                row = db.execute("SELECT * FROM operation WHERE id=? AND active=1 AND receipt='rejected'",
+                                 (op,)).fetchone()
+                if row is None:
+                    raise Conflict("配置前の拒否を確認できません。")
+                if release_claim is not None:
+                    release_claim(self.unpack(row))
             db.execute("""UPDATE operation SET active=0,outcome=?,observed=?,ended=?,observed_boot=?
                           WHERE id=? AND active=1""", (outcome, current, now(), observed_boot, op))
 
     def history(self, machine, boot=""):
         with self.transaction() as db:
             rows = db.execute("""SELECT * FROM operation WHERE (machine=? AND machine!='') OR boot=?
-                                 ORDER BY rowid DESC LIMIT 20""", (machine, boot)).fetchall()
+                                 OR (outcome='unattributed' AND observed_boot=?)
+                                 ORDER BY rowid DESC LIMIT 20""", (machine, boot, boot)).fetchall()
         outcomes = {"installed": "目標版を確認", "unapplied": "目標版に未到達", "failed": "試行失敗",
-                    "unattributed": "旧計画への帰属は未確認"}
+                    "unattributed": "旧計画への帰属は未確認", "rejected": "配置なしを確認"}
+        receipts = {"accepted": "受付済み", "rejected": "未送達または配置前に拒否"}
         lines = []
         for row in rows:
             p = self.unpack(row)
-            receipt = "受付済み" if p["receipt"] == "accepted" else "受付未確定"
+            receipt = receipts.get(p["receipt"], "受付未確定")
             result = outcomes.get(p["outcome"], "結果を照合中")
             lines.append(f"{p['issued']}　{p['current']} → {p['target']}　{receipt}　{result}"
                          + (f"（実機 {p['observed']}）" if p["observed"] else ""))
         return "\n".join(lines)
 
-    def power(self, op, sender, bus):
+    def bind_legacy_power_boot(self, op, request, boot):
+        # Historical records did not record the power request's boot. Keep the
+        # exclusion through the first known boot until another boot is observed.
+        with self.transaction() as db:
+            db.execute("""UPDATE operation SET power_boot=?
+                          WHERE id=? AND active=1 AND power_id=? AND power_boot IS NULL""",
+                       (boot, op, request))
+
+    def power(self, op, sender, bus, boot):
+        if not boot:
+            raise Conflict("今回の起動を確認できません。")
         request = str(uuid.uuid4())
         with self.transaction() as db:
-            changed = db.execute("""UPDATE operation SET power_id=?,power_sender=?,power_bus=?
-                                    WHERE id=? AND active=1 AND power_id IS NULL""", (request, sender, bus, op))
+            changed = db.execute("""UPDATE operation SET power_id=?,power_sender=?,power_bus=?,power_boot=?
+                                    WHERE id=? AND active=1 AND (power_id IS NULL OR power_boot<>?)""",
+                                 (request, sender, bus, boot, op, boot))
             if not changed.rowcount:
                 raise Conflict("起動操作はすでに処理中か、予約が変わりました。状態を再確認してください。")
         return request
@@ -169,7 +215,8 @@ class Journal:
             if not db.execute("SELECT id FROM operation" + where, args).fetchone():
                 raise Conflict("電源操作の要求元を確認できません。")
             if cancelled:
-                db.execute("UPDATE operation SET power_id=NULL,power_sender=NULL,power_bus=NULL" + where, args)
+                db.execute("UPDATE operation SET power_id=NULL,power_sender=NULL,power_bus=NULL,power_boot=NULL"
+                           + where, args)
 
     def catalog_generation(self, stamp, digest):
         if type(stamp) is not int or stamp <= 0 or not re.fullmatch(r"[0-9a-f]{64}", digest):

@@ -19,18 +19,23 @@ ACTION = "通常モードで開き直す"
 
 
 class SmokeAppImageTests(unittest.TestCase):
+    def unavailable(self, reason):
+        if os.environ.get("MKNK_REQUIRE_GUI_SMOKE") == "1":
+            self.fail(reason)
+        self.skipTest(reason)
+
     @unittest.skipUnless(sys.platform == "linux", "Linux process sessions")
     def test_matching_window_is_clicked_and_stopped_only_for_launched_session(self):
         if not all(find_spec(module) for module in ("gi", "Xlib")) or not all(
             shutil.which(tool) for tool in ("xvfb-run", "dbus-run-session", "xdotool")
         ):
-            self.skipTest("requires PyGObject, Python Xlib, Xvfb, D-Bus, and xdotool")
+            self.unavailable("requires PyGObject, Python Xlib, Xvfb, D-Bus, and xdotool")
         import gi
         try:
             gi.require_version("Gtk", "4.0")
             gi.require_version("Atspi", "2.0")
         except ValueError as error:
-            self.skipTest(str(error))
+            self.unavailable(str(error))
 
         subprocess.run(
             ["xvfb-run", "-a", "dbus-run-session", sys.executable, "-B", str(SCRIPT), "verify"],

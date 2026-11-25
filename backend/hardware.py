@@ -86,7 +86,7 @@ def _esrt_resource():
     entry = matches[0]
     guid = str(uuid.UUID((entry / "fw_class").read_text(encoding="ascii").strip()))
     values = []
-    for name in ("fw_version", "last_attempt_version", "last_attempt_status"):
+    for name in ("fw_version", "last_attempt_version", "last_attempt_status", "capsule_flags"):
         try:
             value = int((entry / name).read_text(encoding="ascii").strip(), 0)
             values.append(value if 0 <= value <= 0xffffffff else None)
@@ -309,14 +309,16 @@ def _nvram_files(esp, plan, route, next_boot):
     if fw.efi_asset_sha256(esp / route["loader"]) != route["loader_sha256"]:
         raise Hold("配置済みの更新用ローダーの内容が一致しません。")
     guid, instance = plan["guid"], route["instance"]
-    _pending_file(f"fwupd-{guid}-{instance}", guid, instance, route, route["file"])
+    _pending_file(f"fwupd-{guid}-{instance}", guid, instance, route, route["file"],
+                  capsule_flags=route["capsule_flags"])
 
 
-def _pending_file(name, guid, instance, route, expected_file):
+def _pending_file(name, guid, instance, route, expected_file, *, capsule_flags=None):
     data = fw.read_efi_variable(fw.EFIVARS / f"{name}-{fw.FWUPDATE_GUID}")
     if (len(data) < 56 or int.from_bytes(data[:4], "little") & 7 != 7
             or int.from_bytes(data[4:8], "little") != 7
             or str(uuid.UUID(bytes_le=data[8:24])) != guid
+            or (capsule_flags is not None and int.from_bytes(data[24:28], "little") != capsule_flags)
             or int.from_bytes(data[28:36], "little") != instance
             or int.from_bytes(data[52:56], "little") != 1
             or _relative_file(data[56:], route) != expected_file.casefold()):
@@ -327,6 +329,7 @@ def _ux_file(esp, route):
     """Only a model/build-verified, byte-identical boot-screen asset is auxiliary."""
     if not route.get("ux_hash"):
         raise Hold("表示用カプセルを機種別の配布資材に照合できません。")
+    # fwupd-efi uses the display header's own flags, verified with the asset below.
     _pending_file("fwupd-ux-capsule", UX_GUID, route.get("instance", 0), route, route["ux_file"])
     with (esp / route["ux_file"]).open("rb") as stream:
         size = os.fstat(stream.fileno()).st_size
@@ -360,7 +363,7 @@ def _matches_file(esp, plan, route):
             raise Hold("ESPのカプセルの内容が承認した配布物と一致しません。")
 
 
-def _bound_route(esp, partuuid, mounts, plan, profile, capability):
+def _bound_route(esp, partuuid, mounts, plan, profile, capability, capsule_flags):
     mount = mounts[str(esp)]
     secure = fw.check_boot_delivery(esp, partuuid, mount.device, profile,
                                     bootloader_capability=capability)
@@ -368,6 +371,11 @@ def _bound_route(esp, partuuid, mounts, plan, profile, capability):
     route["power_action"] = "shutdown" if plan.get("shutdown") else "reboot"
     route["power_rule"] = profile.get("power", {})
     if route["delivery"] != "capsule-on-disk":
+        if capsule_flags is None:
+            raise Hold("ESRTのカプセルフラグを確認できません。")
+        # fwupd 2.0.20 on x86_64 adds both reset flags only when neither was set in ESRT.
+        reset_flags = 0x10000 | 0x40000  # PERSIST_ACROSS_RESET | INITIATE_RESET
+        route["capsule_flags"] = capsule_flags if capsule_flags & reset_flags else capsule_flags | reset_flags
         instance = profile.get("fmp", {}).get("hardware_instance", 0)
         if type(instance) is not int or not 0 <= instance < 2**64:
             raise Hold("BIOS資源のハードウェアインスタンスを確認できません。")
@@ -408,28 +416,37 @@ def _esp_reservation(plan, obs, waiting, device, profile, facts):
     if (obs["guid"] != plan.get("guid") or device.get("DeviceId") != plan.get("device")
             or not profile or dell or waiting - {plan.get("device")}):
         return "foreign", "。".join(evidence)
-    route = _bound_route(esp, partuuid, mounts, plan, profile, capability)
+    route = _bound_route(esp, partuuid, mounts, plan, profile, capability, obs["capsule_flags"])
+    if "capsule_flags" in route and "capsule_flags" not in binding:
+        # Older pending plans bound the loader and all other route fields. The
+        # actual registration must still match this device's live ESRT flags.
+        binding = dict(binding, capsule_flags=route["capsule_flags"])
     if route != binding:
         raise Hold("物理区画・起動先・配送方式が承認した内容と一致しません。")
-    if pending.count(UX_GUID) == 1:
-        # Preflight excluded every pending entry. This exact optional addition
-        # is only accepted alongside the separately verified BIOS reservation.
+    display = pending.count(UX_GUID) == 1
+    if display:
+        # Preflight excluded every pending entry. Validate this optional addition
+        # against the approved display asset and boot route before excluding it.
         _ux_file(esp, route)
         pending = [guid for guid in pending if guid != UX_GUID]
     if route["delivery"] == "capsule-on-disk":
         if next_boot is not None or pending:
             return "foreign", "。".join(evidence)
+        if standard:
+            files = list((esp / fw.STANDARD_CAPSULE_DIR).iterdir())
+            if len(files) != 1 or files[0].name.casefold() != Path(route["file"]).name.casefold():
+                raise Hold("ESPに承認したカプセル以外の項目があります。")
+            _matches_file(esp, plan, route)
+        if (not cod and not waiting and obs["boot"] and plan.get("boot") and obs["boot"] != plan["boot"]
+                and obs["can_identify"] and target_installed(plan, obs) and obs["running"] is False
+                and obs["attempt_comparable"] and not obs["new_failure"]):
+            residue = "と".join(name for present, name in ((standard, "カプセルファイル"), (display, "表示用登録"))
+                               if present)
+            obs["prepare_block"] = f"前回の更新の{residue}が残っているため、新しい更新の準備を保留します。"
+            return "clear", f"配送指示は解除され、照合済みの{residue}が残っています。"
         if not standard:
             raise Hold("配送指示または待機記録がありますが、対象のカプセルを確認できません。")
-        files = list((esp / fw.STANDARD_CAPSULE_DIR).iterdir())
-        if len(files) != 1 or files[0].name.casefold() != Path(route["file"]).name.casefold():
-            raise Hold("ESPに承認したカプセル以外の項目があります。")
-        _matches_file(esp, plan, route)
         if not cod:
-            if (not waiting and obs["boot"] and plan.get("boot") and obs["boot"] != plan["boot"]
-                    and obs["can_identify"] and target_installed(plan, obs) and obs["running"] is False
-                    and obs["attempt_comparable"] and not obs["new_failure"]):
-                return "clear", "配送指示は解除され、承認したカプセルのファイルだけが残っています。"
             raise Hold("カプセルは配置済みですが、ディスク配送指示がありません。")
     else:
         if cod or standard or pending != [plan["guid"]]:
@@ -483,7 +500,8 @@ def _attempt(plan, obs):
     if status == 0 or (version, status) == previous:
         return True, False
     raw = plan.get("target_raw")
-    if type(raw) is not int:
+    # A failed ESRT attempt may have no recorded version. Zero cannot identify a different release.
+    if version == 0 or type(raw) is not int:
         return False, False
     if version != raw:
         return True, False
@@ -531,12 +549,13 @@ def observe(plan=None):
     fields, model = _display_dmi()
     obs = dict(model=model, current=fw.visible(fields["bios_version"] or UNKNOWN)[:160], guid="", device="",
                version_format="", boot=_uuid(fw.BOOT_ID), machine="", can_identify=False,
-               reservation="unknown", detail="", history="", fw_version=None,
+               reservation="unknown", detail="", history="", fw_version=None, capsule_flags=None, prepare_block="",
                attempt_version=None, attempt_status=None, attempt_comparable=False,
                new_failure=False, running=None, power="", support_url="", recovery_url="")
     reasons = []
     try:
-        obs["guid"], obs["fw_version"], obs["attempt_version"], obs["attempt_status"] = _esrt_resource()
+        (obs["guid"], obs["fw_version"], obs["attempt_version"], obs["attempt_status"],
+         obs["capsule_flags"]) = _esrt_resource()
     except READ_ERRORS as exc:
         reasons.append("実機のESRTを確認できません。 " + fw.visible(exc))
     device, profile, waiting = {}, {}, set()
@@ -686,7 +705,7 @@ def recovery_required(plan):
     unknown = False
     flagged = False
     try:
-        guid, _, _, _ = _esrt_resource()
+        guid, *_ = _esrt_resource()
         _, device, _ = fw.inventory(guid, devices=_local_rows("get_devices"))
         if guid != plan.get("guid") or device.get("DeviceId") != plan.get("device"):
             raise Hold("BIOSの対象が変わりました。")
@@ -726,7 +745,7 @@ def preflight(plan):
     try:
         _platform()
         fw.check_marker(fw.marker_path())
-        guid, raw, _, _ = _esrt_resource()
+        guid, raw, _, _, capsule_flags = _esrt_resource()
         _, device, devices = fw.inventory(guid)
         if (guid != plan.get("guid") or device["DeviceId"] != plan.get("device")
                 or device["Version"] != plan.get("current") or not plan.get("version_format")
@@ -751,7 +770,7 @@ def preflight(plan):
         mounts = fw.mount_points()
         if fw.find_esp(mounts) != (esp, partuuid) or mounts[str(esp)].read_only:
             raise Hold("書き込み可能な同じEFI配送区画を確認できません。")
-        route = _bound_route(esp, partuuid, mounts, plan, profile, capability)
+        route = _bound_route(esp, partuuid, mounts, plan, profile, capability, capsule_flags)
         if route["secure_boot"] != secure:
             raise Hold("Secure Bootの状態が変わりました。")
         if route["delivery"] != "capsule-on-disk" and fw.esp_has_entry(esp, route["file"], directory=False):

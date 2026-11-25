@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <action id="io.github.mknk.BiosUpdate1.release-approval">
+    <description>Release an unsent BIOS update approval</description>
+    <description xml:lang="ja">未送信の BIOS 更新の承認を解除</description>
+    <message>Administrator authentication is required to release an unsent BIOS update approval.</message>
+    <message xml:lang="ja">未送信の BIOS 更新の承認を解除するには管理者認証が必要です。</message>
+    <icon_name>computer</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

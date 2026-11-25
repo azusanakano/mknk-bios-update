@@ -239,6 +239,72 @@ class PortablePeerTest(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == "linux", "Linux worker accounts and directory locks")
 class PortablePlatformTest(unittest.TestCase):
+    def test_release_approval_checks_the_original_connection_with_admin_policy(self):
+        from test_engine import Machine
+
+        platform = object.__new__(Platform)
+        caller = Machine().actor(":1.2")
+
+        for portable, action in (
+                (False, "io.github.mknk.BiosUpdate1.release-approval"),
+                (True, "org.freedesktop.policykit.exec")):
+            platform.portable = portable
+            for allowed in (True, False):
+                response = GLib.Variant("((bba{ss}))", ((allowed, not allowed, {}),))
+                with self.subTest(portable=portable, allowed=allowed), patch.object(
+                        platform, "bus", create=True) as bus:
+                    bus.call_sync.return_value = response
+                    if allowed:
+                        platform.require_administrator(caller)
+                    else:
+                        with self.assertRaises(Conflict):
+                            platform.require_administrator(caller)
+                    _, _, _, method, params, signature, *_ = bus.call_sync.call_args.args
+                    subject, request, details, flags, _ = params.unpack()
+                    self.assertEqual(method, "CheckAuthorization")
+                    self.assertEqual(signature.dup_string(), "((bba{ss}))")
+                    self.assertEqual(subject, ("system-bus-name", {"name": caller.sender}))
+                    self.assertEqual((request, flags), (action, 1))
+                    self.assertEqual(bool(details.get("polkit.message")), portable)
+
+    def test_unstarted_metadata_worker_releases_fence_but_ambiguous_worker_holds_it(self):
+        import pwd
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            boot = root / "boot"
+            boot.write_text("same-boot", encoding="ascii")
+            journal = Journal(root / "state")
+            platform = object.__new__(Platform)
+            platform.portable = False
+            platform.bus_id = "bus"
+            platform.worker_user = pwd.getpwnam("nobody")
+            platform.cabinet = tempfile.TemporaryFile
+            platform.confirm_owner = lambda owner: None
+            platform.call = lambda *args: (os.getpid(),)
+            result = dict(state="metadata", signed_timestamp=100, catalog_sha256="a" * 64,
+                          daemon_owner=":1.8", remote_id="stable", remote_fingerprint="remote",
+                          settings_fingerprint="settings")
+
+            run_worker = platform.run_worker
+
+            def worker(mode, *args, **kwargs):
+                return result if mode == "metadata" else run_worker(mode, *args, **kwargs)
+
+            with patch.object(platform, "run_worker", side_effect=worker), patch.object(fw, "BOOT_ID", boot), patch(
+                    "platform_linux.read_trust_policy", return_value="0"):
+                with patch("platform_linux.subprocess.Popen", side_effect=OSError("no process slots")):
+                    with self.assertRaises((Conflict, OSError)):
+                        platform.refresh("guid", journal, lambda: None)
+                platform.metadata_clear(journal)
+                self.assertFalse(journal.setting("metadata-request"))
+
+                with patch.object(platform, "execute_worker", side_effect=Conflict("reply after start is unknown")):
+                    with self.assertRaises(Conflict):
+                        platform.refresh("guid", journal, lambda: None)
+                with self.assertRaises(Conflict):
+                    platform.metadata_clear(journal)
+
     def test_declined_authorization_removes_only_the_matching_marker(self):
         import uuid
         from types import SimpleNamespace
@@ -355,7 +421,7 @@ class PortablePlatformTest(unittest.TestCase):
         profile = {"dmi": {"product_name": "fixture"}}
         with patch("platform_linux.fw.read_settings", return_value=profile), patch(
                 "platform_linux.read_trust_policy", return_value="0"), patch(
-                "platform_linux.subprocess.run", return_value=result) as run:
+                "platform_linux.Platform.execute_worker", return_value=result) as run:
             self.assertEqual(platform.worker("check", "g"), {"state": "hold"})
         argv = run.call_args.args[0]
         options = run.call_args.kwargs
@@ -365,10 +431,10 @@ class PortablePlatformTest(unittest.TestCase):
                          (nobody.pw_uid, nobody.pw_gid, []))
         self.assertEqual(set(options["env"]), {"PATH", "LANG", "HOME", "MKNK_FWUPD_ONLY_PQ",
                                                 "LD_LIBRARY_PATH", "GI_TYPELIB_PATH"})
-        self.assertEqual(json.loads(options["input"])["profile"], profile)
+        self.assertEqual(json.loads(run.call_args.args[1])["profile"], profile)
         with patch("platform_linux.fw.read_settings", side_effect=[profile, {}]), patch(
                 "platform_linux.read_trust_policy", return_value="0"), patch(
-                "platform_linux.subprocess.run", return_value=result), self.assertRaises(Conflict):
+                "platform_linux.Platform.execute_worker", return_value=result), self.assertRaises(Conflict):
             platform.worker("check", "g")
 
 

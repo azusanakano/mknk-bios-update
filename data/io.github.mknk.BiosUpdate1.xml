@@ -5,6 +5,7 @@
     <method name="Prepare"><arg name="token" type="s" direction="in"/><arg name="view" type="s" direction="out"/></method>
     <method name="Dismiss"><arg name="plan" type="s" direction="in"/><arg name="view" type="s" direction="out"/></method>
     <method name="Replan"><arg name="plan" type="s" direction="in"/><arg name="view" type="s" direction="out"/></method>
+    <method name="TakeOver"><arg name="plan" type="s" direction="in"/><arg name="view" type="s" direction="out"/></method>
     <method name="Authorize">
       <arg name="plan" type="s" direction="in"/>
       <arg name="operation" type="s" direction="out"/><arg name="owner" type="s" direction="out"/>
@@ -12,6 +13,7 @@
     </method>
     <method name="DeclineAuthorization"><arg name="operation" type="s" direction="in"/></method>
     <method name="Report"><arg name="operation" type="s" direction="in"/><arg name="accepted" type="b" direction="in"/><arg name="view" type="s" direction="out"/></method>
+    <method name="ReportRejection"><arg name="operation" type="s" direction="in"/><arg name="view" type="s" direction="out"/></method>
     <method name="Power">
       <arg name="plan" type="s" direction="in"/><arg name="request" type="s" direction="out"/>
       <arg name="desktop" type="s" direction="out"/><arg name="action" type="s" direction="out"/>

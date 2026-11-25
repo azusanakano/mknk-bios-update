@@ -23,7 +23,10 @@ class ServiceBusTest(unittest.TestCase):
     def test_declining_an_unsent_permit_allows_a_new_approval_in_the_same_boot(self):
         self.exercise_receipt_reporting(switch_user=False, decline=True)
 
-    def exercise_receipt_reporting(self, *, switch_user, decline=False):
+    def test_definite_rejection_can_only_be_reported_by_original_connection(self):
+        self.exercise_receipt_reporting(switch_user=True, reject=True)
+
+    def exercise_receipt_reporting(self, *, switch_user, decline=False, reject=False):
         import fcntl
         from gi.repository import Gio, GLib
         from engine import Engine
@@ -102,6 +105,17 @@ class ServiceBusTest(unittest.TestCase):
                     return operation
 
                 operation = authorize(review["plan"])
+                if reject:
+                    engine.platform.session_active = False
+                    with self.assertRaises(GLib.Error):
+                        call("ReportRejection", "(s)", operation, connection=other)
+                    self.assertEqual(engine.db.active()["receipt"], "unknown")
+                    self.assertEqual(call("ReportRejection", "(s)", operation)["state"], "hold")
+                    self.assertIsNone(engine.db.active())
+                    self.assertIsNone(engine.platform.marker)
+                    engine.platform.session_active = True
+                    self.assertTrue(call("Status")["can_check"])
+                    return
                 if decline:
                     with self.assertRaises(GLib.Error):
                         call("DeclineAuthorization", "(s)", operation, connection=other)
@@ -117,7 +131,7 @@ class ServiceBusTest(unittest.TestCase):
                         call("DeclineAuthorization", "(s)", operation)
                     self.assertEqual(engine.platform.marker, operation)
                 if switch_user:
-                    request = engine.db.power(operation, client.get_unique_name(), engine.platform.bus_id)
+                    request = engine.db.power(operation, client.get_unique_name(), engine.platform.bus_id, "boot-1")
                     engine.platform.session_active = False
                     with self.assertRaises(GLib.Error):
                         call("Report", "(sb)", operation, True, connection=other)

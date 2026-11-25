@@ -1396,6 +1396,8 @@ def check_ready(device, devices, history, settings):
     mounts = mount_points()
     require_efivarfs(mounts, writable=True)
     esp, esp_guid = find_esp(mounts)
+    if mounts[str(esp)].read_only:
+        raise Hold("EFIシステム区画が読み取り専用です。更新ファイルを配置できません。")
     entries = disk_entries(esp)
     if entries:
         raise Hold("ESPの配送先に既存の項目があります。 " + "、".join(entries))

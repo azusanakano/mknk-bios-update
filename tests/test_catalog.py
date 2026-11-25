@@ -13,11 +13,13 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
-from urllib.request import Request
+from urllib.request import HTTPSHandler, Request, build_opener
+from urllib.response import addinfourl
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 import catalog
+from catalog import Session
 from firmware_api import fw
 
 
@@ -34,6 +36,23 @@ def metadata(version="2", requirements=""):
     <releases><release version="{version}"><description><p>New <em>BIOS</em></p></description>
     <checksum type="sha256" target="container">{CAB_DIGEST}</checksum>
     </release></releases></component></components>""".encode()
+
+
+class CabTransport(HTTPSHandler):
+    """Exercise urllib's real auth and redirect handlers with an in-memory response."""
+    def __init__(self, redirect=None):
+        super().__init__()
+        self.requests = []
+        self.redirect = redirect
+
+    def https_open(self, request):
+        self.requests.append(request)
+        location = self.redirect if len(self.requests) == 1 else None
+        response = addinfourl(io.BytesIO(b"" if location else b"cab"),
+                              {"Location": location} if location else {},
+                              request.full_url, 302 if location else 200)
+        response.msg = "Found" if location else "OK"
+        return response
 
 
 class CatalogTests(unittest.TestCase):
@@ -114,6 +133,41 @@ class CatalogTests(unittest.TestCase):
         self.assertIn("承認", catalog.query("check", GUID)["detail"])
         self.policy = ({CAB_DIGEST}, {CAB_DIGEST})
         self.assertIn("ブロック", catalog.query("check", GUID)["detail"])
+
+    def test_new_daemon_checks_candidates_and_approvals_without_removed_block_list(self):
+        self.session.version = "2.1.1"
+        self.session.policy.side_effect = lambda remote: Session.policy(self.session, remote)
+        self.session.remote.return_value = dict(REMOTE, ApprovalRequired=True)
+        self.session.client.get_blocked_firmware.side_effect = RuntimeError("no longer supported")
+        self.session.client.get_approved_firmware.return_value = [CAB_DIGEST]
+        self.assertEqual(catalog.query("check", GUID)["state"], "available")
+        self.releases = [dict(self.release, Flags=["blocked-version"])]
+        self.assertEqual(catalog.query("check", GUID)["state"], "hold")
+        self.releases = [self.release]
+        self.session.client.get_approved_firmware.return_value = []
+        self.assertIn("承認", catalog.query("check", GUID)["detail"])
+        self.set_current_release()
+        self.assertEqual(catalog.query("check", GUID)["state"], "current")
+        self.session.client.get_blocked_firmware.assert_not_called()
+        self.session.bus.call_sync.assert_not_called()
+
+    def test_old_daemon_uses_its_block_list_even_with_a_new_client_library(self):
+        self.session.policy.side_effect = lambda remote: Session.policy(self.session, remote)
+        self.session.client.get_blocked_firmware.side_effect = RuntimeError("no longer supported")
+        query = self.session.bus.call_sync
+        for version in ("2.0.20", "2.1.0"):
+            with self.subTest(version=version):
+                self.session.version = version
+                query.return_value.unpack.return_value = ([],)
+                self.assertEqual(catalog.query("check", GUID)["state"], "available")
+                self.assertEqual(query.call_args.args[:4],
+                                 (self.session.owner, "/", fw.FWUPD_ID, "GetBlockedFirmware"))
+                query.return_value.unpack.return_value = ([CAB_DIGEST],)
+                self.assertIn("ブロック", catalog.query("check", GUID)["detail"])
+        query.side_effect = OSError("private bus error")
+        result = catalog.query("check", GUID)
+        self.assertEqual(result["state"], "hold")
+        self.assertNotIn("private", result["detail"])
 
     def test_available_candidate_retains_the_excluded_higher_version_and_reason(self):
         digest = "b" * 64
@@ -217,6 +271,74 @@ class CatalogTests(unittest.TestCase):
         with self.assertRaises(fw.Hold):
             handler.redirect_request(request, io.BytesIO(), 302, "", {}, "https://elsewhere.example/secret")
 
+    def prepare_mirror(self, signed_location, indexed_location, transport, *, legacy=False):
+        mirror = "https://mirror.example/catalog/firmware.xml.xz"
+        remote = dict(REMOTE, Id="stable-mirror", Username="user", Password="fixture",
+                      MetadataUri=mirror, MetadataUriSig=mirror + ".jcat",
+                      FirmwareBaseUri="https://mirror.example/cabs")
+        settings = dict(stable_remote_id=remote["Id"], stable_metadata_uris=[mirror],
+                        cab_base_uris=["https://mirror.example/cabs/"])
+        self.release.update(RemoteId=remote["Id"], Locations=[indexed_location])
+        location = f"<location>{signed_location}</location>"
+        if not legacy:
+            location = (f'<artifacts><artifact type="binary"><filename>bios.cab</filename>{location}'
+                        f'<checksum type="sha256">{CAB_DIGEST}</checksum></artifact></artifacts>')
+        self.xml = metadata().replace(b"</release>", location.encode() + b"</release>")
+        fw.read_settings.return_value = settings
+        self.session.remote.return_value = remote
+        self.session.rows.side_effect = lambda op, *args: [] if op == "get_details" else self.rows(op, *args)
+        self.session.GLib.Error = OSError
+        payload = uuid.UUID(GUID).bytes_le + struct.pack("<III", 28, 0, 29) + b"x"
+        with (tempfile.TemporaryFile() as cabinet, patch.object(fw, "support_profile", return_value=settings),
+              patch.object(catalog, "build_opener", side_effect=lambda *handlers: build_opener(*handlers, transport)),
+              patch.object(fw, "seal_cabinet", side_effect=lambda stream, r:
+                           fw.verify_cabinet_hashes(stream, fw.release_hashes(r))),
+              patch.object(catalog, "sealed_size", return_value=3),
+              patch.object(fw, "verify_cab", return_value=("fixture", payload, "2"))):
+            return catalog.query("prepare", GUID, cabinet)
+
+    def test_prepare_resolves_signed_cab_location_once_and_scopes_mirror_auth(self):
+        signed = "https://cdn.fwupd.org/downloads/bios.cab"
+        indexed = "https://user:fixture@mirror.example/cabs/bios.cab/auth"
+        destination = "https://mirror.example/cabs/bios.cab/auth"
+        redirect = "https://cdn.fwupd.org/downloads/cached-bios.cab"
+        resolve = self.session.native_remote.return_value.build_firmware_uri
+        resolve.return_value = indexed
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                resolve.reset_mock()
+                transport = CabTransport(redirect)
+                result = self.prepare_mirror(signed, indexed, transport, legacy=legacy)
+                self.assertEqual(result["state"], "available", result)
+                self.assertEqual(result["checksum"], CAB_DIGEST)
+                resolve.assert_called_once_with(signed)
+                self.assertEqual([r.full_url for r in transport.requests], [destination, redirect])
+                self.assertTrue(transport.requests[0].has_header("Authorization"))
+                self.assertFalse(transport.requests[1].has_header("Authorization"))
+
+    def test_prepare_rejects_unrelated_unsigned_or_disallowed_mirror_locations(self):
+        signed = "https://cdn.fwupd.org/downloads/bios.cab"
+        indexed = "https://user:fixture@mirror.example/cabs/bios.cab/auth"
+        resolve = self.session.native_remote.return_value.build_firmware_uri
+        for xml_uri, index_uri, resolved in (
+                (signed, "https://mirror.example/cabs/unrelated.cab", indexed),
+                ("https://unexpected:identity@cdn.fwupd.org/downloads/bios.cab", indexed, indexed),
+                (signed + "?token=private", indexed, indexed),
+                (signed + "?", indexed, indexed),
+                (signed, indexed.replace("/cabs/", "/outside/"), indexed.replace("/cabs/", "/outside/"))):
+            with self.subTest(xml_uri=xml_uri, index_uri=index_uri):
+                resolve.return_value = resolved
+                transport = CabTransport()
+                result = self.prepare_mirror(xml_uri, index_uri, transport)
+                self.assertEqual(result["state"], "hold", result)
+                self.assertEqual(transport.requests, [])
+                self.assertNotIn("fixture@", result["detail"])
+        resolve.return_value = indexed
+        transport = CabTransport("https://mirror.example/outside/redirect.cab/auth")
+        result = self.prepare_mirror(signed, indexed, transport)
+        self.assertEqual(result["state"], "hold", result)
+        self.assertEqual([r.full_url for r in transport.requests], [catalog.protected_uri(indexed)])
+
     def test_remote_fence_tracks_destination_and_policy_across_cache_refresh(self):
         identity = catalog.remote_fingerprint(REMOTE)
         for field, value in (("Id", "other"), ("MetadataUri", "https://mirror.example/stable.xml.xz"),
@@ -310,7 +432,9 @@ class NativeCatalogTests(unittest.TestCase):
         from gi.repository import Jcat
         Fwupd, GLib = fw.fwupd_bindings()
 
-        payload = lzma.compress(metadata())
+        source = "https://lvfs.example/file.cab"
+        xml = metadata().replace(b"</release>", f"<location>{source}</location></release>".encode())
+        payload = lzma.compress(xml)
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             trust = root / "trust"
@@ -337,7 +461,7 @@ class NativeCatalogTests(unittest.TestCase):
                     os.environ, {"MKNK_FWUPD_ONLY_PQ": "0"}):
                 components, identity = catalog.authenticated(payload, signature, {GUID})
                 self.assertEqual(len(components), 1)
-                self.assertEqual(identity["catalog_sha256"], hashlib.sha256(metadata()).hexdigest())
+                self.assertEqual(identity["catalog_sha256"], hashlib.sha256(xml).hexdigest())
                 self.assertGreater(identity["signed_timestamp"], 1)
                 # Recompute the checksum for tampered bytes; the PKCS#7 check must still fail.
                 changed = lzma.compress(metadata("3"))
@@ -363,8 +487,21 @@ class NativeCatalogTests(unittest.TestCase):
             self.assertEqual(remote.get_metadata_uri_sig(), original + ".jcat")
             self.assertTrue(remote.load_signature_bytes(GLib.Bytes.new(signature)))
             self.assertTrue(remote.get_metadata_uri().endswith("/" + immutable))
-            self.assertEqual(catalog.protected_uri(remote.build_firmware_uri("https://lvfs.example/file.cab")),
-                             base + "/file.cab/auth")
+            mapped = remote.build_firmware_uri(source)
+            self.assertEqual(catalog.protected_uri(mapped), base + "/file.cab/auth")
+            row = json.loads(remote.to_json_string(Fwupd.CodecFlags.NONE))
+            session = SimpleNamespace(native_remote=lambda _: remote, GLib=GLib)
+            transport = CabTransport()
+            with (fw.open_cabinet() as cabinet, patch.object(catalog, "build_opener",
+                  side_effect=lambda *handlers: build_opener(*handlers, transport))):
+                catalog.fetch_release(dict(Checksum=[CAB_DIGEST], Locations=[mapped]), row, cabinet,
+                                      dict(cab_base_uris=[base + "/"]), 3, session,
+                                      components[0].findall("releases/release"))
+                self.assertEqual(catalog.sealed_size(cabinet, 3), 3)
+                cabinet.seek(0)
+                self.assertEqual(cabinet.read(), b"cab")
+            self.assertEqual([r.full_url for r in transport.requests], [base + "/file.cab/auth"])
+            self.assertTrue(transport.requests[0].has_header("Authorization"))
 
     def test_installed_query_signatures_and_error_domain(self):
         Fwupd, GLib = fw.fwupd_bindings()
@@ -373,7 +510,7 @@ class NativeCatalogTests(unittest.TestCase):
             "get_remotes": ("cancellable",), "get_devices": ("cancellable",),
             "get_remote_by_id": ("remote_id", "cancellable"), "get_details": ("filename", "cancellable"),
             "get_upgrades": ("device_id", "cancellable"), "get_releases": ("device_id", "cancellable"),
-            "get_approved_firmware": ("cancellable",), "get_blocked_firmware": ("cancellable",),
+            "get_approved_firmware": ("cancellable",),
             "search": ("token", "cancellable"), "get_daemon_version": (),
         }
         for name, names in signatures.items():

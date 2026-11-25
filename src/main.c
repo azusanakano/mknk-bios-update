@@ -23,15 +23,15 @@ static struct {
     GtkWidget *approve, *recovery, *details, *actions;
     GDBusConnection *bus, *control;
     GCancellable *startup, *power_preflight;
-    JsonObject *view, *rendered_review;
-    const char *review_focus;
+    JsonObject *view, *rendered_view;
+    const char *saved_focus, *pending_panel;
     char *owner, *stage, *previous_state, *deferred_plan, *power_plan, *power_action;
     guint watch, changes, timer, startup_timeout;
     gulong closed;
     int appdir_fd;
     guint64 generation;
     gboolean opening, busy, reading, fresh, read_only, explicit_plan, closing, first_status, login;
-    gboolean preparing, abandon_prepare, portable, wait_on_close, review_ready;
+    gboolean preparing, abandon_prepare, portable, wait_on_close, focus_initialized;
 } ui;
 
 typedef struct {
@@ -252,17 +252,18 @@ static void recovery_toggled(GtkCheckButton *check, gpointer data)
 
 static gboolean same_review(void)
 {
-    if (!ui.rendered_review || !state("review") || !*field("plan")) return FALSE;
+    if (!state("review") || !*field("plan") || !g_str_equal(view_field(ui.rendered_view, "state"), "review"))
+        return FALSE;
     const char *content[] = {
         "plan", "model", "current", "target", "scope", "source", "checked", "changes", "power",
         "signed", "synced", "checksum", "cab_sha512", "remote_id", "appstream_id", "device", "daemon_owner",
         "recovery_detail",
     };
     for (guint i = 0; i < G_N_ELEMENTS(content); i++) {
-        if (!g_str_equal(view_field(ui.rendered_review, content[i]), field(content[i]))) return FALSE;
+        if (!g_str_equal(view_field(ui.rendered_view, content[i]), field(content[i]))) return FALSE;
     }
-    return view_flag(ui.rendered_review, "recovery_required") == flag("recovery_required") &&
-           view_flag(ui.rendered_review, "cached") == flag("cached");
+    return view_flag(ui.rendered_view, "recovery_required") == flag("recovery_required") &&
+           view_flag(ui.rendered_view, "cached") == flag("cached");
 }
 
 static const char *widget_focus_key(GtkWidget *widget)
@@ -292,20 +293,29 @@ static void render(void)
     gboolean keep_review = same_review();
     gboolean recovered = keep_review && ui.recovery && gtk_check_button_get_active(GTK_CHECK_BUTTON(ui.recovery));
     gboolean expanded = keep_review && ui.details && gtk_expander_get_expanded(GTK_EXPANDER(ui.details));
-    if (!keep_review) {
-        ui.review_focus = NULL;
-        ui.review_ready = FALSE;
-    } else if (g_strcmp0(ui.previous_state, "review") == 0) {
-        /* GTK may move focus when the current button is disabled during a status read. */
-        ui.review_focus = widget_focus_key(gtk_window_get_focus(ui.window));
-    }
-    g_clear_pointer(&ui.rendered_review, json_object_unref);
-    if (review) ui.rendered_review = json_object_ref(ui.view);
     if (!matching_power_confirmation()) clear_power_confirmation();
-    const char *focus_state = ui.power_plan ? "power-confirmation" : s;
+    const char *pending_panel = NULL;
+    if (state("pending")) {
+        pending_panel = ui.power_plan ? "power-confirmation" :
+                        g_strcmp0(ui.deferred_plan, field("plan")) == 0 ? "deferred" : "pending";
+    }
+    gboolean keep_pending = pending_panel && g_strcmp0(ui.pending_panel, pending_panel) == 0 &&
+        *field("plan") && g_str_equal(view_field(ui.rendered_view, "plan"), field("plan")) &&
+        g_str_equal(view_field(ui.rendered_view, "power"), field("power"));
+    if (!keep_review && !keep_pending) {
+        ui.saved_focus = NULL;
+        ui.focus_initialized = FALSE;
+    } else if (ui.previous_state && *ui.previous_state) {
+        /* GTK may move focus when the current button is disabled during a status read. */
+        ui.saved_focus = widget_focus_key(gtk_window_get_focus(ui.window));
+    }
+    g_clear_pointer(&ui.rendered_view, json_object_unref);
+    if (review || pending_panel) ui.rendered_view = json_object_ref(ui.view);
+    ui.pending_panel = pending_panel;
+    const char *focus_state = pending_panel ? pending_panel : s;
     if (ui.busy || ui.reading || !ui.fresh) focus_state = "";
     gboolean transition = g_strcmp0(ui.previous_state, focus_state) != 0;
-    gboolean entering_view = *focus_state && (review ? !ui.review_ready : transition);
+    gboolean entering_view = *focus_state && (review || pending_panel ? !ui.focus_initialized : transition);
     GtkWidget *old = ui.page;
     ui.page = page;
     ui.approve = NULL;
@@ -417,6 +427,8 @@ static void render(void)
     gtk_widget_set_sensitive(button(ui.actions, "状態を再確認", "Status", FALSE), !ui.reading && !ui.opening);
     if (!ui.read_only && flag("can_replan") && *field("plan"))
         gtk_widget_set_sensitive(button(ui.actions, "更新計画を作り直す", "Replan", FALSE), writable());
+    if (!ui.read_only && flag("can_take_over") && *field("plan"))
+        gtk_widget_set_sensitive(button(ui.actions, "管理者として承認を解除", "TakeOver", FALSE), writable());
     if (!ui.read_only && can_check())
         gtk_widget_set_sensitive(button(ui.actions, "配布情報を再確認", "Check", FALSE), writable());
     const char *history = field("history");
@@ -424,9 +436,9 @@ static void render(void)
              ui.portable && !ui.read_only ? "「更新情報を確認」で端末の更新履歴を読み取れます。" :
              ui.portable ? "更新履歴は通常モードで管理者認証を行うと確認できます。" : "履歴を取得できません。");
     GtkWidget *restore_focus = NULL;
-    if (ui.review_focus) {
-        restore_focus = find_focus(page, ui.review_focus);
-        if (!restore_focus) restore_focus = find_focus(ui.actions, ui.review_focus);
+    if (ui.saved_focus) {
+        restore_focus = find_focus(page, ui.saved_focus);
+        if (!restore_focus) restore_focus = find_focus(ui.actions, ui.saved_focus);
     }
     if (restore_focus && gtk_widget_is_sensitive(restore_focus)) gtk_widget_grab_focus(restore_focus);
     else if (focus && entering_view) gtk_widget_grab_focus(focus);
@@ -434,7 +446,7 @@ static void render(void)
     if (entering_view)
         gtk_accessible_announce(GTK_ACCESSIBLE(ui.stack), heading, GTK_ACCESSIBLE_ANNOUNCEMENT_PRIORITY_MEDIUM);
 #endif
-    if (review && *focus_state) ui.review_ready = TRUE;
+    if ((review || pending_panel) && *focus_state) ui.focus_initialized = TRUE;
     g_free(ui.previous_state);
     ui.previous_state = g_strdup(focus_state);
 }
@@ -492,7 +504,7 @@ static void status_done(GObject *source, GAsyncResult *result, gpointer data)
     render();
     if (ui.first_status && ui.fresh) {
         ui.first_status = FALSE;
-        if (state("idle") && !*field("plan") && can_check() && writable())
+        if (!*field("plan") && !flag("result_this_boot") && can_check() && writable())
             action_clicked(NULL, "Check");
     }
 }
@@ -553,7 +565,7 @@ static void clear_control(void)
     g_clear_object(&ui.control);
     g_clear_pointer(&ui.owner, g_free);
     g_clear_pointer(&ui.view, json_object_unref);
-    g_clear_pointer(&ui.rendered_review, json_object_unref);
+    g_clear_pointer(&ui.rendered_view, json_object_unref);
     clear_power_confirmation();
 }
 
@@ -638,17 +650,22 @@ static void portable_ready(GObject *source, GAsyncResult *result, gpointer data)
     use_control(peer, NULL);
 }
 
+static void bus_unavailable(GError *error)
+{
+    finish_startup();
+    error_notice("システムバスに接続できません。", error);
+    render();
+    if (ui.login) g_application_quit(G_APPLICATION(ui.app));
+}
+
 static void bus_ready(GObject *source, GAsyncResult *result, gpointer data)
 {
     (void) source; (void) data;
     g_autoptr(GError) error = NULL;
-    g_autoptr(GDBusConnection) bus = g_bus_get_finish(result, &error);
+    g_autoptr(GDBusConnection) bus = g_dbus_connection_new_for_address_finish(result, &error);
     if (ui.closing) return;
     if (!bus) {
-        finish_startup();
-        error_notice("システムバスに接続できません。", error);
-        render();
-        if (ui.login) g_application_quit(G_APPLICATION(ui.app));
+        bus_unavailable(error);
         return;
     }
     g_set_object(&ui.bus, bus);
@@ -666,13 +683,21 @@ static void connect_service(void)
     if (ui.opening) return;
     ui.opening = TRUE;
     if (ui.portable) {
-        if (ui.bus && g_dbus_connection_is_closed(ui.bus)) g_clear_object(&ui.bus);
         ui.startup = g_cancellable_new();
         ui.startup_timeout = g_timeout_add_seconds(180, startup_expired, NULL);
     }
     if (ui.watch) g_bus_unwatch_name(ui.watch);
     ui.watch = 0;
-    g_bus_get(G_BUS_TYPE_SYSTEM, ui.startup, bus_ready, NULL);
+    g_clear_object(&ui.bus);
+    g_autoptr(GError) error = NULL;
+    g_autofree char *address = g_dbus_address_get_for_bus_sync(G_BUS_TYPE_SYSTEM, ui.startup, &error);
+    if (!address) {
+        bus_unavailable(error);
+        return;
+    }
+    /* Other libraries may still reference GIO's closed process-wide bus after a restart. */
+    g_dbus_connection_new_for_address(address, G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT |
+        G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION, NULL, ui.startup, bus_ready, NULL);
     render();
 }
 
@@ -727,8 +752,8 @@ static void view_done(GObject *source, GAsyncResult *result, gpointer data)
             if (json_parser_load_from_data(parser, json, -1, NULL) &&
                 JSON_NODE_HOLDS_OBJECT(json_parser_get_root(parser))) {
                 JsonObject *draft = json_node_get_object(json_parser_get_root(parser));
-                const char *plan = json_object_get_string_member_with_default(draft, "plan", "");
-                if (plan && *plan && g_strcmp0(json_object_get_string_member_with_default(draft, "state", ""), "review") == 0) {
+                const char *plan = view_field(draft, "prepared_draft");
+                if (*plan) {
                     send_view("Dismiss", g_variant_new("(s)", plan));
                     return;
                 }
@@ -759,21 +784,51 @@ static void send_view(const char *method, GVariant *args)
                            NULL, view_done, request_new(NULL));
 }
 
-static void report(Request *operation, gboolean accepted)
+static gboolean install_definitely_rejected(GDBusMessage *reply, const char *owner)
 {
-    g_dbus_connection_call(operation->control, operation->owner, BIOS_PATH, BIOS_BUS, "Report",
-                           g_variant_new("(sb)", operation->id, accepted), G_VARIANT_TYPE("(s)"),
-                           G_DBUS_CALL_FLAGS_NO_AUTO_START, 30000, NULL, view_done, operation);
+    if (!reply || g_dbus_message_get_message_type(reply) != G_DBUS_MESSAGE_TYPE_ERROR) return FALSE;
+    const char *sender = g_dbus_message_get_sender(reply);
+    const char *name = g_dbus_message_get_error_name(reply);
+    if (g_strcmp0(sender, "org.freedesktop.DBus") == 0) {
+        return g_strcmp0(name, "org.freedesktop.DBus.Error.NameHasNoOwner") == 0 ||
+               g_strcmp0(name, "org.freedesktop.DBus.Error.ServiceUnknown") == 0 ||
+               g_strcmp0(name, "org.freedesktop.DBus.Error.AccessDenied") == 0;
+    }
+    GVariant *body = g_dbus_message_get_body(reply);
+    if (g_strcmp0(sender, owner) != 0 || g_strcmp0(name, FWUPD ".AuthFailed") != 0 ||
+        !body || !g_variant_is_of_type(body, G_VARIANT_TYPE("(s)"))) return FALSE;
+    /* fwupd's polkit denial precedes fu_engine_install_releases. Other authentication
+     * errors may originate during installation and cannot release the operation. */
+    const char *detail;
+    g_variant_get(body, "(&s)", &detail);
+    return g_str_equal(detail, "Failed to obtain auth");
 }
 
 static void install_done(GObject *source, GAsyncResult *result, gpointer data)
 {
+    Request *operation = data;
     GDBusConnection *bus = G_DBUS_CONNECTION(source);
     g_autoptr(GError) error = NULL;
-    g_autoptr(GVariant) reply = g_dbus_connection_call_with_unix_fd_list_finish(bus, NULL, result, &error);
-    if (!reply)
-        error_notice("受付結果が未確定です。同じ更新は再送せず、予約と実機を照合します。", error);
-    report(data, reply != NULL);
+    g_autoptr(GDBusMessage) reply = g_dbus_connection_send_message_with_reply_finish(bus, result, &error);
+    const char *method = "Report";
+    GVariant *args;
+    if (install_definitely_rejected(reply, operation->fwupd)) {
+        method = "ReportRejection";
+        args = g_variant_new("(s)", operation->id);
+        notice("更新準備の依頼が配置前に拒否されました。端末の予約と状態を照合します。");
+    } else {
+        GVariant *body = reply ? g_dbus_message_get_body(reply) : NULL;
+        gboolean accepted = reply && g_dbus_message_get_message_type(reply) == G_DBUS_MESSAGE_TYPE_METHOD_RETURN &&
+            g_strcmp0(g_dbus_message_get_sender(reply), operation->fwupd) == 0 &&
+            (!body || g_variant_is_of_type(body, G_VARIANT_TYPE_UNIT));
+        if (!accepted) {
+            if (reply) g_dbus_message_to_gerror(reply, &error);
+            error_notice("受付結果が未確定です。同じ更新は再送せず、予約と実機を照合します。", error);
+        }
+        args = g_variant_new("(sb)", operation->id, accepted);
+    }
+    g_dbus_connection_call(operation->control, operation->owner, BIOS_PATH, BIOS_BUS, method, args,
+                           G_VARIANT_TYPE("(s)"), G_DBUS_CALL_FLAGS_NO_AUTO_START, 30000, NULL, view_done, operation);
 }
 
 /* Only the immutable file descriptor from the service is forwarded. The
@@ -843,11 +898,13 @@ static void authorized(GObject *source, GAsyncResult *result, gpointer data)
     ui.stage = g_strdup("検証済みの配布ファイルを fwupd に渡しています。");
     render();
     GDBusConnection *system = r->system;
-    g_dbus_connection_call_with_unix_fd_list(system, owner, "/", FWUPD, "Install",
-                                            g_variant_new("(sha{sv})", device, index, &options),
-                                            G_VARIANT_TYPE_UNIT, G_DBUS_CALL_FLAGS_NO_AUTO_START |
-                                            G_DBUS_CALL_FLAGS_ALLOW_INTERACTIVE_AUTHORIZATION,
-                                            G_MAXINT, fds, NULL, install_done, g_steal_pointer(&r));
+    g_autoptr(GDBusMessage) install = g_dbus_message_new_method_call(owner, "/", FWUPD, "Install");
+    g_dbus_message_set_flags(install, G_DBUS_MESSAGE_FLAGS_NO_AUTO_START |
+                                      G_DBUS_MESSAGE_FLAGS_ALLOW_INTERACTIVE_AUTHORIZATION);
+    g_dbus_message_set_body(install, g_variant_new("(sha{sv})", device, index, &options));
+    g_dbus_message_set_unix_fd_list(install, fds);
+    g_dbus_connection_send_message_with_reply(system, install, G_DBUS_SEND_MESSAGE_FLAGS_NONE, G_MAXINT,
+                                              NULL, NULL, install_done, g_steal_pointer(&r));
 }
 
 static gboolean has_reviewed_release(GVariant *reply, Request *r)
@@ -1013,6 +1070,9 @@ static void action_clicked(GtkButton *button_widget, gpointer data)
     } else if (g_str_equal(action, "Replan") && flag("can_replan") && *field("plan")) {
         begin("以前の処理と起動予約の解消を確認しています。");
         send_view("Replan", g_variant_new("(s)", field("plan")));
+    } else if (g_str_equal(action, "TakeOver") && flag("can_take_over") && *field("plan")) {
+        begin("管理者認証と、以前の承認が未送信であることを確認しています。");
+        send_view("TakeOver", g_variant_new("(s)", field("plan")));
     } else if (g_str_equal(action, "Dismiss") && state("review") && flag("can_approve") && *field("plan")) {
         begin("今回の承認を見送っています。");
         send_view("Dismiss", g_variant_new("(s)", field("plan")));

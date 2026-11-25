@@ -1,4 +1,6 @@
 #!/usr/bin/make -f
+export MKNK_REQUIRE_GUI_SMOKE = 1
+
 %:
 	dh $@ --buildsystem=meson
 

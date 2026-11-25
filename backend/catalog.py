@@ -112,7 +112,13 @@ class Session:
             return {x.lower() for x in items}
         approved = (checksums(self.client.get_approved_firmware(None))
                     if remote.get("ApprovalRequired") else None)
-        return approved, checksums(self.client.get_blocked_firmware(None))
+        if fw.version_key(self.version, None) >= fw.version_key("2.1.1", None):
+            return approved, set()
+        # The 2.1.1 client stub also rejects calls to older daemons that still enforce this list.
+        blocked = self.bus.call_sync(
+            self.owner, "/", fw.FWUPD_ID, "GetBlockedFirmware", None,
+            self.GLib.VariantType.new("(as)"), 0, 5000, None).unpack()[0]
+        return approved, checksums(blocked)
 
 
 def signature_json(signature):
@@ -329,21 +335,38 @@ def write_sealed(stream, data):
     stream.seek(0)
 
 
-def fetch_release(release, remote, cabinet, settings, size, session):
+def signed_cab_locations(entries):
+    locations = []
+    for entry in entries:
+        artifact = fw.catalog_cab_artifact(entry)
+        nodes = artifact.findall("location") if artifact is not None else []
+        nodes.extend(entry.findall("location"))
+        locations.extend(node.text for node in nodes if node.text)
+    return dict.fromkeys(locations)
+
+
+def fetch_release(release, remote, cabinet, settings, size, session, entries):
     native = session.native_remote(remote)
     bases = fw.cab_bases(settings)
     configured = [fw.https_origin_path(p) for p in settings.get("cab_base_uris", [])]
     mirror_origin = fw.https_origin_path(remote["MetadataUri"])[:2]
     locations = []
     authenticated_urls = set()
-    for location in fw.strings(release, "Locations"):
+    indexed = set(fw.strings(release, "Locations"))
+    for location in signed_cab_locations(entries):
         try:
-            # A release URI itself may never provide credentials or query data.
+            # fwupd normally returns an already mapped Location, including /auth on a mirror.
+            # Apply its mapper to the signed source, then match the result against the index.
+            if re.search(r"[\x00-\x20\x7f\\?#]", location):
+                continue  # urljoin strips controls and empty query or fragment delimiters.
             input_uri = urljoin(remote["MetadataUri"], location)
             fw.https_origin_path(input_uri)
-            uri = protected_uri(native.build_firmware_uri(input_uri))
+            resolved = native.build_firmware_uri(input_uri)
+            uri = protected_uri(resolved)
             fw.require_cab_url(uri, bases)
-        except (fw.Hold, ValueError):
+        except (fw.Hold, ValueError, session.GLib.Error):
+            continue
+        if indexed.isdisjoint((resolved, uri, location)):
             continue
         locations.append(uri)
         h, port, path = fw.https_origin_path(uri)
@@ -355,9 +378,10 @@ def fetch_release(release, remote, cabinet, settings, size, session):
                         download_size=size, opener=opener)
 
 
-def verified_payload(cabinet, mode, release, remote, result, device, devices, guid, profile, session):
+def verified_payload(cabinet, mode, release, remote, result, device, devices, guid, profile, session,
+                     entries=()):
     if mode == "prepare":
-        fetch_release(release, remote, cabinet, profile, result.download_size, session)
+        fetch_release(release, remote, cabinet, profile, result.download_size, session, entries)
     size = sealed_size(cabinet, fw.CAB_DOWNLOAD_LIMIT)
     if result.download_size is not None and size != result.download_size:
         raise fw.Hold("固定した配布ファイルと署名サイズが一致しません。")
@@ -460,10 +484,11 @@ def evaluate(mode, guid, cabinet, session, settings, remote, components, report,
     if any({"blocked-approval", "blocked-version", "is-alternate-branch", "is-downgrade"}
            .intersection(fw.strings(r, "Flags")) for r in selected):
         raise fw.Hold("fwupdの配布条件により候補の適用が保留されています。")
-    entry = next((e for _, e in signed_entries(components, [release], remote_id, fmt)), None)
-    if entry is None:
+    bios_components = [component for component in components if guid in fw.component_guids(component)]
+    entries = [entry for _, entry in signed_entries(bios_components, [release], remote_id, fmt)]
+    if not entries:
         raise NeedsRefresh("配布元と候補の版・配布ファイルを照合できません。")
-    changes = release_notes(entry)
+    changes = release_notes(entries[0])
     shutdown = "needs-shutdown" in (flags | set(fw.strings(release, "Flags")))
     plan = dict(state="available", detail="この機種に適用できる更新があります。", target=release["Version"],
                 changes=changes, shutdown=shutdown, version_format=fmt, appstream_id=release["AppstreamId"])
@@ -475,7 +500,7 @@ def evaluate(mode, guid, cabinet, session, settings, remote, components, report,
     if mode != "check":
         profile = fw.support_profile(settings, guid, device)
         prepared, actual = verified_payload(cabinet, mode, release, remote, result, device, devices,
-                                           guid, profile, session)
+                                           guid, profile, session, entries)
         # A candidate can disappear while the user waits for a large download.
         latest = fw.candidate(device, releases=session.rows("get_upgrades", identifier), remote_id=remote_id)
         if (not latest or any(latest.get(k) != release.get(k) for k in ("AppstreamId", "Version", "Branch", "Flags"))

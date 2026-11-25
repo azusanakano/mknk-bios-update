@@ -12,6 +12,7 @@
 
 typedef struct {
     GDBusConnection *system, *session, *control;
+    GCancellable *query_check;
     char *service_owner, *request, *manager, *login, *client;
     gboolean cinnamon, reboot, finished, sent, query_ok;
     guint signal, watch, deadline, query_generation;
@@ -26,6 +27,7 @@ static void power_clear(gpointer data)
     g_clear_object(&p->system);
     g_clear_object(&p->session);
     g_clear_object(&p->control);
+    g_clear_object(&p->query_check);
     g_free(p->service_owner);
     g_free(p->request);
     g_free(p->manager);
@@ -131,17 +133,27 @@ static gboolean checks(Power *p, GCancellable *cancel, GError **error)
     gboolean inhibited;
     g_variant_get(blocked, "(b)", &inhibited);
     if (inhibited) return unavailable(error, "デスクトップで終了を妨げる作業が進行中です。");
-    g_autoptr(GVariant) fresh = call(p->control, p->service_owner, BIOS_PATH, BIOS_BUS,
-                                     "RecheckPower", g_variant_new("(s)", p->request),
-                                     G_VARIANT_TYPE_UNIT, cancel, error);
+    /* Reading the firmware inventory and hashing a capsule on the ESP can take
+     * much longer than a session-manager property lookup. */
+    g_autoptr(GVariant) fresh = g_dbus_connection_call_sync(p->control, p->service_owner, BIOS_PATH, BIOS_BUS,
+        "RecheckPower", g_variant_new("(s)", p->request), G_VARIANT_TYPE_UNIT,
+        G_DBUS_CALL_FLAGS_NO_AUTO_START, 120000, cancel, error);
     return fresh != NULL;
+}
+
+static void end_query(Power *p)
+{
+    ++p->query_generation;
+    g_clear_handle_id(&p->deadline, g_source_remove);
+    if (p->query_check) g_cancellable_cancel(p->query_check);
+    g_clear_object(&p->query_check);
 }
 
 static void finish(Power *p, gboolean cancelled, const char *message)
 {
     if (p->finished) return;
     p->finished = TRUE;
-    if (p->deadline) g_source_remove(p->deadline);
+    end_query(p);
     if (p->signal) g_dbus_connection_signal_unsubscribe(p->session, p->signal);
     if (p->watch) g_bus_unwatch_name(p->watch);
     if (p->client)
@@ -163,7 +175,6 @@ static gboolean deadline(gpointer data)
 {
     Power *p = data;
     p->deadline = 0;
-    p->query_generation++;
     respond(p, FALSE, "給電状態と起動予約の確認に時間がかかっています。");
     return G_SOURCE_REMOVE;
 }
@@ -185,6 +196,7 @@ static void query_done(GObject *source, GAsyncResult *result, gpointer data)
     gboolean ok = g_task_propagate_boolean(task, &error);
     if (p->finished || GPOINTER_TO_UINT(data) != p->query_generation) return;
     g_clear_handle_id(&p->deadline, g_source_remove);
+    g_clear_object(&p->query_check);
     p->query_ok = ok;
     respond(p, ok, ok ? "" : error->message);
 }
@@ -201,19 +213,18 @@ static void session_signal(GDBusConnection *bus, const char *sender, const char 
             return;
         }
         p->query_ok = FALSE;
-        ++p->query_generation;
-        g_clear_handle_id(&p->deadline, g_source_remove);
+        end_query(p);
         /* A desktop can show its usual waiting prompt while hardware is being
          * read. A late result still belongs to this query until it ends. */
         p->deadline = g_timeout_add_seconds(10, deadline, p);
-        g_autoptr(GTask) task = g_task_new(NULL, NULL, query_done, GUINT_TO_POINTER(p->query_generation));
+        p->query_check = g_cancellable_new();
+        g_autoptr(GTask) task = g_task_new(NULL, p->query_check, query_done, GUINT_TO_POINTER(p->query_generation));
         g_task_set_task_data(task, g_atomic_rc_box_acquire(p), release);
         g_task_run_in_thread(task, check_thread);
     } else if (g_str_equal(name, "CancelEndSession")) {
         finish(p, TRUE, "終了が取り消されました。更新の予約は保持されています。");
     } else if (g_str_equal(name, "EndSession")) {
-        ++p->query_generation;
-        g_clear_handle_id(&p->deadline, g_source_remove);
+        end_query(p);
         if (!p->sent) {
             respond(p, TRUE, "");
             finish(p, TRUE, "別の終了処理が先に始まりました。");

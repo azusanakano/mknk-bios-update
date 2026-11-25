@@ -110,6 +110,7 @@ class Service:
 
     def dispatch(self, sender, method, args):
         platform = self.engine.platform
+        receipt = method in ("Report", "ReportRejection")
         if method == "DeclineAuthorization":
             self.engine.decline_authorization(sender, args[0])
             return GLib.Variant("()", ()), None
@@ -119,15 +120,16 @@ class Service:
         try:
             actor = platform.actor(sender)
         except (Conflict, GLib.Error, OSError):
-            if method != "Report":
+            if not receipt:
                 raise
             # The journal binds the receipt to the original unique connection and bus.
             # A session switch removes write access to the view but does not lose its receipt.
             actor = Actor(sender, -1, "", platform.bus_id, False, "", "")
-        if self.peer_sender is not None and method not in ("Status", "Report") and not actor.writable:
+        if self.peer_sender is not None and method != "Status" and not receipt and not actor.writable:
             raise Conflict("操作するには、アクティブなローカル画面から開いてください。")
         views = {"Status": self.engine.status, "Check": self.engine.check, "Prepare": self.engine.prepare,
-                 "Dismiss": self.engine.dismiss, "Report": self.engine.report, "Replan": self.engine.replan}
+                 "Dismiss": self.engine.dismiss, "Report": self.engine.report, "Replan": self.engine.replan,
+                 "ReportRejection": self.engine.report_rejection, "TakeOver": self.engine.take_over}
         if method in views:
             return GLib.Variant("(s)", (json.dumps(views[method](actor, *args), ensure_ascii=False),)), None
         if method == "Authorize":
@@ -159,7 +161,8 @@ class Service:
         except Exception as exc:
             print(f"{method}: {type(exc).__name__}", file=sys.stderr, flush=True)
             invocation.return_dbus_error(NAME + ".Unavailable", "必要な機器・サービス情報を確認できません。状態を再確認してください。")
-        if method in ("Authorize", "DeclineAuthorization", "Report", "Replan", "Dismiss", "Power", "ReplyPower"):
+        if method in ("Authorize", "DeclineAuthorization", "Report", "ReportRejection",
+                      "Replan", "Dismiss", "TakeOver", "Power", "ReplyPower"):
             self.observation_changed()
         return False
 

@@ -14,6 +14,7 @@ install_data('data/io.github.mknk.BiosUpdate.desktop', install_dir: get_option('
 install_data('data/io.github.mknk.BiosUpdate1.xml', install_dir: get_option('datadir') / 'dbus-1/interfaces')
 install_data('data/io.github.mknk.BiosUpdate1.conf', install_dir: get_option('datadir') / 'dbus-1/system.d')
 install_data('data/io.github.mknk.BiosUpdate1.service', install_dir: get_option('datadir') / 'dbus-1/system-services')
+install_data('data/io.github.mknk.BiosUpdate1.policy', install_dir: get_option('datadir') / 'polkit-1/actions')
 install_data('data/mknk-bios-update.service', install_dir: 'lib/systemd/system')
 install_data('data/mknk-bios-update.sysusers', rename: 'mknk-bios-update.conf', install_dir: 'lib/sysusers.d')
 install_data('data/mknk-bios-update-login.desktop', install_dir: get_option('sysconfdir') / 'xdg/autostart')

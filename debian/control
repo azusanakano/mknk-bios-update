@@ -2,7 +2,10 @@ Source: mknk-bios-update
 Section: admin
 Priority: optional
 Maintainer: MKNK BIOS Update contributors <mknk-bios-update@localhost>
-Build-Depends: debhelper-compat (= 13), meson, pkgconf, libgtk-4-dev, libjson-glib-dev, python3, python3-gi <!nocheck>, gir1.2-fwupd-2.0 (>= 2.0.20) <!nocheck>, gir1.2-jcat-1.0 <!nocheck>, openssl <!nocheck>, dbus-daemon, xvfb, xauth
+Build-Depends: debhelper-compat (= 13), meson, pkgconf, libgtk-4-dev, libjson-glib-dev, python3,
+ python3-gi <!nocheck>, gir1.2-fwupd-2.0 (>= 2.0.20) <!nocheck>,
+ gir1.2-jcat-1.0 <!nocheck>, gir1.2-atspi-2.0 <!nocheck>, openssl <!nocheck>,
+ dbus-daemon, xvfb, xauth, python3-xlib <!nocheck>, xdotool <!nocheck>
 Standards-Version: 4.6.2
 Rules-Requires-Root: no
 

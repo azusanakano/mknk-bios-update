@@ -6,7 +6,6 @@ import os
 import re
 import secrets
 import signal
-import subprocess
 import sys
 from pathlib import Path
 from threading import Lock
@@ -17,7 +16,7 @@ sys.path.insert(0, str(BACKEND))
 from gi.repository import Gio, GLib
 from engine import Engine
 from journal import Conflict, Journal
-from platform_linux import DBUS, DBUS_PATH, Platform
+from platform_linux import DBUS, DBUS_PATH, Platform, WorkerNotStarted
 from service import NAME, Service, machine_state
 
 
@@ -96,19 +95,11 @@ class PortablePlatform(Platform):
         # disconnect, then let the engine finish its journal transaction and close FDs.
         with self.worker_lock:
             if self.revoked:
-                raise Conflict(GUI_ERROR)
-            child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.DEVNULL, **options)
+                raise WorkerNotStarted(GUI_ERROR)
+            child = self.start_worker(command, **options)
             self.workers.add(child)
         try:
-            with child:
-                try:
-                    stdout, _ = child.communicate(request, timeout=240)
-                except subprocess.TimeoutExpired:
-                    child.kill()
-                    child.communicate()
-                    raise Conflict("配布情報の検証がタイムアウトしました。")
-            return subprocess.CompletedProcess(command, child.returncode, stdout)
+            return self.collect_worker(child, request)
         finally:
             with self.worker_lock:
                 self.workers.discard(child)

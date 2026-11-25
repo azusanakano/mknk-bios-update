@@ -53,7 +53,7 @@ class ObservationTest(unittest.TestCase):
         fw.EFI_PLATFORM_SIZE.write_text("64")
         self.esrt = fw.ESRT / "entry0"
         self.esrt.mkdir()
-        for key, value in dict(fw_type="1", fw_class=GUID, fw_version="1",
+        for key, value in dict(fw_type="1", fw_class=GUID, fw_version="1", capsule_flags="0",
                                last_attempt_version="0", last_attempt_status="0").items():
             (self.esrt / key).write_text(value)
         dmi = dict(zip(fw.MODEL_FIELDS, ("Test Co", "Notebook", "NB-16", "Board", "rev-b")))
@@ -188,7 +188,7 @@ class ObservationTest(unittest.TestCase):
         self.var("BootNext", struct.pack("<H", 2))
         self.assertEqual(hw.observe(self.plan)["reservation"], "foreign")
 
-    def test_optional_display_registration_requires_the_verified_bitmap_and_bios(self):
+    def stage_cod_with_display(self):
         dib = struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 24, 0, 4, 0, 0, 0, 0)
         bmp = struct.pack("<2sIII", b"BM", 58, 0, 54) + dib + bytes(4)
         ux_guid = uuid.UUID(hw.UX_GUID).bytes_le
@@ -204,14 +204,43 @@ class ObservationTest(unittest.TestCase):
         display = self.esp / route["ux_file"]
         display.parent.mkdir(parents=True)
         display.write_bytes(capsule)
-        info = struct.pack("<I16sIQ16sI", 7, ux_guid, 0, 0, bytes(16), 1)
+        # fwupd records the device's x86 capsule flags, even for the display asset.
+        info = struct.pack("<I16sIQ16sI", 7, ux_guid, 0x50000, 0, bytes(16), 1)
         self.var("fwupd-ux-capsule", info + file_path(route["ux_file"]), fw.FWUPDATE_GUID)
+        return bios, display
+
+    def test_optional_display_registration_requires_the_verified_bitmap_and_bios(self):
+        bios, display = self.stage_cod_with_display()
+        capsule = display.read_bytes()
         self.assertEqual(hw.observe(self.plan)["reservation"], "matching")
         display.write_bytes(capsule[:-1] + b"!")
         self.assertFalse(hw.observe(self.plan)["power"])
         display.write_bytes(capsule)
         bios.unlink()
         self.assertFalse(hw.observe(self.plan)["power"])
+
+    def test_completed_cod_with_only_its_verified_display_registration(self):
+        bios, display = self.stage_cod_with_display()
+        bios.unlink()
+        self.var("OsIndications", struct.pack("<Q", 0))
+        self.device["Version"] = "2"
+        (self.esrt / "fw_version").write_text("2")
+        self.assertNotEqual(hw.observe(self.plan)["reservation"], "clear")
+
+        fw.BOOT_ID.write_text(str(uuid.uuid4()))
+        obs = hw.observe(self.plan)
+        self.assertEqual(obs["reservation"], "clear", obs["detail"])
+        self.assertIn("表示", obs["prepare_block"])
+        self.assertFalse(obs["power"])
+
+        self.history.append(dict(DeviceId=self.device["DeviceId"], UpdateState=1))
+        self.assertNotEqual(hw.observe(self.plan)["reservation"], "clear")
+        self.history.clear()
+        self.var("BootNext", struct.pack("<H", 2))
+        self.assertEqual(hw.observe(self.plan)["reservation"], "foreign")
+        (fw.EFIVARS / f"BootNext-{fw.EFI_GLOBAL}").unlink()
+        display.unlink()
+        self.assertEqual(hw.observe(self.plan)["reservation"], "unknown")
 
     def test_baseline_failure_and_unreadable_attempt_are_never_success(self):
         self.stage_cod()
@@ -229,6 +258,32 @@ class ObservationTest(unittest.TestCase):
         self.assertIsNone(hw.observe(self.plan)["attempt_status"])
         self.assertFalse(hw.observe(self.plan)["attempt_comparable"])
 
+    def test_changed_failure_with_unrecorded_attempt_version_requires_review(self):
+        capsule = self.stage_cod()
+        platform = Machine()
+        platform.observe = hw.observe
+        actor = platform.actor(":1.2")
+        journal = Journal(self.root / "journal")
+        operation = dict(self.plan, machine=journal.machine_key(MACHINE), id="update", uid=actor.uid)
+        journal.issue(operation, actor.sender, ":1.6", actor.bus)
+        engine = Engine(journal, platform)
+        fw.BOOT_ID.write_text(str(uuid.uuid4()))
+        (self.esrt / "last_attempt_status").write_text("3")
+
+        pending = engine.status(actor)
+        self.assertEqual(pending["state"], "hold")
+        self.assertFalse(pending["can_power"])
+        self.assertFalse(pending["can_replan"])
+
+        capsule.unlink()
+        self.var("OsIndications", struct.pack("<Q", 0))
+        self.device["Version"] = "2"
+        (self.esrt / "fw_version").write_text("2")
+        cleared = engine.status(actor)
+        self.assertEqual((cleared["state"], cleared["current"]), ("hold", "2"))
+        self.assertTrue(cleared["can_replan"])
+        self.assertIsNone(journal.active()["outcome"])
+
     def test_processed_cod_file_is_distinguished_after_boot(self):
         self.stage_cod()
         self.device["Version"] = "2"
@@ -238,8 +293,10 @@ class ObservationTest(unittest.TestCase):
         obs = hw.observe(self.plan)
         self.assertEqual(obs["reservation"], "clear")
         self.assertIn("残っています", obs["detail"])
+        self.assertIn("カプセル", obs.get("prepare_block", ""))
         self.assertFalse(obs["power"])
         (self.esp / self.plan["binding"]["file"]).unlink()
+        self.assertFalse(hw.observe(self.plan).get("prepare_block"))
         self.disk.return_value = "replacement-disk-with-cloned-partuuid"
         self.assertEqual(hw.observe(self.plan)["reservation"], "unknown")
 
@@ -265,7 +322,11 @@ class ObservationTest(unittest.TestCase):
         self.assertFalse(status["can_power"])
         self.assertIn("残っています", status["detail"])
         platform.candidate.update(guid=GUID, current="2", version_format="number", target="3")
-        self.assertEqual(engine.check(actor)["state"], "available")
+        checked = engine.check(actor)
+        self.assertEqual((checked["state"], checked["target"]), ("hold", "3"))
+        self.assertTrue(checked["can_check"])
+        self.assertFalse(checked["can_prepare"])
+        self.assertIn("カプセル", checked["detail"])
         with self.assertRaises(hw.Hold):
             hw.preflight(dict(self.plan, boot=fw.BOOT_ID.read_text(), current="2", target="3"))
 
@@ -344,7 +405,7 @@ class ObservationTest(unittest.TestCase):
         with self.assertRaisesRegex(hw.Hold, "空き容量"):
             hw.preflight(self.plan)
 
-    def stage_nvram(self, secure):
+    def stage_nvram(self, secure, registration_flags=0x50000):
         self.var("SecureBoot", bytes([secure]))
         self.profile["secure_boot"] = {"delivery": "shim" if secure else "nvram",
                                        "efi_app_dir": str(self.root), "esp_vendor_dir": "ubuntu"}
@@ -371,7 +432,7 @@ class ObservationTest(unittest.TestCase):
         image.write_bytes(self.payload)
         (self.esp / route["loader"]).write_bytes(loader)
         self.var("BootNext", struct.pack("<H", 7))
-        info = struct.pack("<I16sIQ16sI", 7, uuid.UUID(GUID).bytes_le, 0, 0, bytes(16), 1)
+        info = struct.pack("<I16sIQ16sI", 7, uuid.UUID(GUID).bytes_le, registration_flags, 0, bytes(16), 1)
         self.var(f"fwupd-{GUID}-0", info + file_path(route["file"]), fw.FWUPDATE_GUID)
         return route, info
 
@@ -384,6 +445,44 @@ class ObservationTest(unittest.TestCase):
         self.var(f"fwupd-{GUID}-0", info + file_path(route["file"], number=2), fw.FWUPDATE_GUID)
         with self.assertRaisesRegex(hw.Hold, "ESP"):
             hw.check_power_action(self.plan, hw.observe(self.plan))
+
+    def test_nvram_flags_must_match_the_esrt_and_approved_registration(self):
+        # fwupd only supplies BOTH x86 reset flags when NEITHER is present.
+        (self.esrt / "capsule_flags").write_text("0x10041")
+        route, info = self.stage_nvram(False, registration_flags=0x10041)
+        self.var("Boot0007", boot_option("Linux Firmware Updater", file_path(route["loader"])))
+        self.assertEqual(hw.check_power_action(self.plan, hw.observe(self.plan)), "reboot")
+
+        saved_info = info + file_path(route["file"])
+        changed = bytearray(saved_info)
+        struct.pack_into("<I", changed, 20, 0x50041)
+        self.var(f"fwupd-{GUID}-0", changed, fw.FWUPDATE_GUID)
+        self.assertFalse(hw.observe(self.plan)["power"])
+        self.var(f"fwupd-{GUID}-0", saved_info, fw.FWUPDATE_GUID)
+
+        (self.esrt / "capsule_flags").write_text("0x40041")
+        self.assertFalse(hw.observe(self.plan)["power"])
+        (self.esrt / "capsule_flags").write_text("0x10041")
+        legacy_route = dict(route)
+        legacy_route.pop("capsule_flags", None)
+        legacy = dict(self.plan, binding=legacy_route)
+        observed = hw.observe(legacy)
+        self.assertEqual(observed["power"], "reboot", observed["detail"])
+        self.assertEqual(hw.check_power_action(legacy, observed), "reboot")
+        self.assertFalse(hw.observe(dict(legacy, binding=dict(legacy_route, loader_sha256="0" * 64)))["power"])
+        self.var(f"fwupd-{GUID}-0", changed, fw.FWUPDATE_GUID)
+        self.assertFalse(hw.observe(legacy)["power"])
+        self.var(f"fwupd-{GUID}-0", saved_info, fw.FWUPDATE_GUID)
+        (self.esrt / "capsule_flags").unlink()
+        self.assertFalse(hw.observe(legacy)["power"])
+        (fw.EFIVARS / f"BootNext-{fw.EFI_GLOBAL}").unlink()
+        (fw.EFIVARS / f"fwupd-{GUID}-0-{fw.FWUPDATE_GUID}").unlink()
+        self.assertEqual(hw.observe(legacy)["reservation"], "clear")
+
+    def test_nvram_preflight_requires_readable_esrt_capsule_flags(self):
+        (self.esrt / "capsule_flags").unlink()
+        with self.assertRaisesRegex(hw.Hold, "フラグ"):
+            self.stage_nvram(False)
 
     def test_secure_boot_shim_load_option_matches_fwupd_2_0_20(self):
         route, _ = self.stage_nvram(True)

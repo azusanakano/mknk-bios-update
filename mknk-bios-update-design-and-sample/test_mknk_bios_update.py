@@ -580,7 +580,7 @@ class StableCatalogTest(unittest.TestCase):
                        secure_boot_after=b"\x01", disk_support_after=4, boot_order_after=3,
                        boot_order_during_authorization=None, policy=(None, frozenset()), policy_after=None,
                        initial_xml=None, initial_release=None, latest_release=None, cabinet_bytes=None,
-                       expected_output=None):
+                       expected_output=None, esp_options=("rw", "rw")):
         verify_path = "/proc/self/fd/23"
         with TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -617,6 +617,8 @@ class StableCatalogTest(unittest.TestCase):
                 return "yes"
 
             def sudo(args, _purpose):
+                if esp_options != ("rw", "rw"):
+                    self.fail("A read-only ESP must stop preparation before the request marker")
                 self.assertEqual(Path(args[-1]), marker)
                 if args[0] == "/usr/bin/mkdir":
                     marker.mkdir()
@@ -644,7 +646,7 @@ class StableCatalogTest(unittest.TestCase):
                                  load_stable_catalog=catalog,
                                  candidate=Mock(side_effect=[release, latest_release or release]),
                                  marker_path=Mock(return_value=marker), sudo_command=sudo,
-                                 MOUNTINFO=ReadinessTest.mountinfo(base),
+                                 MOUNTINFO=ReadinessTest.mountinfo(base, esp_options=esp_options),
                                  find_esp=Mock(return_value=(esp, self.guid)), check_power=Mock(),
                                  open_cabinet=Mock(return_value=nullcontext(cabinet)),
                                  fetch_cab=Mock(return_value=verify_path), verify_cab=verify),
@@ -660,7 +662,7 @@ class StableCatalogTest(unittest.TestCase):
                     send.assert_called_once_with([updater.FWUPDMGR, "--no-reboot-check", "local-install",
                                                   verify_path, bios["DeviceId"]], pass_fds=(23,))
                     self.assertTrue(marker.is_dir())
-                self.assertEqual(catalog.call_count, 2)
+                self.assertEqual(catalog.call_count, 2 if esp_options == ("rw", "rw") else 0)
                 if expected_output:
                     self.assertIn(expected_output, output.getvalue())
 
@@ -732,6 +734,11 @@ class StableCatalogTest(unittest.TestCase):
 
     def test_apply_rechecks_which_esp_boot_order_selects_after_approval(self):
         self.exercise_apply(self.signed_xml, boot_order_after=4, expected_error="Boot0004")
+
+    def test_apply_stops_before_marking_or_sending_on_a_read_only_esp(self):
+        for opts in (("ro,nosuid", "rw"), ("rw,nosuid", "ro")):
+            with self.subTest(esp_options=opts):
+                self.exercise_apply(self.signed_xml, esp_options=opts, expected_error="読み取り専用")
 
     def test_apply_rechecks_boot_order_after_authorizing_the_request_marker(self):
         self.exercise_apply(self.signed_xml, boot_order_during_authorization=4, expected_error="Boot0004")
@@ -1049,11 +1056,11 @@ class ReservationStatusTest(unittest.TestCase):
 
 class ReadinessTest(unittest.TestCase):
     @staticmethod
-    def mountinfo(base, *, mount_options="rw", super_options="rw"):
+    def mountinfo(base, *, mount_options="rw", super_options="rw", esp_options=("rw", "rw")):
         esp, efivars = base / "esp", base / "efivars"
         path = base / "mountinfo"
         path.write_text(f"20 1 0:1 / {efivars} {mount_options} - efivarfs efivarfs {super_options}\n"
-                        f"21 1 8:1 / {esp} rw - vfat /dev/sda1 rw\n", encoding="utf-8")
+                        f"21 1 8:1 / {esp} {esp_options[0]} - vfat /dev/sda1 {esp_options[1]}\n", encoding="utf-8")
         return path
 
     def check_secure_boot_readiness(self, base, profile, *, mount_options="rw", super_options="rw"):
@@ -1115,6 +1122,23 @@ class ReadinessTest(unittest.TestCase):
                           redirect_stdout(io.StringIO()) as output):
                         updater.show_reservations(str(BootEntryTest.esp))
                     self.assertIn("標準の配送指示なし", output.getvalue())
+
+    def test_read_only_esp_still_reports_existing_capsule_files(self):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            variables, esp = base / "efivars", base / "esp"
+            variables.mkdir()
+            delivery = esp / updater.STANDARD_CAPSULE_DIR
+            delivery.mkdir(parents=True)
+            (delivery / "old.cap").write_bytes(b"fixture")
+            for opts in (("ro,nosuid", "rw"), ("rw,nosuid", "ro")):
+                with (self.subTest(esp_options=opts),
+                      patch.object(updater, "MOUNTINFO", self.mountinfo(base, esp_options=opts)),
+                      patch.object(updater, "EFIVARS", variables),
+                      patch.object(updater, "find_esp", return_value=(esp, str(BootEntryTest.esp))),
+                      redirect_stdout(io.StringIO()) as output):
+                    updater.show_reservations(str(BootEntryTest.esp))
+                    self.assertIn(updater.STANDARD_CAPSULE_DIR, output.getvalue())
 
     @staticmethod
     def x64_efi_fixture():
@@ -1285,7 +1309,8 @@ class ReadinessTest(unittest.TestCase):
             previous = esp / "EFI/dell/bios/recovery/BIOS_TRS.rcv"
             previous.parent.mkdir(parents=True)
             previous.write_bytes(b"fixture")
-            with (patch.object(updater, "mount_points", return_value={}),
+            mount = updater.MountPoint(21, "8:1", "/", "vfat", False)
+            with (patch.object(updater, "mount_points", return_value={str(esp): mount}),
                   patch.object(updater, "require_efivarfs"),
                   patch.object(updater, "find_esp", return_value=(esp, str(BootEntryTest.esp))),
                   patch.object(updater, "fwupd_efi_state", return_value=([], None)),

@@ -25,6 +25,10 @@ GUI = "/usr/bin/mknk-bios-update"
 WORKER = Path(__file__).with_name("worker.py")
 
 
+class WorkerNotStarted(Conflict):
+    """No child was started, so no D-Bus request can be in flight."""
+
+
 @dataclass(frozen=True)
 class BusProcess:
     uid: int
@@ -115,6 +119,25 @@ class Platform:
         if owner != unique or not unique.startswith(":"):
             raise Conflict("fwupd が再起動しました。実機と配布情報を再照合してください。")
 
+    def require_administrator(self, actor):
+        authority = "org.freedesktop.PolicyKit1"
+        subject = ("system-bus-name", {"name": GLib.Variant("s", actor.sender)})
+        action = "io.github.mknk.BiosUpdate1.release-approval"
+        details = {}
+        if self.portable:
+            # Portable mode uses the OS's built-in administrator challenge.
+            action = "org.freedesktop.policykit.exec"
+            details["polkit.message"] = "別の利用者が承認した未送信の BIOS 更新計画を解除します。"
+        params = GLib.Variant("((sa{sv})sa{ss}us)", (subject, action, details, 1, ""))
+        try:
+            reply = self.bus.call_sync(authority, "/org/freedesktop/PolicyKit1/Authority", authority + ".Authority",
+                                       "CheckAuthorization", params, GLib.VariantType.new("((bba{ss}))"),
+                                       Gio.DBusCallFlags.NONE, 120000, None)
+        except GLib.Error as exc:
+            raise Conflict("承認の解除に必要な管理者認証を完了できませんでした。") from exc
+        if reply.unpack()[0][0] is not True:
+            raise Conflict("承認の解除に必要な管理者認証を完了できませんでした。")
+
     @contextmanager
     def claim(self, plan):
         # Old copies of the terminal client already use this exact per-boot mkdir.
@@ -166,10 +189,28 @@ class Platform:
                 if other.get("Class") in ("user", "user-early") and other.get("State") != "closing":
                     raise Conflict("別のログインセッションで作業中です。保存してログアウトしてください。")
 
-    def execute_worker(self, command, request, **options):
-        return subprocess.run(command, input=request, capture_output=True, timeout=240, check=False, **options)
+    def start_worker(self, command, **options):
+        try:
+            return subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, **options)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            raise WorkerNotStarted("配布情報の検証プロセスを起動できませんでした。") from exc
 
-    def run_worker(self, mode, guid, files=(), **args):
+    @staticmethod
+    def collect_worker(child, request):
+        with child:
+            try:
+                stdout, _ = child.communicate(request, timeout=240)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.communicate()
+                raise Conflict("配布情報の検証がタイムアウトしました。")
+        return subprocess.CompletedProcess(child.args, child.returncode, stdout)
+
+    def execute_worker(self, command, request, **options):
+        return self.collect_worker(self.start_worker(command, **options), request)
+
+    def run_worker(self, mode, guid, files=(), *, before_start=None, **args):
         account = self.worker_user
         desc = [f.fileno() for f in files]
         env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "HOME": "/nonexistent",
@@ -183,6 +224,8 @@ class Platform:
             python.append("-S")
             args["profile"] = fw.read_settings()
         request = json.dumps(dict(mode=mode, guid=guid, fds=desc, **args)).encode()
+        if before_start is not None:
+            before_start()
         result = self.execute_worker([*python, str(WORKER)], request, pass_fds=tuple(desc),
                                      user=account.pw_uid, group=account.pw_gid, extra_groups=[], cwd="/", env=env)
         if result.returncode or len(result.stdout) > 256 * 1024:
@@ -222,15 +265,22 @@ class Platform:
             db.catalog_generation(item["signed_timestamp"], item["catalog_sha256"])
             pid = self.call(DBUS, DBUS_PATH, DBUS, "GetConnectionUnixProcessID", "(s)", (owner,))[0]
             start = (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[19]
-            check_caller()
-            self.confirm_owner(owner)
-            db.setting("metadata-request", dict(boot=fw.BOOT_ID.read_text().strip(), pid=pid, start=start,
-                                               bus=self.bus_id, owner=owner, digest=item["catalog_sha256"]))
             for stream in (xml, sig):
                 stream.seek(0)
-            response = self.run_worker("import", guid, (xml, sig), owner=owner, remote=item["remote_id"],
-                                       settings_fingerprint=item["settings_fingerprint"],
-                                       remote_fingerprint=item["remote_fingerprint"])
+
+            def record_import():
+                check_caller()
+                self.confirm_owner(owner)
+                db.setting("metadata-request", dict(boot=fw.BOOT_ID.read_text().strip(), pid=pid, start=start,
+                                                   bus=self.bus_id, owner=owner, digest=item["catalog_sha256"]))
+
+            try:
+                response = self.run_worker("import", guid, (xml, sig), before_start=record_import, owner=owner,
+                                           remote=item["remote_id"], settings_fingerprint=item["settings_fingerprint"],
+                                           remote_fingerprint=item["remote_fingerprint"])
+            except WorkerNotStarted:
+                db.setting("metadata-request", {})
+                raise
             if response.get("terminal"):
                 db.setting("metadata-request", {})
             if not response.get("ok"):
