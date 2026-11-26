@@ -62,20 +62,12 @@ class Session:
         self.owner = self.current_owner()
         # Read the property from the same unique owner that the service will
         # confirm before using the signature generation.
-        self.version = self.bus.call_sync(
-            self.owner, "/", "org.freedesktop.DBus.Properties", "Get",
-            self.GLib.Variant("(ss)", (fw.FWUPD_ID, "DaemonVersion")),
-            self.GLib.VariantType.new("(v)"), Gio.DBusCallFlags.NO_AUTO_START, 5000, None).unpack()[0]
-        if not isinstance(self.version, str) or not re.fullmatch(r"[0-9]{1,9}(?:\.[0-9]{1,9}){2}", self.version):
-            raise fw.Hold("fwupdの版を確認できません。")
+        self.version = fw.fwupd_daemon_version(self.bus, self.GLib, self.owner, Gio.DBusCallFlags.NO_AUTO_START)
         if fw.version_key(self.version, None) < fw.version_key(MIN_DAEMON_VERSION, None):
             raise fw.Hold(f"更新機能には fwupd {MIN_DAEMON_VERSION} 以降が必要です（稼働中の版は {self.version}）。")
 
     def current_owner(self):
-        return self.bus.call_sync(
-            "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
-            "GetNameOwner", self.GLib.Variant("(s)", (fw.FWUPD_ID,)),
-            self.GLib.VariantType.new("(s)"), 0, 5000, None).unpack()[0]
+        return fw.fwupd_daemon_owner(self.bus, self.GLib)
 
     def rows(self, operation, *args):
         try:
@@ -111,19 +103,7 @@ class Session:
         return item
 
     def policy(self, remote):
-        def checksums(items):
-            if not isinstance(items, (list, tuple)) or not all(isinstance(x, str) for x in items):
-                raise fw.Hold("管理者の配布制限を確認できません。")
-            return {x.lower() for x in items}
-        approved = (checksums(self.client.get_approved_firmware(None))
-                    if remote.get("ApprovalRequired") else None)
-        if fw.version_key(self.version, None) >= fw.version_key("2.1.1", None):
-            return approved, set()
-        # The 2.1.1 client stub also rejects calls to older daemons that still enforce this list.
-        blocked = self.bus.call_sync(
-            self.owner, "/", fw.FWUPD_ID, "GetBlockedFirmware", None,
-            self.GLib.VariantType.new("(as)"), 0, 5000, None).unpack()[0]
-        return approved, checksums(blocked)
+        return fw.firmware_policy(self.client, self.bus, self.GLib, self.owner, self.version, remote)
 
 
 def signature_json(signature):
@@ -388,6 +368,31 @@ def fetch_release(release, remote, cabinet, settings, size, session, entries):
                         download_size=size, opener=opener)
 
 
+def esrt_target_raw(raw, version, fmt):
+    if re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)", raw):
+        number = int(raw, 16 if raw.lower().startswith("0x") else 10)
+    else:
+        # Only invert formats that preserve all 32 bits. Dell formats omit a byte,
+        # and the BCD conversion can map different byte values to the same number.
+        widths = {"quad": (8, 8, 8, 8), "triplet": (8, 8, 16), "pair": (16, 16)}.get(fmt, ())
+        parts = raw.split(".")
+        if len(parts) != len(widths) or not all(re.fullmatch(r"[0-9]+", part) for part in parts):
+            return None
+        number = 0
+        for part, bits in zip(parts, widths):
+            component = int(part)
+            if component >= 1 << bits:
+                return None
+            number = (number << bits) | component
+    if not 0 < number <= 0xffffffff:
+        return None
+    display = fw.esrt_version(str(number), fmt)
+    key = fw.version_key(display, fmt)
+    if ("." not in raw or key == fw.version_key(raw, fmt)) and key == fw.version_key(version, fmt):
+        return number
+    return None
+
+
 def verified_payload(cabinet, mode, release, remote, result, device, devices, guid, profile, session,
                      entries=()):
     if mode == "prepare":
@@ -406,13 +411,7 @@ def verified_payload(cabinet, mode, release, remote, result, device, devices, gu
     if not payload.startswith((fw.FMP_CAPSULE, uuid.UUID(guid).bytes_le)):
         raise fw.Hold("配送時に変更されるメーカー形式のカプセルを予約内容と照合できません。")
     fw.capsule_header_size(payload, 0)
-    target_raw = None
-    if re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)", raw):
-        number = int(raw, 16 if raw.lower().startswith("0x") else 10)
-        fmt = device["VersionFormat"]
-        if (0 < number <= 0xffffffff
-                and fw.version_key(fw.esrt_version(raw, fmt), fmt) == fw.version_key(release["Version"], fmt)):
-            target_raw = number
+    target_raw = esrt_target_raw(raw, release["Version"], device["VersionFormat"])
     plan = dict(checksum=actual["sha256"], cab_sha512=actual["sha512"], payload_sha256=hashlib.sha256(payload).hexdigest(),
                 payload_size=len(payload), scope=scope, target_raw=target_raw)
     return plan, set(actual.values())
@@ -499,6 +498,7 @@ def evaluate(mode, guid, cabinet, session, settings, remote, components, report,
     if not entries:
         raise NeedsRefresh("配布元と候補の版・配布ファイルを照合できません。")
     changes = release_notes(entries[0])
+    community = any("is-community" in fw.strings(r, "Flags") for r in (release, *selected))
     shutdown = "needs-shutdown" in (flags | set(fw.strings(release, "Flags")))
     plan = dict(state="available", detail="この機種に適用できる更新があります。", target=release["Version"],
                 changes=changes, shutdown=shutdown, version_format=fmt, appstream_id=release["AppstreamId"])
@@ -506,6 +506,9 @@ def evaluate(mode, guid, cabinet, session, settings, remote, components, report,
                    device.get("Branch"), device.get("CompositeId"), release["AppstreamId"], plan["target"],
                    result.hashes, report["catalog_sha256"], remote_id, report["remote_fingerprint"],
                    report["settings_fingerprint"], session.owner, session.version, shutdown]
+    if community:
+        plan["source"] = f"{report['source']}（{fw.COMMUNITY_SUPPORT_NOTICE}）"
+        token_input.append("is-community")
     plan["token"] = fingerprint(token_input)
     if mode != "check":
         profile = fw.support_profile(settings, guid, device)
@@ -537,8 +540,13 @@ def run(mode, guid, cabinet=None, metadata=None, signature=None):
         guid, device, devices = fw.inventory(guid, devices=session.rows("get_devices"))
         if sum(d.get("DeviceId") == device["DeviceId"] for d in devices) != 1:
             raise fw.Hold("実機のデバイス識別子が重複しています。")
-        source = ("LVFS 安定版" if remote["MetadataUri"] in fw.LVFS_METADATA_URIS
-                  else "安定版ミラー " + fw.https_origin_path(remote["MetadataUri"])[0])
+        metadata_uri = remote["MetadataUri"]
+        if metadata_uri in fw.LVFS_METADATA_URIS:
+            source = "LVFS 安定版"
+        else:
+            source = "安定版ミラー " + fw.https_origin_path(metadata_uri)[0]
+            # Neither the catalog signature time nor the local cache age identifies a mirror sync.
+            report["synced"] = "未確認"
         report.update(device=device["DeviceId"], current=device["Version"], source=source,
                       daemon_owner=session.owner, remote_id=remote["Id"], settings_fingerprint=fingerprint(settings),
                       remote_fingerprint=remote_fingerprint(remote))

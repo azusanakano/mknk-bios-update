@@ -1,4 +1,5 @@
 """The portable transport on an isolated message bus, with no firmware or power operations."""
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -15,7 +16,6 @@ from unittest.mock import patch
 
 if sys.platform == "linux":
     import fcntl
-    from dataclasses import replace
     from gi.repository import Gio, GLib
     repo = Path(__file__).resolve().parents[1]
     sys.path[:0] = [str(repo / "backend"), str(repo)]
@@ -68,6 +68,18 @@ def gui_fixture(address):
 
 
 class PortableViewTest(unittest.TestCase):
+    def test_user_scope_prompts_for_explicit_access_before_catalog_check(self):
+        from test_engine import Machine
+        from engine import Engine
+        from journal import Journal
+        platform = Machine()
+        platform.portable = True
+        actor = replace(platform.actor(":2.0"), can_open_plan=True)
+        with tempfile.TemporaryDirectory() as temp:
+            view = Engine(Journal(Path(temp) / "history"), platform).status(actor)
+        self.assertTrue(view.get("can_open_plan"))
+        self.assertFalse(view["can_check"])
+
     def test_indirect_session_explains_how_to_reopen_the_appimage(self):
         from test_engine import Machine
         from engine import Engine
@@ -105,7 +117,9 @@ class PortablePeerTest(unittest.TestCase):
                 executable=f"/proc/self/fd/{executable.fileno()}", pass_fds=(executable.fileno(),),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(self.close_gui)
-        self.sender = self.line()
+        # Starting a sealed Python/GIO process can take much longer than a
+        # response on its established connection, particularly in a VM.
+        self.sender = self.line(timeout=float(os.environ.get("MKNK_TEST_GUI_START_TIMEOUT", "60")))
 
         class FixturePlatform(PortablePlatform):
             def call(self, name, path, iface, method, signature=None, args=()):
@@ -123,14 +137,15 @@ class PortablePeerTest(unittest.TestCase):
             def status(self, actor):
                 return dict(sender=actor.sender, uid=actor.uid, writable=actor.writable, process=actor.process)
 
-            def authorize(self, actor, plan):
+            def authorize(self, actor, plan, *, prepare_reply):
                 self.required(actor)
                 cabinet = os.fdopen(os.memfd_create("fixture-cab", os.MFD_ALLOW_SEALING), "w+b")
                 cabinet.write(b"fixture firmware bytes")
                 cabinet.flush()
                 cabinet.seek(0)
                 fcntl.fcntl(cabinet.fileno(), fcntl.F_ADD_SEALS, SEALS)
-                return plan, ":1.23", "fixture-device", cabinet
+                with cabinet:
+                    return prepare_reply(plan, ":1.23", "fixture-device", cabinet)
 
         engine = FixtureEngine(Journal(Path(self.tmp.name) / "history"), self.platform)
         interface = Path(__file__).resolve().parents[1] / "data" / (NAME + ".xml")
@@ -141,8 +156,8 @@ class PortablePeerTest(unittest.TestCase):
             self.gui.kill()
         self.gui.communicate(timeout=5)
 
-    def line(self):
-        self.assertTrue(select.select([self.gui.stdout], [], [], 10)[0], "GUI fixture did not reply")
+    def line(self, *, timeout=10):
+        self.assertTrue(select.select([self.gui.stdout], [], [], timeout)[0], "GUI fixture did not reply")
         value = self.gui.stdout.readline()
         if not value:
             self.fail(self.gui.communicate(timeout=5)[1])
@@ -435,6 +450,17 @@ class PortablePlatformTest(unittest.TestCase):
                 with self.assertRaises(OSError), platform.claim({"id": "fixture"}):
                     self.fail("A marker that could not be written yielded permission to issue")
             self.assertFalse(marker.exists())
+
+    def test_recovered_claim_is_retired_before_its_files_are_removed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / "request"
+            marker.mkdir()
+            (marker / "gui-operation").write_text("fixture", encoding="ascii")
+            with patch("hardware._owns_marker", return_value=True), patch.object(
+                    Path, "unlink", side_effect=PermissionError("cleanup interrupted")):
+                self.assertTrue(Platform.remove_gui_claim(marker, {"id": "fixture"}, "boot"))
+            self.assertFalse(marker.exists())
+            self.assertEqual(len(list(Path(temp).iterdir())), 1)
 
     def test_issue_rollback_releases_claim_but_committed_issue_keeps_it(self):
         import sqlite3

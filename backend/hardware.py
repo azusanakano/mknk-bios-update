@@ -4,6 +4,7 @@ The service owns host pseudonymization, request attribution and serialization.
 The payload hash and length are inputs from the unprivileged CAB verifier.
 """
 
+import configparser
 import hashlib
 import json
 import os
@@ -24,6 +25,13 @@ READ_ERRORS = (Hold, fw.Error, OSError, ValueError, KeyError, TypeError, subproc
 UNKNOWN = "確認できません"
 SHA256 = re.compile(r"[0-9a-f]{64}")
 UX_GUID = "3b8c8162-188c-46a4-aec9-be43f1d65697"
+FWUPD_CONFIG = (Path("/etc/fwupd/fwupd.conf"), Path("/var/etc/fwupd/fwupd.conf"))
+BGRT_IMAGE = Path("/sys/firmware/acpi/bgrt/image")
+# The uefi_capsule device classes publish distinct, untranslated summaries.
+DELIVERY_SUMMARIES = {
+    "uefi system resource table device (updated via capsule-on-disk)": "capsule-on-disk",
+    "uefi system resource table device (updated via nvram)": "nvram",
+}
 # The supported fwupd Linux uefi_capsule backend obtains its device from ESRT.
 # ESRT supplies no FMP hardware instance, so its EFI update records use zero.
 ESRT_REGISTRATION_INSTANCE = 0
@@ -737,6 +745,34 @@ def recovery_required(plan):
     return flagged or bool(kinds) or unknown
 
 
+def _confirm_daemon_delivery(device, profile, esp):
+    delivery = profile.get("secure_boot", {}).get("delivery", "nvram")
+    expected = "nvram" if delivery == "shim" else delivery
+    summary = device.get("Summary")
+    actual = DELIVERY_SUMMARIES.get(summary.casefold()) if isinstance(summary, str) else None
+    if actual is None or actual != expected:
+        raise Hold("実行中のfwupdが選んだBIOS配送方式と機種別の設定を照合できません。")
+    # Check both locations used by the packaged daemon. A conflicting
+    # setting also means we cannot prove the route across a reload.
+    for path in FWUPD_CONFIG:
+        config = configparser.ConfigParser(interpolation=None, strict=False)
+        config.optionxform = str
+        try:
+            with path.open(encoding="utf-8") as stream:
+                config.read_file(stream)
+            custom_esp = config.get("fwupd", "EspLocation", fallback="")
+            grub = config.getboolean("uefi_capsule", "EnableGrubChainLoad", fallback=False)
+            no_cod = config.getboolean("uefi_capsule", "DisableCapsuleUpdateOnDisk", fallback=False)
+            no_shim = config.getboolean("uefi_capsule", "DisableShimForSecureBoot", fallback=False)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError, configparser.Error) as exc:
+            raise Hold("fwupdの配送設定を確認できません。") from exc
+        if (grub or (no_cod and delivery == "capsule-on-disk") or (no_shim and delivery == "shim")
+                or (custom_esp and custom_esp != str(esp))):
+            raise Hold("fwupdの配送設定が、照合した方式またはEFIシステム区画と一致しません。")
+
+
 def preflight(plan):
     """Return JSON-serializable binding. No mount, EFI, or power changes."""
     try:
@@ -762,6 +798,7 @@ def preflight(plan):
         if _daemon_busy():
             raise Hold("fwupdが別の処理を実行中です。")
         esp, partuuid, secure, capability = fw.check_ready(device, devices, history, profile)
+        _confirm_daemon_delivery(device, profile, esp)
         if fw.disk_delivery_requested():
             raise Hold("既存のディスク経由カプセル配送指示があります。")
         mounts = fw.mount_points()
@@ -770,6 +807,14 @@ def preflight(plan):
         route = _bound_route(esp, partuuid, mounts, plan, profile, capability, capsule_flags)
         if route["secure_boot"] != secure:
             raise Hold("Secure Bootの状態が変わりました。")
+        # fwupd may generate a display capsule from BGRT even on a CoD path.
+        try:
+            BGRT_IMAGE.stat()
+        except FileNotFoundError:
+            pass
+        else:
+            if "ux_hash" not in route:
+                raise Hold("この機器では表示用カプセルを生成できるため、検証済みの配置とハッシュが必要です。")
         if route["delivery"] != "capsule-on-disk" and fw.esp_has_entry(esp, route["file"], directory=False):
             raise Hold("予定のBIOSファイルがESPに既に存在します。")
         if "binding" in plan and route != plan["binding"]:

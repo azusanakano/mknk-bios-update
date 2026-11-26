@@ -43,6 +43,10 @@ class ObservationTest(unittest.TestCase):
     def setUp(self):
         tmp = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(tmp)
+        self.fwupd_config = self.root / "fwupd.conf"
+        self.fake(hw, "FWUPD_CONFIG", (self.fwupd_config,), create=True)
+        self.bgrt_image = self.root / "bgrt" / "image"
+        self.fake(hw, "BGRT_IMAGE", self.bgrt_image, create=True)
         for key in ("ESRT", "DMI", "EFIVARS", "POWER", "LOCK_DIR", "LEGACY_LOCK_DIR"):
             path = self.root / key
             path.mkdir()
@@ -84,7 +88,8 @@ class ObservationTest(unittest.TestCase):
         self.fake(hw, "_platform")
         self.busy = self.fake(hw, "_daemon_busy", return_value=False)
         self.device = dict(Plugin="uefi_capsule", Protocols=[fw.PROTOCOL], Flags=["internal", "updatable"],
-                           DeviceId="a" * 40, Guid=[GUID], Version="1", VersionFormat="number")
+                           DeviceId="a" * 40, Guid=[GUID], Version="1", VersionFormat="number",
+                           Summary="UEFI System Resource Table device (Updated via capsule-on-disk)")
         self.devices = [self.device, {"DeviceId": "b" * 40, "Name": "SSD"}]
         self.history = []
         self.rows = self.fake(fw, "rows", side_effect=lambda args, **kw: self.devices if args == ["get-devices"]
@@ -108,6 +113,24 @@ class ObservationTest(unittest.TestCase):
 
     def var(self, name, payload, namespace=fw.EFI_GLOBAL):
         (fw.EFIVARS / f"{name}-{namespace}").write_bytes(struct.pack("<I", 7) + payload)
+
+    def test_preflight_rechecks_the_daemons_live_delivery_method(self):
+        self.plan["binding"] = hw.preflight(self.plan)
+        for summary in ("UEFI System Resource Table device (updated via NVRAM)",
+                        "UEFI System Resource Table device (updated via grub)", None):
+            with self.subTest(summary=summary):
+                self.device["Summary"] = summary
+                with self.assertRaisesRegex(hw.Hold, "fwupd.*配送"):
+                    hw.preflight(self.plan)
+
+    def test_preflight_rejects_a_configured_alternate_delivery(self):
+        for contents in ("[uefi_capsule]\nDisableCapsuleUpdateOnDisk=true\n",
+                         "[uefi_capsule]\nEnableGrubChainLoad=true\n",
+                         "[fwupd]\nEspLocation=/other/esp\n"):
+            with self.subTest(contents=contents):
+                self.fwupd_config.write_text(contents)
+                with self.assertRaisesRegex(hw.Hold, "fwupd.*配送"):
+                    hw.preflight(self.plan)
 
     def stage_cod(self):
         self.plan["binding"] = hw.preflight(self.plan)
@@ -227,6 +250,14 @@ class ObservationTest(unittest.TestCase):
         bios.unlink()
         self.assertFalse(hw.observe(self.plan)["power"])
 
+    def test_preflight_requires_display_assets_if_fwupd_can_write_a_ux_capsule(self):
+        self.bgrt_image.parent.mkdir()
+        self.bgrt_image.write_bytes(b"fixture display")
+        with self.assertRaisesRegex(hw.Hold, "表示用カプセル"):
+            hw.preflight(self.plan)
+        self.stage_cod_with_display()
+        self.assertEqual(hw.observe(self.plan)["reservation"], "matching")
+
     def test_completed_cod_with_only_its_verified_display_registration(self):
         bios, display = self.stage_cod_with_display()
         bios.unlink()
@@ -289,7 +320,8 @@ class ObservationTest(unittest.TestCase):
         (self.esrt / "fw_version").write_text("2")
         cleared = engine.status(actor)
         self.assertEqual((cleared["state"], cleared["current"]), ("hold", "2"))
-        self.assertTrue(cleared["can_replan"])
+        self.assertFalse(cleared["can_replan"])
+        self.assertTrue(cleared["can_take_over"])
         self.assertIsNone(journal.active()["outcome"])
 
     def test_processed_cod_file_is_distinguished_after_boot(self):
@@ -469,6 +501,7 @@ class ObservationTest(unittest.TestCase):
 
     def stage_nvram(self, secure, registration_flags=0x50000):
         self.var("SecureBoot", bytes([secure]))
+        self.device["Summary"] = "UEFI System Resource Table device (updated via NVRAM)"
         self.profile["secure_boot"] = {"delivery": "shim" if secure else "nvram",
                                        "efi_app_dir": str(self.root), "esp_vendor_dir": "ubuntu"}
         dos = bytearray(64)

@@ -4,29 +4,29 @@
 
 ## コピーして起動する
 
-Ubuntu 24.04 LTS（GNOME）と Linux Mint 22 系（Cinnamon）の x86_64 用。**`mknk-bios-update-0.1.1-x86_64.AppImage` 一つ**を対象 PC のホームフォルダーなどにコピーする。実行権限を付けたら、ファイルをダブルクリックするか次のように起動する。
+Ubuntu 24.04 LTS（GNOME）と Linux Mint 22 系（Cinnamon）の x86_64 用。**`mknk-bios-update-0.1.2-x86_64.AppImage` 一つ**を対象 PC のホームフォルダーなどにコピーする。実行権限を付けたら、ファイルをダブルクリックするか次のように起動する。
 
 ```sh
-chmod +x ./mknk-bios-update-0.1.1-x86_64.AppImage
-./mknk-bios-update-0.1.1-x86_64.AppImage
+chmod +x ./mknk-bios-update-0.1.2-x86_64.AppImage
+./mknk-bios-update-0.1.2-x86_64.AppImage
 ```
 
-通常ユーザーで開くと、機種名と現在の BIOS 版をローカルで読み取る。**更新情報を確認**を選ぶと、OS の管理者認証を通じて、その画面だけが使える一時ヘルパーを起動する。更新ファイルを fwupd に渡すのは、その後の「この更新を承認」を選んだとき。照会や承認前の準備中に画面を閉じるとヘルパーは終了する。送信許可を照合中に閉じた場合は、受け取った未使用の許可を取り消す。依頼を fwupd へ送った後は、結果の記録に必要な間だけ接続を維持する。
+通常ユーザーで開くと、機種名と現在の BIOS 版をローカルで読み取る。**更新情報を確認**を選ぶと、OS の管理者認証を通じて、その画面だけが使える一時ヘルパーを起動する。GNOME などで画面に「更新計画を開く」が表示された場合は、そのボタンを選んで現在の画面で操作するための管理者認証を行う。更新ファイルを fwupd に渡すのは、その後の「この更新を承認」を選んだとき。照会や承認前の準備中に画面を閉じるとヘルパーは終了する。送信許可を照合中に閉じた場合は、受け取った未使用の許可を取り消す。依頼を fwupd へ送った後は、結果の記録に必要な間だけ接続を維持する。
 
 更新の予約と履歴は対象 PC に保存する。再起動後は同じ AppImage を開き、「更新情報を確認」で結果を読み直す。ポータブル版はシステムへのサービス登録やログイン時の自動起動登録を行わない。すでにパッケージ版の端末サービスがある PC では、更新操作にはアプリ一覧の「BIOS 更新」を使う。
 
-GTK と更新の検証に使うライブラリはイメージに収録している。対象 OS の Python 3.12 を使い、実機への適用には OS 側の fwupd 2.0.20 以降、polkit（`pkexec`）、logind、UDisks などの稼働と、下記の機種別設定が必要。FUSE を利用できない環境では、同じファイルを `./mknk-bios-update-0.1.1-x86_64.AppImage --appimage-extract-and-run` で起動できる。[AppImage の起動方法](https://docs.appimage.org/user-guide/troubleshooting/fuse.html)
+GTK と更新の検証に使うライブラリはイメージに収録している。対象 OS の Python 3.12 を使い、実機への適用には OS 側の fwupd 2.0.20 以降、polkit（`pkexec`）、logind、UDisks などの稼働と、下記の機種別設定が必要。FUSE を利用できない環境では、同じファイルを `./mknk-bios-update-0.1.2-x86_64.AppImage --appimage-extract-and-run` で起動できる。[AppImage の起動方法](https://docs.appimage.org/user-guide/troubleshooting/fuse.html)
 
 ## パッケージ版をインストールする
 
-アプリ一覧への登録と再ログイン時の自動確認を使う場合は、Debian パッケージを使う。0.1.0 からの更新も同じ手順で行う。ダウンロードしたディレクトリで次を実行する。
+アプリ一覧への登録と再ログイン時の自動確認を使う場合は、Debian パッケージを使う。以前の版からの更新も同じ手順で行う。ダウンロードしたディレクトリで次を実行する。
 
 ```sh
-sudo apt install ./mknk-bios-update_0.1.1_amd64.deb
+sudo apt install ./mknk-bios-update_0.1.2_amd64.deb
 mknk-bios-update
 ```
 
-アプリ一覧の **BIOS 更新** からも一般ユーザーで起動できる。ログイン時はローカル状態を読み直し、処理中の計画やその起動で判明した結果があるときに画面を開く。閲覧専用の画面から承認へ進むときは、アプリ一覧の「更新計画を開く」を使う。`mknk-bios-update --status-only` は配布元への通信を伴わない状態確認に使える。
+アプリ一覧の **BIOS 更新** からも一般ユーザーで起動できる。ログイン時はローカル状態を読み直し、処理中の計画やその起動で判明した結果があるときに画面を開く。閲覧専用の画面から承認へ進むときは、アプリ一覧の「更新計画を開く」を使う。GNOME などで画面に「更新計画を開く」が表示された場合は、そのボタンを選んで管理者認証を済ませると、配布情報の再確認や更新の準備ができる。画面の切り替えや接続の終了後は再認証が必要になる。`mknk-bios-update --status-only` は配布元への通信を伴わない状態確認に使える。
 
 ## 更新の操作
 
@@ -52,6 +52,8 @@ GUI 用の追加項目は次のとおり。
 | `system_uuid_unique` | この機種で SMBIOS System UUID が個体ごとに一意と実証した場合に `true`。端末 DB に保存するのは鍵付きの照合値 |
 | `power` | `minimum_battery_percent` に機種固有の最低残量、バッテリー非搭載を検証した構成では `batteryless` に `true` |
 | `esp_free_bytes` | 配送方式・配布ビルドで必要な ESP 空き容量の下限（バイト） |
+| `secure_boot.ux_capsule_sha256` | BGRT の起動画面を使って表示用カプセルが生成され得る機種では、検証済みカプセル全体の SHA-256 を指定する。`secure_boot.esp_vendor_dir` に配置先も指定する |
+| `secure_boot.normal_boot_entry_sha256` | 標準 Capsule-on-Disk で表示用カプセルを使う場合は、通常起動で使う `Boot####` の全バイトの SHA-256 を指定する。efivarfs の先頭4バイトの属性も含む |
 | `encryption` | 管理者が確認した構成。`none`、`luks`、`bitlocker`、`luks+bitlocker`、`unknown` を使う |
 | `support_url`、`recovery_url` | 機種に対応するメーカー公式の更新・復旧手順の HTTPS URL。機種を照合できた場合に保留画面から開ける |
 | `stable_remote_id`、`stable_metadata_uris`、`cab_base_uris` | 管理者指定の安定版ミラーの ID と、カタログおよび CAB の許可された取得先 |
@@ -63,7 +65,7 @@ GUI 用の追加項目は次のとおり。
 リポジトリ直下で実行する。ビルド依存関係は `debian/control` に列挙している。
 
 ```sh
-sudo apt install build-essential debhelper meson ninja-build pkgconf libgtk-4-dev libjson-glib-dev python3-gi gir1.2-fwupd-2.0 gir1.2-jcat-1.0 gir1.2-atspi-2.0 openssl dbus-daemon xvfb xauth python3-xlib xdotool
+sudo apt install build-essential debhelper meson ninja-build pkgconf libgtk-4-dev libjson-glib-dev python3-gi gir1.2-fwupd-2.0 gir1.2-jcat-1.0 gir1.2-atspi-2.0 at-spi2-core openssl dbus-daemon xvfb xauth python3-xlib xdotool
 dpkg-buildpackage -b -us -uc
 ```
 

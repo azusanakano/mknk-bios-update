@@ -71,7 +71,7 @@ flowchart LR
 
 進捗率はこの操作の取得量と総量を確認できる間だけ表示し、それ以外は「署名を確認中」などの工程名にする。承認欄を開くと「今回は見送る」に、起動操作を表示すると「あとで」に初期フォーカスを置く。Tab で操作をたどれ、読み上げで現在版・目標版・保留理由を識別できるようにする。文字を拡大した場合は版と操作を縦に並べる。[GTK のアクセシビリティ](https://docs.gtk.org/gtk4/section-accessibility.html)
 
-ログイン時の自動起動が閲覧専用になった場合も、同じ主画面でローカルの「状態を再確認」を使える。配布情報の取り込みと更新準備は、各操作を許可された経路で受け付ける。承認が必要な場合は、ランチャーに用意する「更新計画を開く」操作を案内する。デスクトップエントリの `Exec` と `G_APPLICATION_NON_UNIQUE` で正規 GUI を新規に起動し、端末サービスがそのプロセスのアクティブなローカル画面への直接の帰属を照合する。起動経路を実証できない配布構成では、閲覧と保留理由を表示する。[デスクトップエントリのアクション](https://specifications.freedesktop.org/desktop-entry/latest/recognized-keys.html) ・ [GLib の起動フラグ](https://docs.gtk.org/gio/flags.ApplicationFlags.html)
+ログイン時の自動起動は閲覧専用で、同じ主画面でローカルの「状態を再確認」を使える。承認が必要な場合は、ランチャーに用意する「更新計画を開く」操作を案内する。デスクトップエントリの `Exec` と `G_APPLICATION_NON_UNIQUE` で正規 GUI を新規に起動する。端末サービスはアクティブなローカル画面への直接の帰属を照合する。GNOME Shell などが GUI を systemd のユーザースコープから起動した場合は、logind が返すプロセス所有者・表示セッション・操作中のシートを照合する。その画面で明示的に「更新計画を開く」を選び、polkit の管理者認証を済ませてから配布情報の再確認や更新準備へ進む。閲覧専用の起動ではこのボタンを表示しない。起動経路を照合できない場合は、閲覧と保留理由を表示する。[デスクトップエントリのアクション](https://specifications.freedesktop.org/desktop-entry/latest/recognized-keys.html) ・ [GLib の起動フラグ](https://docs.gtk.org/gio/flags.ApplicationFlags.html)
 
 ## 受け入れ条件
 

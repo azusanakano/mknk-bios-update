@@ -172,7 +172,7 @@ class StableCatalogTest(unittest.TestCase):
 
     def exercise_check(self, release, *, xml=None, metadata_result=None, expected_hold=None, expected_output=None,
                        host_ids=None, policy=(None, frozenset()), approval_required=False, daemon_version="2.0.20",
-                       device_before_refresh=None, other_devices=()):
+                       device_before_refresh=None, other_devices=(), runtime_policy=None):
         remote = {"Id": "lvfs", "MetadataUri": self.metadata_uri, "MetadataUriSig": self.signature_uri,
                   "ApprovalRequired": False}
         active_remote = dict(remote, ApprovalRequired=approval_required)
@@ -206,9 +206,37 @@ class StableCatalogTest(unittest.TestCase):
         client = SimpleNamespace(update_metadata_bytes=update, get_daemon_version=lambda: daemon_version)
         fwupd = SimpleNamespace(Client=SimpleNamespace(new=lambda: client),
                                 Error=SimpleNamespace(NOTHING_TO_DO=19))
-        glib = SimpleNamespace(Bytes=SimpleNamespace(new=bytes), Error=FixtureGLibError, Regex=FixtureRegex)
+        glib = SimpleNamespace(Bytes=SimpleNamespace(new=bytes), Error=FixtureGLibError, Regex=FixtureRegex,
+                               Variant=lambda kind, value: (kind, value), VariantType=SimpleNamespace(new=str))
         imports = {"gi": SimpleNamespace(require_version=lambda *_args: None),
                    "gi.repository": SimpleNamespace(Fwupd=fwupd, GLib=glib)}
+        admin_patch = patch.object(updater, "admin_checksums", return_value=policy)
+        help_patch = nullcontext()
+        policy_calls = []
+        if runtime_policy is not None:
+            running_version, blocked, client_help = runtime_policy
+
+            def call(destination, path, interface, method, params, reply_type, *_args):
+                policy_calls.append(method)
+                if method == "GetNameOwner":
+                    self.assertEqual(params, ("(s)", (updater.FWUPD_ID,)))
+                    return SimpleNamespace(unpack=lambda: (":1.7",))
+                self.assertEqual((destination, path), (":1.7", "/"))
+                if method == "Get":
+                    self.assertEqual(params, ("(ss)", (updater.FWUPD_ID, "DaemonVersion")))
+                    return SimpleNamespace(unpack=lambda: (running_version,))
+                self.assertEqual((interface, method, params, reply_type),
+                                 (updater.FWUPD_ID, "GetBlockedFirmware", None, "(as)"))
+                if isinstance(blocked, Exception):
+                    raise blocked
+                return SimpleNamespace(unpack=lambda: (blocked,))
+
+            bus = SimpleNamespace(call_sync=call)
+            imports["gi.repository"].Gio = SimpleNamespace(
+                bus_get_sync=lambda *_args: bus, BusType=SimpleNamespace(SYSTEM=0),
+                DBusCallFlags=SimpleNamespace(NO_AUTO_START=1))
+            admin_patch = nullcontext()
+            help_patch = patch.object(updater.subprocess, "run", return_value=SimpleNamespace(stdout=client_help))
         with (TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()) as output,
               patch.dict(sys.modules, imports),
               patch.object(sys, "argv", [SCRIPT.name, "--check"]),
@@ -218,7 +246,7 @@ class StableCatalogTest(unittest.TestCase):
               patch.object(updater, "read_settings", return_value={}),
               patch.object(updater, "stable_remote", side_effect=[remote, remote, active_remote]),
               patch.object(updater, "command", return_value=json.dumps(host_ids)) as command,
-              patch.object(updater, "admin_checksums", return_value=policy) as admin,
+              admin_patch as admin, help_patch as help_command,
               patch.object(updater, "inventory", side_effect=inventory),
               patch.object(updater, "fwupd_query", return_value=[release] if release else []),
               patch.object(updater, "build_opener", return_value=SimpleNamespace(open=get))):
@@ -237,11 +265,34 @@ class StableCatalogTest(unittest.TestCase):
             command.assert_called_once_with(["hwids"])
         if approval_required:
             admin.assert_called_once_with(active_remote)
+        if runtime_policy is not None:
+            help_command.assert_not_called()
+            return policy_calls
         self.assertCountEqual(requests, [self.signature_uri, self.metadata_uri])
         self.assertEqual(daemon_calls, [("lvfs", signed, signature)])
 
     def test_check_uses_only_the_approved_lvfs_catalog(self):
         self.exercise_check(self.published)
+
+    def test_new_cli_obeys_old_daemon_block_list_for_a_newer_release(self):
+        calls = self.exercise_check(self.published, xml=self.catalog_with_competitor("196608"),
+                                    expected_output="新版 3.0　明示ブロック",
+                                    runtime_policy=("2.0.20", ["B" * 64], ""))
+        self.assertIn("GetBlockedFirmware", calls)
+
+    def test_old_cli_skips_block_list_removed_from_new_daemon(self):
+        calls = self.exercise_check(self.published, runtime_policy=(
+            "2.1.1", FixtureGLibError("Unknown method"), "  get-blocked-firmware   Show blocked firmware"))
+        self.assertIn("Get", calls)
+        self.assertNotIn("GetBlockedFirmware", calls)
+
+    def test_missing_block_list_on_old_daemon_holds_the_candidate(self):
+        calls = self.exercise_check(self.published, expected_hold="管理者.*確認できません",
+                                    runtime_policy=("2.0.20", FixtureGLibError("Unavailable"), ""))
+        self.assertIn("GetBlockedFirmware", calls)
+
+    def test_check_displays_community_support_status(self):
+        self.exercise_check(dict(self.published, Flags=["is-community"]), expected_output="コミュニティ提供")
 
     def test_reused_remote_id_does_not_authorize_an_unpublished_cab(self):
         self.exercise_check(dict(self.published, Checksum=["b" * 64]), expected_hold="署名済み")

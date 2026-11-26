@@ -1,4 +1,4 @@
-project('mknk-bios-update', 'c', version: '0.1.1', meson_version: '>=0.63',
+project('mknk-bios-update', 'c', version: '0.1.2', meson_version: '>=0.63',
         default_options: ['c_std=c17', 'warning_level=2'])
 
 gtk = dependency('gtk4', version: '>=4.8')

@@ -70,6 +70,7 @@ ID_REQUIREMENT_GLOB = "id-requirement-glob"
 CLIENT_FEATURES = ("requests", "requests-non-generic", "detach-action", "update-action",
                    "allow-authentication", "fde-warning", "show-problems")
 UNSUPPORTED_CLIENT_FEATURES = {"switch-branch", "community-text", "can-report", "none"}
+COMMUNITY_SUPPORT_NOTICE = "コミュニティ提供。元のハードウェアメーカーによる提供・サポートはありません。"
 VERSION_COMPARISONS = {"eq": operator.eq, "ne": operator.ne, "lt": operator.lt,
                        "gt": operator.gt, "le": operator.le, "ge": operator.ge}
 REMOTE = "lvfs"
@@ -294,6 +295,23 @@ def fwupd_bindings():
     except (ImportError, ValueError) as exc:
         raise Hold("更新候補の照会・検証には python3-gi と gir1.2-fwupd-2.0 が必要です。") from exc
     return Fwupd, GLib
+
+
+def fwupd_daemon_owner(bus, GLib):
+    return bus.call_sync(
+        "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+        "GetNameOwner", GLib.Variant("(s)", (FWUPD_ID,)),
+        GLib.VariantType.new("(s)"), 0, 5000, None).unpack()[0]
+
+
+def fwupd_daemon_version(bus, GLib, owner, call_flags):
+    version = bus.call_sync(
+        owner, "/", "org.freedesktop.DBus.Properties", "Get",
+        GLib.Variant("(ss)", (FWUPD_ID, "DaemonVersion")),
+        GLib.VariantType.new("(v)"), call_flags, 5000, None).unpack()[0]
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9]{1,9}(?:\.[0-9]{1,9}){2}", version):
+        raise Hold("fwupdの版を確認できません。")
+    return version
 
 
 def fwupd_query(operation, argument):
@@ -924,24 +942,34 @@ def admin_policy_reason(hashes, policy, *, other_block_hashes=()):
     return None
 
 
+def firmware_policy(client, bus, GLib, owner, version, remote):
+    def checksums(items):
+        if not isinstance(items, (list, tuple)) or not all(isinstance(x, str) for x in items):
+            raise Hold("管理者の配布制限を確認できません。")
+        return {x.lower() for x in items}
+
+    approved = checksums(client.get_approved_firmware(None)) if remote.get("ApprovalRequired") else None
+    if version_key(version, None) >= version_key("2.1.1", None):
+        return approved, set()
+    # A 2.1.1+ client stub cannot query the block list maintained by a pre-2.1.1 daemon.
+    blocked = bus.call_sync(owner, "/", FWUPD_ID, "GetBlockedFirmware", None,
+                            GLib.VariantType.new("(as)"), 0, 5000, None).unpack()[0]
+    return approved, checksums(blocked)
+
+
 def admin_checksums(remote):
-    approved = checksum_list("get-approved-firmware") if remote.get("ApprovalRequired") is True else None
-    # 個別ブロック一覧のCLIは2.0系にあり、2.1.1以降で廃止された。
-    help_text = subprocess.run([FWUPDMGR, "--help"], stdin=subprocess.DEVNULL,
-                               capture_output=True, text=True, errors="replace", check=True).stdout
-    blocked = (checksum_list("get-blocked-firmware")
-               if re.search(r"(?m)^\s*get-blocked-firmware(?:\s|$)", help_text) else set())
-    return approved, blocked
-
-
-def checksum_list(action):
+    Fwupd, GLib = fwupd_bindings()
+    from gi.repository import Gio
     try:
-        result = json.loads(command([action]))
-        if not isinstance(result, dict) or "Checksums" not in result:
-            raise ValueError
-        return {s.lower() for s in strings(result, "Checksums")}
-    except ValueError as exc:
-        raise Error("fwupdの管理者ポリシーを照合できません。") from exc
+        bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        owner = fwupd_daemon_owner(bus, GLib)
+        version = fwupd_daemon_version(bus, GLib, owner, Gio.DBusCallFlags.NO_AUTO_START)
+        policy = firmware_policy(Fwupd.Client.new(), bus, GLib, owner, version, remote)
+        if fwupd_daemon_owner(bus, GLib) != owner:
+            raise Hold("管理者の配布制限の照会中にfwupdが変化しました。再確認してください。")
+        return policy
+    except GLib.Error as exc:
+        raise Hold("fwupdの管理者ポリシーを確認できません。") from exc
 
 
 def check_power():
@@ -2150,6 +2178,9 @@ def main():
         print(message)
         return
     print("更新候補  ", visible(device["Version"]), "→", visible(release["Version"]), "（lvfs 安定版）")
+    community = "is-community" in strings(release, "Flags")
+    if community:
+        print(COMMUNITY_SUPPORT_NOTICE)
     if result.unavailable:
         print(result.unavailable)
     if not opt.apply:
@@ -2192,6 +2223,7 @@ def main():
                 raise Hold("承認後に機器情報が変化しました。再確認してください。")
             updated = candidate(current)
             if (not updated or any(updated.get(k) != release.get(k) for k in ("Version", "AppstreamId", "RemoteId"))
+                    or ("is-community" in strings(updated, "Flags")) != community
                     or not same_cab(approved_hashes, release_hashes(updated))):
                 raise Hold("承認後に配布候補が変わりました。再確認してください。")
             active_profile = support_profile(active_settings, guid, current)

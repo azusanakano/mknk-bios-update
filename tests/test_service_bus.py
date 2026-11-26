@@ -1,5 +1,6 @@
 """Round trip through the actual system service on a private bus, including the CAB FD."""
 from contextlib import contextmanager
+import errno
 import hashlib
 import json
 import os
@@ -8,6 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from test_engine import Machine
 
@@ -26,7 +28,16 @@ class ServiceBusTest(unittest.TestCase):
     def test_definite_rejection_can_only_be_reported_by_original_connection(self):
         self.exercise_receipt_reporting(switch_user=True, reject=True)
 
-    def exercise_receipt_reporting(self, *, switch_user, decline=False, reject=False):
+    def test_fd_duplication_failure_leaves_no_permission_or_claim(self):
+        self.exercise_receipt_reporting(switch_user=False, exhaust_fds=True)
+
+    def test_busy_status_queue_reserves_capacity_for_rejection(self):
+        self.exercise_receipt_reporting(switch_user=True, reject=True, busy=True)
+
+    def test_busy_status_queue_reserves_capacity_for_decline(self):
+        self.exercise_receipt_reporting(switch_user=False, decline=True, busy=True)
+
+    def exercise_receipt_reporting(self, *, switch_user, decline=False, reject=False, exhaust_fds=False, busy=False):
         import fcntl
         from gi.repository import Gio, GLib
         from engine import Engine
@@ -104,14 +115,64 @@ class ServiceBusTest(unittest.TestCase):
                         self.assertTrue(fcntl.fcntl(sealed.fileno(), fcntl.F_GET_SEALS) & fcntl.F_SEAL_WRITE)
                     return operation
 
+                if exhaust_fds:
+                    with patch.object(Gio.UnixFDList, "append", side_effect=OSError(errno.EMFILE, "fixture FD limit")):
+                        with self.assertRaises(GLib.Error) as failure:
+                            authorize(review["plan"])
+                    self.assertEqual(Gio.DBusError.get_remote_error(failure.exception), NAME + ".Unavailable")
+                    self.assertIsNone(engine.db.active())
+                    self.assertIsNone(engine.platform.marker)
+                    review = call("Prepare", "(s)", call("Check")["token"])
+
                 operation = authorize(review["plan"])
+
+                @contextmanager
+                def busy_status_queue():
+                    if not busy:
+                        yield
+                        return
+                    release = threading.Event()
+                    drained = threading.Event()
+                    remaining = 16
+                    dispatch = service.dispatch
+
+                    def wait_on_status(sender, method, args, interactive):
+                        if method == "Status" and not release.wait(timeout=12):
+                            raise Conflict("Status fixture did not release")
+                        return dispatch(sender, method, args, interactive)
+
+                    def status_done(connection, result, _):
+                        nonlocal remaining
+                        try:
+                            connection.call_finish(result)
+                        except GLib.Error:
+                            pass
+                        finally:
+                            remaining -= 1
+                            if remaining == 0:
+                                drained.set()
+
+                    with patch.object(service, "dispatch", wait_on_status):
+                        try:
+                            for _ in range(16):
+                                client.call(server.get_unique_name(), OBJECT, NAME, "Status", None, None,
+                                            Gio.DBusCallFlags.NONE, 15000, None, status_done, None)
+                            with self.assertRaises(GLib.Error) as failure:
+                                call("Status")
+                            self.assertEqual(Gio.DBusError.get_remote_error(failure.exception), NAME + ".Busy")
+                            yield
+                        finally:
+                            release.set()
+                            self.assertTrue(drained.wait(timeout=8), "queued Status fixture did not drain")
+
                 if reject:
                     engine.platform.session_active = False
-                    with self.assertRaises(GLib.Error):
-                        call("ReportRejection", "(s)", operation, connection=other)
-                    self.assertEqual(engine.db.active()["receipt"], "unknown")
-                    self.assertEqual(call("ReportRejection", "(s)", operation), {"recorded": True})
-                    self.assertEqual(engine.db.active()["receipt"], "rejected")
+                    with busy_status_queue():
+                        with self.assertRaises(GLib.Error):
+                            call("ReportRejection", "(s)", operation, connection=other)
+                        self.assertEqual(engine.db.active()["receipt"], "unknown")
+                        self.assertEqual(call("ReportRejection", "(s)", operation), {"recorded": True})
+                        self.assertEqual(engine.db.active()["receipt"], "rejected")
                     with self.assertRaises(GLib.Error):
                         call("Status")
                     engine.platform.session_active = True
@@ -120,13 +181,14 @@ class ServiceBusTest(unittest.TestCase):
                     self.assertIsNone(engine.platform.marker)
                     return
                 if decline:
-                    with self.assertRaises(GLib.Error):
-                        call("DeclineAuthorization", "(s)", operation, connection=other)
-                    self.assertEqual(engine.db.active()["id"], operation)
-                    self.assertEqual(engine.platform.marker, operation)
-                    call("DeclineAuthorization", "(s)", operation)
-                    self.assertIsNone(engine.db.active())
-                    self.assertIsNone(engine.platform.marker)
+                    with busy_status_queue():
+                        with self.assertRaises(GLib.Error):
+                            call("DeclineAuthorization", "(s)", operation, connection=other)
+                        self.assertEqual(engine.db.active()["id"], operation)
+                        self.assertEqual(engine.platform.marker, operation)
+                        call("DeclineAuthorization", "(s)", operation)
+                        self.assertIsNone(engine.db.active())
+                        self.assertIsNone(engine.platform.marker)
                     review = call("Prepare", "(s)", call("Check")["token"])
                     operation = authorize(review["plan"])
                     call("Report", "(sb)", operation, False)

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from firmware_api import fw
 from hardware import target_installed, target_version_matches
-from journal import Conflict
+from journal import Conflict, failure_text
 
 
 @dataclass(frozen=True)
@@ -19,9 +19,13 @@ class Actor:
     writable: bool
     desktop: str
     process: str
+    can_open_plan: bool = False
+    session_version: tuple[str, int, int] | None = None
 
 
-DISPLAY = ("target", "source", "checked", "changes", "scope", "checksum", "token", "signed", "synced")
+DISPLAY = ("target", "source", "checked", "changes", "scope", "checksum", "token", "signed", "synced",
+           "remote_id", "appstream_id", "cab_sha512")
+CACHE_DISPLAY = ("target", "source", "checked", "signed", "synced")
 VERIFIED = ("token", "guid", "device", "current", "target", "version_format", "checksum", "cab_sha512",
             "appstream_id", "remote_id", "scope",
             "payload_sha256", "payload_size", "settings_fingerprint", "shutdown", "daemon_owner", "target_raw")
@@ -31,7 +35,7 @@ TITLES = {"idle": "この PC の更新を確認", "available": "この機種に�
           "pending": "再起動待ち", "complete": "目標版の導入を確認", "hold": "確認が必要です"}
 RESULTS = {
     "installed": ("complete", "実機の BIOS 版と起動予約の解消を確認しました。"),
-    "unapplied": ("hold", "起動予約は解消しましたが、実機の BIOS は目標版に達していません。現在版から再照会できます。"),
+    "unapplied": ("hold", "起動予約は解消しました。実機の BIOS は目標版と異なります。現在版から再照会できます。"),
     "failed": ("hold", "以前の更新の試行失敗を記録しました。現在版から再照会できます。"),
     "unattributed": ("hold", "以前の更新の結果を確定できませんでした。現在版から再照会できます。"),
     "rejected": ("hold", "更新依頼の未送達または配置前の拒否と、起動予約がないことを確認しました。現在版から再照会できます。"),
@@ -45,6 +49,12 @@ def same_target(plan, obs):
 
 def free(obs):
     return obs["reservation"] == "clear" and obs["running"] is False
+
+
+def display_cache_key(obs):
+    if obs["machine"]:
+        return "display-cache:machine:" + obs["machine"]
+    return "display-cache:boot" if obs["boot"] else None
 
 
 def settled_after_boot(plan, obs, *, allow_unidentified=False):
@@ -139,7 +149,7 @@ class Engine:
             return result
 
     def failed_attempt(self, plan, obs):
-        return obs["new_failure"] or bool(self.db.setting("failure-" + plan["id"]))
+        return obs["new_failure"] or bool(self.db.failure(plan["id"]))
 
     def reconcile(self, plan, obs):
         same_boot = bool(obs["boot"] and obs["boot"] == plan["boot"])
@@ -153,10 +163,9 @@ class Engine:
                 self.candidates.clear()
                 return RESULTS["rejected"]
             return "hold", "更新依頼の未送達または配置前の拒否を記録しました。既存の予約と進行中の処理を確認しています。"
-        if obs["new_failure"] and not self.db.setting("failure-" + plan["id"]):
-            self.db.setting("failure-" + plan["id"], {"current": obs["current"], "status": obs["attempt_status"]})
-        if self.failed_attempt(plan, obs):
-            return "hold", ATTEMPT_FAILED
+        failure = self.db.failure(plan["id"], obs if obs["new_failure"] else None)
+        if failure:
+            return "hold", ATTEMPT_FAILED + "\n" + failure_text(failure)
         if obs["reservation"] == "matching":
             if not same_boot and not obs["attempt_comparable"]:
                 return "hold", "予約は残っていますが、起動後の実機の試行結果を承認した更新に照合できません。"
@@ -178,12 +187,29 @@ class Engine:
         # The journal can change while reading hardware. Never render a permission from an obsolete read.
         with self.lock:
             plan, obs, ambiguous = self.current_operation()
+            saved = None
+            reason = "未解決の操作と今回の PC を一意に照合できません。" if ambiguous else ""
+            if not plan and not ambiguous:
+                approvals = self.db.pending_approvals(obs["machine"], obs["boot"])
+                if len(approvals) > 1:
+                    reason = "保存済みの承認と今回の PC を一意に照合できません。"
+                elif approvals:
+                    saved = approvals[0]
+                    if (obs["reservation"] == "foreign" and obs["boot"]
+                            and (saved["boot"], saved["machine"]) == (obs["boot"], obs["machine"])
+                            and same_target(saved, obs)
+                            and self.db.recover_approval_claim(saved, self.platform.recover_claim)):
+                        checked = self.observation()
+                        if (obs["machine"], obs["boot"]) != (checked["machine"], checked["boot"]):
+                            reason = "保存済みの承認と今回の PC を一意に照合できません。"
+                        obs = checked
             v = dict(model=obs["model"], current=obs["current"],
                      state="idle", detail=obs["detail"], can_check=actor.writable and obs["can_identify"],
-                     can_prepare=False, can_approve=False, can_power=False, plan="", power="")
+                     can_open_plan=actor.can_open_plan,
+                     can_prepare=False, can_approve=False, can_dismiss=False, can_power=False, plan="", power="")
             v.update({k: obs[k] for k in ("support_url", "recovery_url") if obs.get(k)})
-            if ambiguous:
-                v.update(state="hold", can_check=False, detail="未解決の操作と今回の PC を一意に照合できません。")
+            if reason:
+                v.update(state="hold", can_check=False, needs_attention=True, detail=reason)
             elif plan:
                 state, reason = self.reconcile(plan, obs)
                 active = self.db.active(plan_id=plan["id"]) is not None
@@ -202,20 +228,24 @@ class Engine:
                     v["detail"] += "\nデスクトップへの終了要求の結果を確認中です。"
                 elif state == "pending" and actor.writable and not actor.desktop:
                     v["detail"] += "\nこのデスクトップの終了操作を照合できません。予約は保持されています。"
-                can_resolve = (state == "hold" and active and actor.writable
-                               and settled_after_boot(plan, obs, allow_unidentified=True))
-                v["can_replan"] = can_resolve and plan["uid"] == actor.uid
-                v["can_take_over"] = can_resolve and plan["uid"] != actor.uid
+                # A UID alone cannot identify the same account after another boot.
+                v["can_replan"] = False
+                v["can_take_over"] = (state == "hold" and active and actor.writable
+                                      and settled_after_boot(plan, obs, allow_unidentified=True))
                 if v["can_take_over"]:
                     v["detail"] += "\n管理者は前回の記録を整理して、現在版から再計画できます。"
             elif not obs["can_identify"] or not free(obs):
                 v.update(state="hold", can_check=False,
                          detail=obs["detail"] or "実機の更新対象または既存予約を確認できません。")
             else:
-                self.idle_view(v, actor, obs)
+                self.idle_view(v, actor, obs, saved)
+            if (v.get("source") or "").startswith("安定版ミラー ") and not v.get("synced"):
+                v["synced"] = "未確認"
             if not actor.writable:
                 hint = "閲覧専用です。承認にはランチャーの「更新計画を開く」を使います。"
-                if getattr(self.platform, "portable", False):
+                if actor.can_open_plan:
+                    hint = "閲覧専用です。更新を準備するには通常モードの「更新計画を開く」で管理者認証を行ってください。"
+                elif getattr(self.platform, "portable", False):
                     hint = ("閲覧専用です。この画面をログイン中のデスクトップに直接対応付けられません。"
                             "そのデスクトップの端末から同じ AppImage を開き直してください。")
                 v["detail"] = (v["detail"] + "\n" + hint).strip()
@@ -224,7 +254,7 @@ class Engine:
             v["title"] = "電源オフ待ち" if v["state"] == "pending" and v["power"] == "shutdown" else TITLES[v["state"]]
             return v
 
-    def idle_view(self, v, actor, obs):
+    def idle_view(self, v, actor, obs, saved):
         item = self.candidates.get(actor.sender)
         draft = self.drafts.get(actor.sender)
         prepare_block = obs.get("prepare_block")
@@ -238,19 +268,13 @@ class Engine:
         except Conflict as exc:
             import_block = str(exc)
         prepare_block = prepare_block or import_block
-        approvals = self.db.pending_approvals(obs["machine"], obs["boot"])
-        if len(approvals) > 1:
-            v.update(state="hold", can_check=False, detail="保存済みの承認と今回の PC を一意に照合できません。")
-            return
-        saved = approvals[0] if approvals else None
         if draft or saved:
             p = saved or draft[1]
             own = owns_approval(p, actor, obs)
             can_resume = not prepare_block and actor.writable and own and same_target(p, obs) and p["current"] == obs["current"]
             v.update({k: p[k] for k in DISPLAY if k in p})
             v.update(state="review", plan=p["id"], device=p["device"], daemon_owner=p["daemon_owner"],
-                     can_approve=can_resume, can_check=False, cab_sha512=p.get("cab_sha512", ""),
-                     remote_id=p.get("remote_id", ""), appstream_id=p.get("appstream_id", ""),
+                     can_approve=can_resume, can_dismiss=actor.writable and own, can_check=False,
                      recovery_detail=p.get("recovery_detail", ""),
                      recovery_required=p.get("recovery_required", True),
                      power="shutdown" if p["shutdown"] else "reboot", detail="対象・配布ファイル・起動先を照合しました。")
@@ -265,17 +289,15 @@ class Engine:
             if prepare_block:
                 v["detail"] += "\n" + prepare_block
             return
-        if item and same_target(item, obs) and item["current"] == obs["current"]:
+        if (item and same_target(item, obs)
+                and all(item[k] == obs[k] for k in ("current", "machine", "boot"))):
             v.update({k: item[k] for k in DISPLAY if k in item})
             v.update(state=item["state"], detail=item.get("detail", ""),
                      can_prepare=bool(actor.writable and item["state"] == "available"))
             if prepare_block and item["state"] == "available":
                 v.update(state="hold", can_prepare=False, detail=prepare_block)
             if item["state"] == "hold":
-                cache = self.db.setting("display-cache")
-                if cache and same_target(cache, obs) and cache["current"] == obs["current"]:
-                    v.update({k: cache[k] for k in ("target", "source", "checked") if k in cache})
-                    v["cached"] = True
+                self.load_display_cache(v, obs)
             return
         last = self.db.last(obs["machine"], obs["boot"])
         if last and same_target(last, obs):
@@ -289,19 +311,27 @@ class Engine:
                                and outcome in RESULTS and last["observed"] == obs["current"])
             if show_result:
                 state, detail = RESULTS[outcome]
+                failure = failure_text(self.db.failure(last["id"])) if outcome == "failed" else ""
                 v.update({k: last[k] for k in DISPLAY if k in last})
                 v.update(state=state, result_this_boot=this_boot,
-                         detail="\n".join(filter(None, (detail, obs["detail"]))))
+                         detail="\n".join(filter(None, (detail, failure, obs["detail"]))))
                 return
-        cache = self.db.setting("display-cache")
-        if cache and same_target(cache, obs) and cache["current"] == obs["current"]:
-            v.update({k: cache[k] for k in ("target", "source", "checked") if k in cache})
-            v["cached"] = True
+        if self.load_display_cache(v, obs):
             v["detail"] = "前回確認した配布情報です。現在の候補は再照会して確認します。"
         elif not v["detail"]:
             v["detail"] = "この PC の BIOS に適用できる安定版を確認します。"
         if import_block:
             v.update(state="hold", detail=import_block)
+
+    def load_display_cache(self, view, obs):
+        key = display_cache_key(obs)
+        cache = self.db.setting(key) if key else None
+        if (not cache or not same_target(cache, obs) or cache.get("current") != obs["current"]
+                or (not obs["machine"] and cache.get("boot") != obs["boot"])):
+            return False
+        view.update({k: cache[k] for k in CACHE_DISPLAY if k in cache})
+        view["cached"] = True
+        return True
 
     def check(self, actor):
         self.required(actor)
@@ -317,11 +347,13 @@ class Engine:
         # A diagnostic still belongs to the observed machine when the remote could not be reached.
         for k in ("guid", "device", "current"):
             item.setdefault(k, obs[k])
+        item.update(machine=obs["machine"], boot=obs["boot"])
         with self.lock:
             self.candidates[actor.sender] = item
-            if item["state"] in ("available", "current"):
-                self.db.setting("display-cache", {k: item[k] for k in
-                                ("guid", "device", "current", "target", "source", "checked") if k in item})
+            key = display_cache_key(obs)
+            if key and item["state"] in ("available", "current"):
+                self.db.setting(key, {k: item[k] for k in ("guid", "device", "current", "boot", *CACHE_DISPLAY)
+                                      if k in item})
         return self.status(actor)
 
     def prepare(self, actor, token):
@@ -342,7 +374,8 @@ class Engine:
             obs = self.observation()
             self.required(actor)
             self.platform.confirm_owner(p["daemon_owner"])
-            if not same_target(p, obs) or p["current"] != obs["current"] or not obs["boot"] or not free(obs):
+            if (not same_target(p, obs) or p["current"] != obs["current"] or not obs["boot"] or not free(obs)
+                    or any(candidate[k] != obs[k] for k in ("machine", "boot"))):
                 raise Conflict("検証中に実機の対象、現在版または予約が変わりました。")
             p.update({k: obs[k] for k in ("boot", "machine", "attempt_version", "attempt_status")})
             p.update(id=str(uuid.uuid4()), uid=actor.uid, approval_session=actor.session, approval_bus=actor.bus)
@@ -360,7 +393,7 @@ class Engine:
             # or fixing the reported condition. Keep the last target as history.
             with self.lock:
                 if self.candidates.get(actor.sender) is candidate:
-                    held = {k: candidate[k] for k in ("device", "guid", "current")}
+                    held = {k: candidate[k] for k in ("device", "guid", "current", "machine", "boot")}
                     self.candidates[actor.sender] = dict(held, state="hold", detail=str(exc)[:1024])
             raise
         finally:
@@ -372,16 +405,17 @@ class Engine:
         with self.lock:
             draft = self.drafts.get(actor.sender)
             saved = self.db.approval(plan_id=plan_id)
-            owns_plan = (owns_approval(saved, actor, self.observation()) if saved else
-                         draft and draft[0] == actor and draft[1]["id"] == plan_id)
+            owns_draft = draft and draft[0] == actor and draft[1]["id"] == plan_id
+            owns_plan = owns_approval(saved, actor, self.observation()) if saved else owns_draft
             if not owns_plan:
                 raise Conflict("この接続で表示した計画を確認できません。")
-            self.drop_draft(actor.sender)
+            if owns_draft:
+                self.drop_draft(actor.sender)
             if saved:
                 self.db.cancel_approval(plan_id)
         return self.status(actor)
 
-    def authorize(self, actor, plan_id):
+    def authorize(self, actor, plan_id, *, prepare_reply=None):
         self.required(actor)
         with self.lock:
             draft = self.drafts.get(actor.sender)
@@ -427,12 +461,17 @@ class Engine:
                     raise Conflict("暗号化の照合結果が変わりました。回復手段を確認してから再承認してください。")
                 self.verified(updated)
                 self.platform.confirm_owner(p["daemon_owner"])
-                self.required(actor)
                 cabinet.seek(0)
+                result = (plan_id, p["daemon_owner"], p["device"], cabinet)
+                if prepare_reply is not None:
+                    # Reserve the response FD before journaling a permission that may be sent.
+                    with cabinet:
+                        result = prepare_reply(*result)
+                self.required(actor)
                 with self.platform.claim(p):
                     self.db.issue(p, actor.sender, p["daemon_owner"], actor.bus, from_approval=True)
                 self.drop_draft(actor.sender)
-            return plan_id, p["daemon_owner"], p["device"], cabinet
+            return result
         except BaseException:
             cabinet.close()
             with self.lock:
@@ -487,8 +526,13 @@ class Engine:
         obs = self.observation(p)
         if not settled_after_boot(p, obs, allow_unidentified=True):
             raise Conflict("以前の依頼、予約または機器との一致を確認できません。")
-        failed = (bool(obs["machine"]) and p["machine"] == obs["machine"]
-                  and self.db.setting("failure-" + p["id"]))
+        if obs["machine"] and p["machine"] == obs["machine"]:
+            self.reconcile(p, obs)
+            if self.db.active(plan_id=p["id"]) is None:
+                return
+            failed = self.db.failure(p["id"])
+        else:
+            failed = False
         self.db.finish(p["id"], "failed" if failed else "unattributed", obs["current"], observed_boot=obs["boot"])
         self.candidates.clear()
 
@@ -498,11 +542,7 @@ class Engine:
             view = self.status(actor)
             if view.get("plan") != plan_id or not view.get("can_replan"):
                 raise Conflict("以前の依頼・予約の解消を確認できません。")
-            p = self.db.active(plan_id=plan_id)
-            if p:
-                self.finish_for_replan(p)
-            else:
-                self.db.cancel_approval(plan_id)
+            self.db.cancel_approval(plan_id)
             self.disconnect(actor.sender)
         return self.check(actor)
 

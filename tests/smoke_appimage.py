@@ -8,11 +8,30 @@ import signal
 import subprocess
 import tempfile
 import time
+import unicodedata
 
 import gi
 
 gi.require_version("Atspi", "2.0")
 from gi.repository import Atspi, GLib
+
+
+def local_identity(directory):
+    def read(field):
+        with suppress(OSError, UnicodeError):
+            return (directory / field).read_text(encoding="utf-8").strip()
+        return ""
+
+    def visible(value):
+        return "".join(" " if unicodedata.category(c).startswith("C") else c for c in value).strip()[:160]
+
+    generic = {"system product name", "default string", "to be filled by o.e.m.", "not applicable"}
+    product = read("product_name")
+    parts = [read("sys_vendor"), product, read("product_sku")] if product and product.lower() not in generic else [
+        read("board_name"), read("board_version")]
+    names = (visible(part) for part in parts if part and part.lower() not in generic)
+    model = " / ".join(dict.fromkeys(filter(None, names)))
+    return model or "確認できません", visible(read("bios_version") or "確認できません")
 
 
 def accessible_children(node):
@@ -170,11 +189,9 @@ def main(image, extract, status_only):
             proc = Path("/proc") / str(pid)
             assert "memfd:mknk-bios-update" in os.readlink(proc / "exe")
             assert b"/usr/lib/gui/libgtk-4.so" in (proc / "maps").read_bytes()
-            for filename, prefix in [("product_name", "機種"), ("bios_version", "現在の BIOS")]:
-                field = Path("/sys/class/dmi/id") / filename
-                if field.exists() and os.access(field, os.R_OK):
-                    value = field.read_text().strip()
-                    assert any(key.startswith(prefix) and value in key for key in labels), (field, labels.keys())
+            model, version = local_identity(Path("/sys/class/dmi/id"))
+            for prefix, value in (("機種", model), ("現在の BIOS", version)):
+                assert f"{prefix}　{value}" in labels, (prefix, value, labels.keys())
             assert "状態を再確認" in labels
             if status_only:
                 click_button(process, pid, labels[primary])

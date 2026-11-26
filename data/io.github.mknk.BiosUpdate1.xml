@@ -1,6 +1,7 @@
 <node>
   <interface name="io.github.mknk.BiosUpdate1">
     <method name="Status"><arg name="view" type="s" direction="out"/></method>
+    <method name="OpenPlan"><arg name="view" type="s" direction="out"/></method>
     <method name="Check"><arg name="view" type="s" direction="out"/></method>
     <method name="Prepare"><arg name="token" type="s" direction="in"/><arg name="view" type="s" direction="out"/></method>
     <method name="Dismiss"><arg name="plan" type="s" direction="in"/><arg name="view" type="s" direction="out"/></method>

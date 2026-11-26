@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 import catalog
 from catalog import Session
 from firmware_api import fw
+from hardware import _attempt
 
 
 GUID = "12345678-1234-1234-1234-123456789abc"
@@ -104,6 +105,40 @@ class CatalogTests(unittest.TestCase):
         self.assertTrue(all(args == (DEVICE,) for op, args in self.queries if op != "get_devices"))
         self.assertNotIn("checksum", report)
         self.assertEqual(report["token"], catalog.query("check", GUID)["token"])
+
+    def test_mirror_sync_is_unknown_even_when_signature_time_is_known(self):
+        official = catalog.query("check", GUID)
+        self.assertEqual(official["state"], "available", official)
+        self.assertNotIn("synced", official)
+
+        uri = "https://mirror.example/stable/firmware.xml.xz"
+        self.session.remote.return_value = dict(REMOTE, MetadataUri=uri, MetadataUriSig=uri + ".jcat", Mtime=45)
+        mirror = catalog.query("check", GUID)
+        self.assertEqual(mirror["state"], "available", mirror)
+        self.assertEqual(mirror["source"], "安定版ミラー mirror.example")
+        self.assertEqual(mirror["signed_timestamp"], official["signed_timestamp"])
+        self.assertEqual(mirror.get("synced"), "未確認")
+
+    def test_community_support_notice_stays_with_the_verified_candidate(self):
+        vendor = catalog.query("check", GUID)
+        self.release.update(Flags=["is-community"], Description="<p>Unverified text</p>")
+        community = catalog.query("check", GUID)
+        self.assertEqual(community["state"], "available", community)
+        self.assertEqual(community["changes"], vendor["changes"])
+        self.assertNotIn("メーカー", vendor["source"])
+        self.assertIn("コミュニティ提供", community["source"])
+        self.assertIn("メーカー", community["source"])
+        self.assertNotIn("Unverified", community["source"] + community["changes"])
+        self.assertNotEqual(community["token"], vendor["token"])
+        verified = {"checksum": CAB_DIGEST}
+        with (patch.object(fw, "support_profile", return_value={}),
+              patch.object(catalog, "verified_payload", return_value=(verified, {CAB_DIGEST}))):
+            for mode in ("prepare", "revalidate"):
+                with self.subTest(mode=mode):
+                    report = catalog.query(mode, GUID)
+                    self.assertEqual(report["state"], "available", report)
+                    self.assertEqual(report["source"], community["source"])
+                    self.assertEqual(report["token"], community["token"])
 
     def test_current_daemon_policy_is_used_for_download_and_cache_signatures(self):
         self.session.version = "2.1.1"
@@ -380,6 +415,42 @@ class CatalogTests(unittest.TestCase):
             self.assertEqual(plan["cab_sha512"], hashlib.sha512(b"cab").hexdigest())
             self.assertIn(CAB_DIGEST, actual)
             self.assertEqual(plan["target_raw"], 2)
+
+    def test_dotted_and_hex_cab_versions_identify_the_same_failed_esrt_attempt(self):
+        guid_bytes = uuid.UUID(GUID).bytes_le
+        image = struct.pack("<I16sB3xII", 1, guid_bytes, 1, 1, 0) + b"x"
+        fmp = struct.pack("<IHHQ", 1, 0, 1, 16) + image
+        payload = fw.FMP_CAPSULE + struct.pack("<III", 28, 0, 28 + len(fmp)) + fmp
+        profile = dict(fmp=dict(image_type_id=GUID, image_index=1, hardware_instance=0))
+        self.device.update(Version="1.0.0.0", VersionFormat="quad")
+        self.release.update(Version="1.2.3.4")
+        details = [dict(Guid=[GUID], Releases=[dict(self.release, Flags=["trusted-payload"])])]
+        self.session.rows.side_effect = lambda *args: details
+        for raw in ("1.2.3.4", "01.02.003.004", "0x01020304"):
+            with (self.subTest(raw=raw), tempfile.TemporaryFile() as cabinet,
+                  patch.object(catalog, "sealed_size", return_value=3),
+                  patch.object(fw, "read_cab_files", side_effect=lambda path, name=None:
+                               {name: payload} if name else {"bios.metainfo.xml": xml})):
+                xml = (f'<component><id>com.example.Bios</id><releases><release version="{raw}"/>'
+                       '</releases></component>').encode()
+                cabinet.write(b"cab")
+                plan, _ = catalog.verified_payload(cabinet, "revalidate", self.release, REMOTE,
+                                                   fw.CatalogCheck(3, True, {"sha256": CAB_DIGEST}, None),
+                                                   self.device, self.devices, GUID, profile, self.session)
+                plan.update(guid=GUID, attempt_version=0x01000000, attempt_status=0)
+                obs = dict(guid=GUID, attempt_version=0x01020304, attempt_status=3)
+                self.assertEqual(_attempt(plan, obs), (True, True))
+
+    def test_esrt_target_raw_requires_a_reversible_dotted_format(self):
+        for fmt, raw, expected in (
+                ("triplet", "1.2.772", 0x01020304), ("pair", "258.772", 0x01020304),
+                ("quad", "0.0.0.0", None), ("quad", "1.2.3.256", None),
+                ("quad", "1.2.3.4~rc", None), ("bcd", "1.2.3.4", None),
+                ("dell-bios", "2.3.4", None), ("dell-bios-msb", "1.2.3", None),
+                ("plain", "1.2.3.4", None)):
+            with self.subTest(fmt=fmt, raw=raw):
+                self.assertEqual(catalog.esrt_target_raw(raw, raw, fmt), expected)
+        self.assertIsNone(catalog.esrt_target_raw("1.2.3.4", "1.2.3.5", "quad"))
 
     @unittest.skipUnless(hasattr(os, "memfd_create"), "Linux sealable memfd")
     def test_metadata_fds_are_verified_sealed_and_rewound(self):

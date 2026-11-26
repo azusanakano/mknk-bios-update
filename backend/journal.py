@@ -22,6 +22,15 @@ def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def failure_text(failure):
+    if not failure:
+        return ""
+    fields = (("実機", "current"), ("試行版（ESRT）", "attempt_version"), ("状態", "status"),
+              ("観測日時", "observed_at"))
+    detail = "、".join(f"{label} {failure[key]}" for label, key in fields if failure.get(key) is not None)
+    return f"記録済みの ESRT 試行失敗（{detail}）" if detail else "記録済みの ESRT 試行失敗"
+
+
 OPERATION_TABLE = """CREATE TABLE IF NOT EXISTS operation (
     id TEXT PRIMARY KEY, boot TEXT NOT NULL, machine TEXT NOT NULL,
     plan TEXT NOT NULL, sender TEXT NOT NULL, daemon TEXT NOT NULL, bus TEXT NOT NULL,
@@ -148,6 +157,19 @@ class Journal:
         with self.transaction() as db:
             db.execute("DELETE FROM approval WHERE id=?", (plan_id,))
 
+    def recover_approval_claim(self, plan, recover):
+        # The service holds the machine state lock. Keep the proof of the
+        # unissued approval and marker removal in the same journal transaction.
+        with self.transaction() as db:
+            row = db.execute("SELECT plan FROM approval WHERE id=? AND boot=? AND machine=?",
+                             (plan["id"], plan["boot"], plan["machine"])).fetchone()
+            if row is None or json.loads(row["plan"]) != plan:
+                return False
+            operations = db.execute("SELECT 1 FROM operation WHERE id=? OR (boot=? AND outcome IS NOT 'rejected')"
+                                    " OR (active=1 AND " + RELEVANT_PC + ")",
+                                    (plan["id"], plan["boot"], *pc_scope(plan["machine"], plan["boot"])))
+            return operations.fetchone() is None and recover(plan)
+
     def issue(self, plan, sender, daemon, bus, *, from_approval=False):
         try:
             with self.transaction() as db:
@@ -214,12 +236,24 @@ class Journal:
             db.execute("""UPDATE operation SET active=0,outcome=?,observed=?,ended=?,observed_boot=?
                           WHERE id=? AND active=1""", (outcome, current, now(), observed_boot, op))
 
+    def failure(self, op, observation=None):
+        name = "failure-" + op
+        with self.transaction() as db:
+            if observation is not None:
+                record = dict(current=observation["current"], attempt_version=observation["attempt_version"],
+                              status=observation["attempt_status"], observed_at=now())
+                db.execute("INSERT OR IGNORE INTO setting VALUES (?,?)", (name, json.dumps(record)))
+            row = db.execute("SELECT value FROM setting WHERE name=?", (name,)).fetchone()
+            return json.loads(row[0]) if row else None
+
     def history(self, machine, boot=""):
         with self.transaction() as db:
-            rows = db.execute("""SELECT * FROM operation WHERE (machine=? AND machine!='') OR boot=?
-                                 OR (outcome='unattributed' AND observed_boot=?)
-                                 ORDER BY rowid DESC LIMIT 20""", (machine, boot, boot)).fetchall()
-        outcomes = {"installed": "目標版を確認", "unapplied": "目標版に未到達", "failed": "試行失敗",
+            rows = db.execute("""SELECT op.*, saved.value AS failure_json FROM operation AS op
+                                 LEFT JOIN setting AS saved ON saved.name='failure-' || op.id
+                                 WHERE (op.machine=? AND op.machine!='') OR op.boot=?
+                                 OR (op.outcome='unattributed' AND op.observed_boot=?)
+                                 ORDER BY op.rowid DESC LIMIT 20""", (machine, boot, boot)).fetchall()
+        outcomes = {"installed": "目標版を確認", "unapplied": "目標版と異なる", "failed": "試行失敗",
                     "unattributed": "旧計画への帰属は未確認", "rejected": "配置なしを確認"}
         receipts = {"accepted": "受付済み", "rejected": "未送達または配置前に拒否"}
         lines = []
@@ -227,8 +261,10 @@ class Journal:
             p = self.unpack(row)
             receipt = receipts.get(p["receipt"], "受付未確定")
             result = outcomes.get(p["outcome"], "結果を照合中")
+            failure = failure_text(json.loads(p["failure_json"])) if p["failure_json"] else ""
             lines.append(f"{p['issued']}　{p['current']} → {p['target']}　{receipt}　{result}"
-                         + (f"（実機 {p['observed']}）" if p["observed"] else ""))
+                         + (f"（実機 {p['observed']}）" if p["observed"] else "")
+                         + (f"　{failure}" if failure else ""))
         return "\n".join(lines)
 
     def bind_legacy_power_boot(self, op, request, boot):

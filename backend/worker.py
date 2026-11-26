@@ -14,7 +14,7 @@ from firmware_api import fw
 def import_metadata(request):
     try:
         import fcntl
-        from gi.repository import Gio, GLib
+        from gi.repository import Gio
         owner, remote = request["owner"], request["remote"]
         if not Gio.dbus_is_unique_name(owner) or not re.fullmatch(r"[A-Za-z0-9._-]+", remote):
             raise ValueError("invalid destination")
@@ -34,22 +34,41 @@ def import_metadata(request):
             os.lseek(fd, 0, os.SEEK_SET)
             fds.append(fd)
         bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
-        params = GLib.Variant("(shh)", (remote, 0, 1))
     except Exception:
         # No UpdateMetadata call has started. Suppress details that may contain URLs or credentials.
         return dict(terminal=True, ok=False, detail="取り込み前に配布設定または署名済みファイルを確認できませんでした。")
 
+    return send_metadata(bus, owner, remote, fds)
+
+
+def send_metadata(bus, owner, remote, fds):
+    from gi.repository import Gio, GLib
+
+    iface = "org.freedesktop.fwupd"
+    message = Gio.DBusMessage.new_method_call(owner, "/", iface, "UpdateMetadata")
+    message.set_flags(Gio.DBusMessageFlags.NO_AUTO_START)
+    message.set_body(GLib.Variant("(shh)", (remote, 0, 1)))
+    message.set_unix_fd_list(fds)
+    failure = dict(terminal=False, ok=False, detail="fwupd が配布情報の取り込みを完了できませんでした。")
     try:
-        bus.call_with_unix_fd_list_sync(owner, "/", "org.freedesktop.fwupd", "UpdateMetadata", params,
-                                        None, Gio.DBusCallFlags.NO_AUTO_START,
-                                        120000, fds, None)
-        return dict(terminal=True, ok=True)
-    except GLib.Error as exc:
-        error = Gio.DBusError.get_remote_error(exc) or ""
-        return dict(terminal=error.startswith("org.freedesktop.fwupd.") or
-                    error == "org.freedesktop.DBus.Error.ServiceUnknown",
-                    ok=error == "org.freedesktop.fwupd.NothingToDo",
-                    detail="fwupd が配布情報の取り込みを完了できませんでした。")
+        reply, _ = bus.send_message_with_reply_sync(message, Gio.DBusSendMessageFlags.NONE, 120000, None)
+    except GLib.Error:
+        return failure
+    sender, kind = reply.get_sender(), reply.get_message_type()
+    if sender == owner and kind == Gio.DBusMessageType.METHOD_RETURN:
+        body = reply.get_body()
+        if body is None or body.get_type_string() == "()":
+            return dict(terminal=True, ok=True)
+    if kind == Gio.DBusMessageType.ERROR:
+        name = reply.get_error_name() or ""
+        if sender == owner and name.startswith(iface + "."):
+            return dict(failure, terminal=True, ok=name == iface + ".NothingToDo")
+        if sender == "org.freedesktop.DBus" and name in (
+                "org.freedesktop.DBus.Error.NameHasNoOwner",
+                "org.freedesktop.DBus.Error.ServiceUnknown",
+                "org.freedesktop.DBus.Error.AccessDenied"):
+            return dict(failure, terminal=True)
+    return failure
 
 
 def main():

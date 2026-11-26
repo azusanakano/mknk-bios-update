@@ -15,13 +15,14 @@ from gi.repository import Gio, GLib
 from engine import Engine
 from firmware_api import fw
 from journal import Conflict, Journal
-from platform_linux import Platform
+from platform_linux import LOGIN, MANAGER, PROPERTIES, Platform
 
 
 NAME = "io.github.mknk.BiosUpdate1"
 OBJECT = "/io/github/mknk/BiosUpdate1"
 INTERFACE = "/usr/share/dbus-1/interfaces/io.github.mknk.BiosUpdate1.xml"
 STATE = Path("/var/lib/mknk-bios-update")
+RECEIPTS = frozenset(("Report", "ReportRejection", "DeclineAuthorization", "ReplyPower"))
 
 
 @contextmanager
@@ -52,6 +53,9 @@ class Service:
         self.engine = engine
         self.pool = ThreadPoolExecutor(max_workers=5)
         self.slots = BoundedSemaphore(16)
+        # Preserve capacity for terminal reports while reads and workers are busy.
+        self.receipt_pool = ThreadPoolExecutor(max_workers=2)
+        self.receipt_slots = BoundedSemaphore(4)
         self.timer = 0
         self.closing = False
         self.info = Gio.DBusNodeInfo.new_for_xml(interface)
@@ -59,6 +63,14 @@ class Service:
         self.subscriptions = [self.events.signal_subscribe(
             "org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged",
             "/org/freedesktop/DBus", None, Gio.DBusSignalFlags.NONE, self.owner_changed)]
+        self.topology_filter = 0
+        if isinstance(engine.platform, Platform):
+            # Revoke on the bus's incoming message order, before a worker can
+            # accept an authorization reply or validate a new write request.
+            self.topology_filter = self.events.add_filter(self.session_event, None)
+            for interface, signal in ((PROPERTIES, "PropertiesChanged"), (LOGIN + ".Manager", None)):
+                self.subscriptions.append(self.events.signal_subscribe(
+                    LOGIN, interface, signal, None, None, Gio.DBusSignalFlags.NONE, lambda *unused: None))
         for signal in ("DeviceAdded", "DeviceRemoved", "DeviceChanged"):
             self.subscriptions.append(self.events.signal_subscribe(
                 "org.freedesktop.fwupd", "org.freedesktop.fwupd", signal, "/", None,
@@ -66,6 +78,17 @@ class Service:
         self.subscriptions.append(self.events.signal_subscribe(
             "org.freedesktop.UPower", "org.freedesktop.DBus.Properties", "PropertiesChanged", None, None,
             Gio.DBusSignalFlags.NONE, self.observation_changed))
+        for signal in ("SessionNew", "SessionRemoved"):
+            self.subscriptions.append(self.events.signal_subscribe(
+                LOGIN, LOGIN + ".Manager", signal, MANAGER, None,
+                Gio.DBusSignalFlags.NONE, self.observation_changed))
+        self.subscriptions.append(self.events.signal_subscribe(
+            LOGIN, PROPERTIES, "PropertiesChanged", MANAGER, None,
+            Gio.DBusSignalFlags.NONE, self.inhibitors_changed))
+        for interface in ("Block", "Partition", "Filesystem"):
+            self.subscriptions.append(self.events.signal_subscribe(
+                "org.freedesktop.UDisks2", PROPERTIES, "PropertiesChanged", None, "org.freedesktop.UDisks2." + interface,
+                Gio.DBusSignalFlags.NONE, self.observation_changed))
         for signal in ("InterfacesAdded", "InterfacesRemoved"):
             self.subscriptions.append(self.events.signal_subscribe(
                 "org.freedesktop.UDisks2", "org.freedesktop.DBus.ObjectManager", signal,
@@ -74,12 +97,21 @@ class Service:
     def close(self):
         self.closing = True
         self.bus.unregister_object(self.registration)
+        if self.topology_filter:
+            self.events.remove_filter(self.topology_filter)
         for subscription in self.subscriptions:
             self.events.signal_unsubscribe(subscription)
         if self.timer:
             GLib.source_remove(self.timer)
             self.timer = 0
         self.pool.shutdown(wait=True, cancel_futures=True)
+        self.receipt_pool.shutdown(wait=True)
+
+    def session_event(self, conn, message, incoming, data):
+        if (incoming and not self.closing and message.get_message_type() == Gio.DBusMessageType.SIGNAL
+                and self.engine.platform.topology_changed(message)):
+            GLib.idle_add(self.observation_changed)
+        return message
 
     def owner_changed(self, conn, sender, path, iface, name, params):
         if self.closing:
@@ -89,7 +121,13 @@ class Service:
             # Most unique bus names belong to other apps (including inventory helpers).
             if unique in self.engine.drafts or unique in self.engine.candidates:
                 self.pool.submit(self.engine.disconnect, unique)
-        if unique == "org.freedesktop.fwupd":
+        if unique in ("org.freedesktop.fwupd", LOGIN, "org.freedesktop.UDisks2", "org.freedesktop.UPower"):
+            self.observation_changed()
+
+    def inhibitors_changed(self, conn, sender, path, iface, signal, params):
+        interface, changed, invalidated = params.unpack()
+        if interface == LOGIN + ".Manager" and {"BlockInhibited", "BlockWeakInhibited"}.intersection(
+                set(changed).union(invalidated)):
             self.observation_changed()
 
     def observation_changed(self, *unused):
@@ -103,14 +141,22 @@ class Service:
         return False
 
     def incoming(self, conn, sender, path, iface, method, parameters, invocation):
-        if not self.slots.acquire(blocking=False):
+        pool, slots = (self.receipt_pool, self.receipt_slots) if method in RECEIPTS else (self.pool, self.slots)
+        if not slots.acquire(blocking=False):
             invocation.return_dbus_error(NAME + ".Busy", "端末サービスが処理中です。少し待って再確認してください。")
             return
         # Peer message headers do not identify a system bus caller. Every method
         # on this connection belongs to the process authenticated at both sockets.
         caller = self.peer_sender if self.peer_sender is not None else sender
-        task = self.pool.submit(self.dispatch, caller, method, parameters.unpack())
-        task.add_done_callback(lambda done: GLib.idle_add(self.reply, invocation, method, done))
+        interactive = bool(invocation.get_message().get_flags() & Gio.DBusMessageFlags.ALLOW_INTERACTIVE_AUTHORIZATION)
+        task = pool.submit(self.dispatch, caller, method, parameters.unpack(), interactive)
+        task.add_done_callback(lambda done: GLib.idle_add(self.reply, invocation, method, done, slots))
+
+    @staticmethod
+    def authorization_reply(operation, owner, device, cabinet):
+        fds = Gio.UnixFDList.new()
+        index = fds.append(cabinet.fileno())
+        return GLib.Variant("(sssh)", (operation, owner, device, index)), fds
 
     def receipt_view(self, sender, args):
         platform = self.engine.platform
@@ -125,7 +171,7 @@ class Service:
             pass
         return {"recorded": True}
 
-    def dispatch(self, sender, method, args):
+    def dispatch(self, sender, method, args, interactive=False):
         platform = self.engine.platform
         if method in ("Report", "ReportRejection"):
             return GLib.Variant("(s)", (json.dumps(self.receipt_view(sender, args), ensure_ascii=False),)), None
@@ -136,6 +182,12 @@ class Service:
             self.engine.db.power_reply(args[0], sender, platform.bus_id, args[1])
             return GLib.Variant("()", ()), None
         actor = platform.actor(sender)
+        if method == "OpenPlan":
+            if not interactive:
+                raise Conflict("更新計画を開くには画面で管理者認証を開始してください。")
+            actor = platform.open_plan(actor)
+            self.engine.required(actor)
+            method = "Status"
         if self.peer_sender is not None and method != "Status" and not actor.writable:
             raise Conflict("操作するには、アクティブなローカル画面から開いてください。")
         views = {"Status": self.engine.status, "Check": self.engine.check, "Prepare": self.engine.prepare,
@@ -143,11 +195,7 @@ class Service:
         if method in views:
             return GLib.Variant("(s)", (json.dumps(views[method](actor, *args), ensure_ascii=False),)), None
         if method == "Authorize":
-            op, owner, device, cabinet = self.engine.authorize(actor, *args)
-            with cabinet:
-                fds = Gio.UnixFDList.new()
-                index = fds.append(cabinet.fileno())
-                return GLib.Variant("(sssh)", (op, owner, device, index)), fds
+            return self.engine.authorize(actor, *args, prepare_reply=self.authorization_reply)
         if method == "Power":
             return GLib.Variant("(sss)", self.engine.power(actor, *args)), None
         if method == "CheckPower":
@@ -158,8 +206,8 @@ class Service:
             raise Conflict("この操作を認識できません。")
         return GLib.Variant("()", ()), None
 
-    def reply(self, invocation, method, result):
-        self.slots.release()
+    def reply(self, invocation, method, result, slots):
+        slots.release()
         if self.closing or self.bus.is_closed():
             return False
         try:

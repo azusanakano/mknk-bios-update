@@ -1,3 +1,13 @@
+mknk-bios-update (0.1.2) noble; urgency=medium
+
+  * Verify the live fwupd delivery method and authenticate explicit desktop access.
+  * Recover interrupted preparation, keep attributed update results, and refresh
+    manual power guidance on changes to the desktop or storage.
+  * Fix catalog and CLI compatibility, preserve review details, and declare the
+    accessibility service needed by the GTK packaging tests.
+
+ -- MKNK BIOS Update contributors <mknk-bios-update@localhost>  Thu, 26 Nov 2026 16:00:00 +0900
+
 mknk-bios-update (0.1.1) noble; urgency=medium
 
   * Rebuild the Debian package and AppImage from the same release source.
