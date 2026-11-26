@@ -25,8 +25,8 @@ MACHINE = "f8808e2b-2a4e-4658-a3e5-600037b18795"
 BOOT = "8d65e75b-3a14-461f-a285-1e7d423ce337"
 
 
-def file_path(name, partition=PART, number=1):
-    hd = struct.pack("<BBHIQQ16sBB", 4, 1, 42, number, 2048, 32768,
+def file_path(name, partition=PART, number=1, start=2048, size=32768):
+    hd = struct.pack("<BBHIQQ16sBB", 4, 1, 42, number, start, size,
                      uuid.UUID(partition).bytes_le, 2, 2)
     encoded = ("\\" + name.replace("/", "\\") + "\0").encode("utf-16-le")
     return hd + struct.pack("<BBH", 4, 4, len(encoded) + 4) + encoded + b"\x7f\xff\x04\x00"
@@ -71,7 +71,15 @@ class ObservationTest(unittest.TestCase):
         }
         self.fake(fw, "mount_points", return_value=self.mounts)
         self.find_esp = self.fake(fw, "find_esp", return_value=(self.esp, PART))
-        self.fake(fw, "partition_number", return_value=1)
+        disk = self.root / "sysfs-disk"
+        self.partition = disk / "partition"
+        self.partition.mkdir(parents=True)
+        self.block_size = disk / "queue/logical_block_size"
+        self.block_size.parent.mkdir()
+        self.block_size.write_text("512")
+        for key, value in {"partition": "1", "start": "2048", "size": "32768"}.items():
+            (self.partition / key).write_text(value)
+        self.fake(fw, "partition_sysfs_path", return_value=self.partition)
         self.disk = self.fake(hw, "_physical_disk", return_value="disk-wwid-hash")
         self.fake(hw, "_platform")
         self.busy = self.fake(hw, "_daemon_busy", return_value=False)
@@ -300,6 +308,60 @@ class ObservationTest(unittest.TestCase):
         self.disk.return_value = "replacement-disk-with-cloned-partuuid"
         self.assertEqual(hw.observe(self.plan)["reservation"], "unknown")
 
+    def test_cod_allows_the_same_physical_disk_to_be_renumbered_after_boot(self):
+        self.stage_cod()
+        self.mounts[str(self.esp)] = self.mounts[str(self.esp)]._replace(device="8:17")
+        self.assertFalse(hw.observe(self.plan)["power"])
+
+        self.device["Version"] = "2"
+        (self.esrt / "fw_version").write_text("2")
+        fw.BOOT_ID.write_text(str(uuid.uuid4()))
+        self.var("OsIndications", struct.pack("<Q", 0))
+        obs = hw.observe(self.plan)
+        self.assertEqual(obs["reservation"], "clear", obs["detail"])
+        self.assertIn("カプセル", obs["prepare_block"])
+        self.disk.return_value = "replacement-disk-with-cloned-partuuid"
+        self.assertEqual(hw.observe(self.plan)["reservation"], "unknown")
+
+    def test_verified_cod_route_can_follow_a_missing_boot_order_entry(self):
+        self.var("BootOrder", struct.pack("<HH", 240, 2))
+        with self.assertRaisesRegex(hw.Hold, "Boot00F0"):
+            hw.preflight(self.plan)
+
+        self.profile["secure_boot"]["boot_order_skip_missing"] = True
+        self.stage_cod()
+        obs = hw.observe(self.plan)
+        self.assertEqual(hw.check_power_action(self.plan, obs), "reboot")
+
+        self.var("Boot00F0", b"malformed")
+        self.assertFalse(hw.observe(self.plan)["power"])
+        self.var("Boot00F0", boot_option("Other ESP", file_path("EFI/other/loader.efi", partition=GUID)))
+        self.assertFalse(hw.observe(self.plan)["power"])
+
+    def test_verified_cod_route_holds_an_unreadable_or_malformed_first_boot_option(self):
+        self.profile["secure_boot"]["boot_order_skip_missing"] = True
+        self.var("BootOrder", struct.pack("<HH", 240, 2))
+        boot_path = bytearray(file_path("EFI/ubuntu/shimx64.efi"))
+        boot_path[-6:-4] = b"xx"  # Correct framing, but File() has no UTF-16 terminator.
+        self.var("Boot00F0", boot_option("Ubuntu", boot_path))
+        with self.assertRaisesRegex(hw.Hold, "Boot00F0"):
+            hw.preflight(self.plan)
+
+        (fw.EFIVARS / f"Boot00F0-{fw.EFI_GLOBAL}").unlink()
+        self.stage_cod()
+
+        read = fw.read_efi_variable
+
+        def deny_one_variable(path):
+            if path.name.startswith("Boot00F0-"):
+                raise PermissionError("Boot00F0 unreadable")
+            return read(path)
+
+        with patch.object(fw, "read_efi_variable", side_effect=deny_one_variable):
+            obs = hw.observe(self.plan)
+        self.assertFalse(obs["power"])
+        self.assertIn("Boot00F0 unreadable", obs["detail"])
+
     def test_completed_cod_file_stays_visible_after_reopen_but_foreign_changes_hold(self):
         capsule = self.stage_cod()
         self.device["Version"] = "2"
@@ -445,6 +507,57 @@ class ObservationTest(unittest.TestCase):
         self.var(f"fwupd-{GUID}-0", info + file_path(route["file"], number=2), fw.FWUPDATE_GUID)
         with self.assertRaisesRegex(hw.Hold, "ESP"):
             hw.check_power_action(self.plan, hw.observe(self.plan))
+
+    def test_nvram_requires_current_lbas_in_both_paths_even_for_a_legacy_plan(self):
+        route, info = self.stage_nvram(False)
+        registration = f"fwupd-{GUID}-0"
+        legacy = dict(self.plan, binding={k: v for k, v in route.items() if k not in ("start_lba", "size_lba")})
+        for plan in (self.plan, legacy):
+            self.var("Boot0007", boot_option("Linux Firmware Updater", file_path(route["loader"])))
+            self.var(registration, info + file_path(route["file"]), fw.FWUPDATE_GUID)
+            self.assertEqual(hw.check_power_action(plan, hw.observe(plan)), "reboot")
+            self.var(registration, info + file_path(route["file"], start=4096), fw.FWUPDATE_GUID)
+            self.assertFalse(hw.observe(plan)["power"])
+            self.var(registration, info + file_path(route["file"]), fw.FWUPDATE_GUID)
+            self.var("Boot0007", boot_option("Linux Firmware Updater", file_path(route["loader"], size=65536)))
+            self.assertFalse(hw.observe(plan)["power"])
+
+    def test_nvram_checks_4k_disk_geometry_in_logical_blocks(self):
+        self.block_size.write_text("4096")
+        route, info = self.stage_nvram(False)
+        self.var("Boot0007", boot_option("Linux Firmware Updater", file_path(route["loader"], start=256, size=4096)))
+        self.var(f"fwupd-{GUID}-0", info + file_path(route["file"], start=256, size=4096), fw.FWUPDATE_GUID)
+        self.assertEqual(hw.check_power_action(self.plan, hw.observe(self.plan)), "reboot")
+
+        (self.partition / "start").write_text("2049")
+        self.assertFalse(hw.observe(self.plan)["power"])
+
+    def test_fmp_image_instance_is_independent_of_linux_esrt_registration(self):
+        self.profile["fmp"] = dict(image_type_id=GUID, image_index=1, hardware_instance=7)
+        image = struct.pack("<I16sB3xIIQ", 2, uuid.UUID(GUID).bytes_le, 1, 1, 0, 7) + b"x"
+        fmp = struct.pack("<IHHQ", 1, 0, 1, 16) + image
+        self.payload = fw.FMP_CAPSULE + struct.pack("<III", 28, 0, 28 + len(fmp)) + fmp
+        self.assertEqual(fw.check_capsule_scope(self.payload, GUID, self.profile), "FMP画像1件")
+        self.plan.update(payload_sha256=hashlib.sha256(self.payload).hexdigest(), payload_size=len(self.payload))
+        route, info = self.stage_nvram(False)
+        self.var("Boot0007", boot_option("Linux Firmware Updater", file_path(route["loader"])))
+        obs = hw.observe(self.plan)
+        self.assertEqual(hw.check_power_action(self.plan, obs), "reboot")
+
+        legacy = dict(route)
+        legacy["instance"] = legacy.pop("fmp_instance")
+        del legacy["registration_instance"]
+        self.assertEqual(hw.observe(dict(self.plan, binding=legacy))["power"], "reboot")
+
+        registration = fw.EFIVARS / f"fwupd-{GUID}-0-{fw.FWUPDATE_GUID}"
+        registration.unlink()
+        other_info = bytearray(info)
+        struct.pack_into("<Q", other_info, 24, 7)
+        self.var(f"fwupd-{GUID}-7", other_info + file_path(route["file"]), fw.FWUPDATE_GUID)
+        self.assertFalse(hw.observe(self.plan)["power"])
+        self.profile["fmp"]["hardware_instance"] = 0
+        with self.assertRaises(hw.Hold):
+            fw.check_capsule_scope(self.payload, GUID, self.profile)
 
     def test_nvram_flags_must_match_the_esrt_and_approved_registration(self):
         # fwupd only supplies BOTH x86 reset flags when NEITHER is present.

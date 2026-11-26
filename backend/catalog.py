@@ -60,7 +60,12 @@ class Session:
         if not self.client.set_feature_flags(self.Fwupd.FeatureFlags.NONE, None):
             raise fw.Hold("fwupdで画面の機能を登録できません。")
         self.owner = self.current_owner()
-        self.version = self.client.get_daemon_version()
+        # Read the property from the same unique owner that the service will
+        # confirm before using the signature generation.
+        self.version = self.bus.call_sync(
+            self.owner, "/", "org.freedesktop.DBus.Properties", "Get",
+            self.GLib.Variant("(ss)", (fw.FWUPD_ID, "DaemonVersion")),
+            self.GLib.VariantType.new("(v)"), Gio.DBusCallFlags.NO_AUTO_START, 5000, None).unpack()[0]
         if not isinstance(self.version, str) or not re.fullmatch(r"[0-9]{1,9}(?:\.[0-9]{1,9}){2}", self.version):
             raise fw.Hold("fwupdの版を確認できません。")
         if fw.version_key(self.version, None) < fw.version_key(MIN_DAEMON_VERSION, None):
@@ -129,7 +134,7 @@ def signature_json(signature):
     return decoded.decode()
 
 
-def signing_time(metadata, signature):
+def signing_time(metadata, signature, *, daemon_version):
     import gi
     gi.require_version("Jcat", "1.0")
     from gi.repository import GLib, Jcat
@@ -149,7 +154,12 @@ def signing_time(metadata, signature):
     with tempfile.TemporaryDirectory() as keyring:
         context = Jcat.Context.new()
         context.set_keyring_path(keyring)
-        for kind in (Jcat.BlobKind.SHA256, Jcat.BlobKind.SHA512, Jcat.BlobKind.PKCS7, Jcat.BlobKind.GPG):
+        kinds = (Jcat.BlobKind.SHA256, Jcat.BlobKind.SHA512, Jcat.BlobKind.PKCS7)
+        # fwupd 2.1.1's explicit allowlist excludes GPG. A worker with a
+        # GPG-capable libjcat must not use such a signature as a rollback floor.
+        if fw.version_key(daemon_version, None) < fw.version_key("2.1.1", None):
+            kinds += (Jcat.BlobKind.GPG,)
+        for kind in kinds:
             context.blob_kind_allow(kind)
         for directory in TRUST_DIRECTORIES:
             context.add_public_keys(directory)
@@ -162,9 +172,9 @@ def signing_time(metadata, signature):
     return timestamp
 
 
-def authenticated(metadata, signature, guids):
+def authenticated(metadata, signature, guids, *, daemon_version):
     try:
-        timestamp = signing_time(metadata, signature)
+        timestamp = signing_time(metadata, signature, daemon_version=daemon_version)
     except Exception as exc:
         raise fw.Hold("OSの信頼鍵と署名ポリシーで配布カタログを検証できません。") from exc
     if not metadata.startswith((b"\xfd7zXZ\x00", b"\x28\xb5\x2f\xfd")):
@@ -284,7 +294,7 @@ class NeedsRefresh(fw.Hold):
     pass
 
 
-def compare_cache(remote, pair, info, report):
+def compare_cache(remote, pair, info, report, *, daemon_version):
     try:
         cached = cache_pair(remote)
     except FileNotFoundError:
@@ -292,7 +302,7 @@ def compare_cache(remote, pair, info, report):
     if cached == pair:
         return cached
     try:
-        _, old = authenticated(*cached, set())
+        _, old = authenticated(*cached, set(), daemon_version=daemon_version)
     except fw.Hold:
         # The service's independent durable high-water mark still gates replacement.
         return None
@@ -534,9 +544,9 @@ def run(mode, guid, cabinet=None, metadata=None, signature=None):
                       remote_fingerprint=remote_fingerprint(remote))
         pair = download(remote, settings, session)
         guids = {g.lower() for g in fw.strings(device, "Guid")} | {guid}
-        components, info = authenticated(*pair, guids)
+        components, info = authenticated(*pair, guids, daemon_version=session.version)
         report.update(info)
-        cached = compare_cache(remote, pair, info, report)
+        cached = compare_cache(remote, pair, info, report, daemon_version=session.version)
         if mode == "metadata":
             write_sealed(metadata, pair[0])
             write_sealed(signature, pair[1])

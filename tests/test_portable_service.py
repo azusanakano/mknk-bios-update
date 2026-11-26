@@ -305,6 +305,95 @@ class PortablePlatformTest(unittest.TestCase):
                 with self.assertRaises(Conflict):
                     platform.metadata_clear(journal)
 
+    def test_stale_metadata_reader_cannot_clear_a_new_request(self):
+        from threading import Event, Thread
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            boot = root / "boot"
+            boot.write_text("current-boot", encoding="ascii")
+            journal = Journal(root / "state")
+            journal.setting("metadata-request", dict(boot="old-boot", pid=os.getpid(), start="old"))
+            platform = object.__new__(Platform)
+            seen_old = Event()
+            allow_clear = Event()
+            outcomes = []
+            lookup = journal.setting
+            start = (Path("/proc") / str(os.getpid()) / "stat").read_text().rsplit(")", 1)[1].split()[19]
+            new = dict(id="new", boot="current-boot", pid=os.getpid(), start=start)
+
+            def pause_after_read(name, value=None):
+                result = lookup(name, value)
+                if value is None and result and result["boot"] == "old-boot":
+                    seen_old.set()
+                    if not allow_clear.wait(3):
+                        raise AssertionError("timed out waiting to resume the old reader")
+                return result
+
+            def reconcile():
+                try:
+                    platform.metadata_clear(journal)
+                except Exception as exc:
+                    outcomes.append(exc)
+
+            with patch.object(journal, "setting", side_effect=pause_after_read), patch.object(fw, "BOOT_ID", boot):
+                reader = Thread(target=reconcile)
+                reader.start()
+                try:
+                    self.assertTrue(seen_old.wait(3))
+                    Journal(root / "state").setting("metadata-request", new)
+                finally:
+                    allow_clear.set()
+                    reader.join()
+            self.assertEqual(lookup("metadata-request"), new)
+            self.assertEqual(len(outcomes), 1)
+            self.assertIsInstance(outcomes[0], Conflict)
+
+    def test_metadata_worker_reports_definite_not_sent_when_remote_lookup_fails(self):
+        import worker
+
+        with patch.object(fw, "read_settings", return_value={}), patch.object(
+                worker.catalog, "Session") as session, patch.object(Gio, "bus_get_sync") as bus:
+            session.return_value.remote.side_effect = fw.Hold("fixture failure with private details")
+            response = worker.import_metadata(dict(owner=":1.2", remote="lvfs", fds=[]))
+        bus.assert_not_called()
+        self.assertIs(response["terminal"], True)
+        self.assertIs(response["ok"], False)
+        self.assertNotIn("private", response["detail"])
+
+    def test_portable_profile_change_preserves_the_terminal_import_response(self):
+        import pwd
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            boot = root / "boot"
+            boot.write_text("same-boot", encoding="ascii")
+            journal = Journal(root / "state")
+            platform = object.__new__(Platform)
+            platform.portable = True
+            platform.bus_id = "bus"
+            platform.worker_user = pwd.getpwnam("nobody")
+            platform.cabinet = tempfile.TemporaryFile
+            platform.confirm_owner = lambda owner: None
+            platform.call = lambda *args: (os.getpid(),)
+            catalog = dict(state="metadata", signed_timestamp=100, catalog_sha256="a" * 64,
+                           daemon_owner=":1.8", remote_id="stable", remote_fingerprint="remote",
+                           settings_fingerprint="settings")
+            run = platform.run_worker
+
+            def worker(mode, *args, **kwargs):
+                return catalog if mode == "metadata" else run(mode, *args, **kwargs)
+
+            for changed in ({"version": "changed"}, fw.Hold("configuration cannot be read")):
+                with self.subTest(changed=changed), patch.object(platform, "run_worker", side_effect=worker), patch.object(
+                        fw, "BOOT_ID", boot), patch.object(fw, "read_settings", side_effect=[{}, changed]), patch(
+                        "platform_linux.read_trust_policy", return_value="0"), patch.object(
+                        platform, "execute_worker", return_value=subprocess.CompletedProcess(
+                            [], 0, b'{"terminal": true, "ok": true}')):
+                    with self.assertRaises(Conflict):
+                        platform.refresh("guid", journal, lambda: None)
+                self.assertFalse(journal.setting("metadata-request"))
+
     def test_declined_authorization_removes_only_the_matching_marker(self):
         import uuid
         from types import SimpleNamespace

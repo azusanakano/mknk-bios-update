@@ -12,7 +12,7 @@ from threading import BoundedSemaphore
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gi.repository import Gio, GLib
-from engine import Actor, Engine
+from engine import Engine
 from firmware_api import fw
 from journal import Conflict, Journal
 from platform_linux import Platform
@@ -66,6 +66,10 @@ class Service:
         self.subscriptions.append(self.events.signal_subscribe(
             "org.freedesktop.UPower", "org.freedesktop.DBus.Properties", "PropertiesChanged", None, None,
             Gio.DBusSignalFlags.NONE, self.observation_changed))
+        for signal in ("InterfacesAdded", "InterfacesRemoved"):
+            self.subscriptions.append(self.events.signal_subscribe(
+                "org.freedesktop.UDisks2", "org.freedesktop.DBus.ObjectManager", signal,
+                "/org/freedesktop/UDisks2", None, Gio.DBusSignalFlags.NONE, self.observation_changed))
 
     def close(self):
         self.closing = True
@@ -108,28 +112,34 @@ class Service:
         task = self.pool.submit(self.dispatch, caller, method, parameters.unpack())
         task.add_done_callback(lambda done: GLib.idle_add(self.reply, invocation, method, done))
 
+    def receipt_view(self, sender, args):
+        platform = self.engine.platform
+        # Receipt ownership is independent of the caller's current right to see the machine.
+        self.engine.record_receipt(sender, platform.bus_id, *args)
+        try:
+            actor = platform.actor(sender)
+            view = self.engine.status(actor)
+            if platform.actor(sender) == actor:
+                return view
+        except (Conflict, GLib.Error, OSError):
+            pass
+        return {"recorded": True}
+
     def dispatch(self, sender, method, args):
         platform = self.engine.platform
-        receipt = method in ("Report", "ReportRejection")
+        if method in ("Report", "ReportRejection"):
+            return GLib.Variant("(s)", (json.dumps(self.receipt_view(sender, args), ensure_ascii=False),)), None
         if method == "DeclineAuthorization":
             self.engine.decline_authorization(sender, args[0])
             return GLib.Variant("()", ()), None
         if method == "ReplyPower":
             self.engine.db.power_reply(args[0], sender, platform.bus_id, args[1])
             return GLib.Variant("()", ()), None
-        try:
-            actor = platform.actor(sender)
-        except (Conflict, GLib.Error, OSError):
-            if not receipt:
-                raise
-            # The journal binds the receipt to the original unique connection and bus.
-            # A session switch removes write access to the view but does not lose its receipt.
-            actor = Actor(sender, -1, "", platform.bus_id, False, "", "")
-        if self.peer_sender is not None and method != "Status" and not receipt and not actor.writable:
+        actor = platform.actor(sender)
+        if self.peer_sender is not None and method != "Status" and not actor.writable:
             raise Conflict("操作するには、アクティブなローカル画面から開いてください。")
         views = {"Status": self.engine.status, "Check": self.engine.check, "Prepare": self.engine.prepare,
-                 "Dismiss": self.engine.dismiss, "Report": self.engine.report, "Replan": self.engine.replan,
-                 "ReportRejection": self.engine.report_rejection, "TakeOver": self.engine.take_over}
+                 "Dismiss": self.engine.dismiss, "Replan": self.engine.replan, "TakeOver": self.engine.take_over}
         if method in views:
             return GLib.Variant("(s)", (json.dumps(views[method](actor, *args), ensure_ascii=False),)), None
         if method == "Authorize":
@@ -140,6 +150,8 @@ class Service:
                 return GLib.Variant("(sssh)", (op, owner, device, index)), fds
         if method == "Power":
             return GLib.Variant("(sss)", self.engine.power(actor, *args)), None
+        if method == "CheckPower":
+            return GLib.Variant("(s)", (self.engine.check_power(actor, *args),)), None
         if method == "RecheckPower":
             self.engine.recheck_power(actor, *args)
         else:

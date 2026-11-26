@@ -8,7 +8,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 from hardware import check_power_action
-from journal import Conflict, Journal
+from firmware_api import fw
+from journal import Conflict, Journal, METADATA_PENDING
 from engine import Actor, Engine
 
 
@@ -70,6 +71,20 @@ class EngineTest(unittest.TestCase):
         self.assertTrue(candidate["can_prepare"])
         return self.engine.prepare(self.user, candidate["token"])
 
+    def test_manual_power_check_is_read_only_and_needs_current_power(self):
+        review = self.review()
+        operation, _, _, cabinet = self.engine.authorize(self.user, review["plan"])
+        cabinet.close()
+        self.machine.observation.update(reservation="matching", power="reboot")
+        self.machine.check_power_action = check_power_action
+        self.machine.power_allowed = lambda *_: None
+        self.assertEqual(self.engine.check_power(self.user, operation), "reboot")
+        self.assertIsNone(self.db.active()["power_id"])
+        self.machine.observation["power"] = ""
+        with self.assertRaises(fw.Hold):
+            self.engine.check_power(self.user, operation)
+        self.assertIsNone(self.db.active()["power_id"])
+
     def test_review_keeps_model_and_installed_version_and_dismiss_never_issues(self):
         review = self.review()
         self.assertEqual((review["model"], review["current"], review["target"]), ("NB-14", "1.20", "1.24"))
@@ -99,6 +114,34 @@ class EngineTest(unittest.TestCase):
         self.assertTrue(reply.get("prepared_draft"))
         self.engine.dismiss(self.user, reply["prepared_draft"])
         self.assertEqual(self.db.approval()["id"], other_plan)
+
+    def test_uncertain_metadata_import_allows_lookup_but_blocks_cab_download(self):
+        def check_import(db):
+            if db.setting("metadata-request"):
+                raise Conflict(METADATA_PENDING)
+
+        self.machine.metadata_clear = check_import
+        requested = []
+        original_worker = self.machine.worker
+
+        def worker(mode, *args):
+            requested.append(mode)
+            return original_worker(mode, *args)
+
+        self.machine.worker = worker
+        view = self.engine.check(self.user)
+        self.assertTrue(view["can_prepare"])
+        self.db.setting("metadata-request", {"id": "previous-import"})
+        blocked = self.engine.check(self.user)
+        self.assertFalse(blocked["can_prepare"])
+        self.assertTrue(blocked["can_check"])
+        self.assertEqual(blocked["target"], view["target"])
+        self.assertIn(METADATA_PENDING, blocked["detail"])
+        with self.assertRaises(Conflict):
+            self.engine.prepare(self.user, view["token"])
+        self.assertEqual(requested, ["check", "check"])
+        self.db.setting("metadata-request", {})
+        self.assertTrue(self.engine.prepare(self.user, view["token"])["can_approve"])
 
     def test_issued_operation_survives_gui_disconnect_and_is_not_resent(self):
         review = self.review()
@@ -184,6 +227,26 @@ class EngineTest(unittest.TestCase):
         with self.assertRaises(Conflict):
             self.db.power_reply(original, self.user.sender, self.user.bus, True)
         reopened.recheck_power(current, later)
+
+    def test_recorded_failure_blocks_all_power_entrypoints_after_esrt_changes(self):
+        self.machine.check_power_action = check_power_action
+        self.machine.power_allowed = lambda *_: None
+        plan = self.review()["plan"]
+        *_, cabinet = self.engine.authorize(self.user, plan)
+        cabinet.close()
+        self.machine.observation.update(reservation="matching", power="reboot")
+        request, _, _ = self.engine.power(self.user, plan)
+        self.machine.observation.update(new_failure=True, attempt_status=1)
+        self.assertEqual(self.engine.status(self.user)["state"], "hold")
+        self.machine.observation.update(new_failure=False, attempt_status=0)
+        self.assertEqual(self.engine.status(self.user)["state"], "hold")
+        with self.assertRaises(Conflict):
+            self.engine.recheck_power(self.user, request)
+        self.db.power_reply(request, self.user.sender, self.user.bus, True)
+        for verify in (self.engine.power, self.engine.check_power):
+            with self.subTest(method=verify.__name__), self.assertRaises(Conflict):
+                verify(self.user, plan)
+        self.assertIsNone(self.db.active(plan_id=plan)["power_id"])
 
     def test_external_reservation_wins_over_cached_catalog(self):
         self.engine.check(self.user)
@@ -315,6 +378,28 @@ class EngineTest(unittest.TestCase):
 
         self.authorize_after_catalog_wait(power_lost)
 
+    def test_additional_encryption_requires_a_fresh_explicit_approval(self):
+        kinds = ["LUKS"]
+
+        def recovery(plan):
+            plan["recovery_detail"] = "・".join(kinds)
+            return True
+
+        self.machine.recovery_required = recovery
+        original = self.review()
+        self.assertEqual(original["recovery_detail"], "LUKS")
+        kinds.append("BitLocker")
+        with self.assertRaisesRegex(Conflict, "回復手段"):
+            *_, cabinet = self.engine.authorize(self.user, original["plan"])
+            cabinet.close()
+        self.assertIsNone(self.db.active())
+        self.assertIsNone(self.db.approval())
+        revised = self.review()
+        self.assertIn("BitLocker", revised["recovery_detail"])
+        self.assertNotEqual(original["plan"], revised["plan"])
+        *_, cabinet = self.engine.authorize(self.user, revised["plan"])
+        cabinet.close()
+
     def test_can_replan_after_reboot_without_esrt_attempt_result(self):
         review = self.review()
         operation, _, _, cabinet = self.engine.authorize(self.user, review["plan"])
@@ -330,11 +415,76 @@ class EngineTest(unittest.TestCase):
 
         self.assertFalse(self.engine.status(self.machine.actor(":2.0"))["can_replan"])
         self.machine.observation["machine"] = "different"
-        self.assertFalse(self.engine.status(self.user)["can_replan"])
+        self.assertFalse(self.engine.status(self.user).get("can_replan", False))
         with self.assertRaises(Conflict):
             self.engine.replan(self.user, operation)
         self.machine.observation["machine"] = "uuid"
         self.assertEqual(self.engine.replan(self.user, operation)["state"], "available")
+        self.assertEqual(self.db.last(self.db.machine_key("uuid"), "boot-2")["outcome"], "unattributed")
+
+    def test_moved_disk_retains_old_pc_record_and_allows_an_independent_plan(self):
+        first = self.review()["plan"]
+        _, _, _, cabinet = self.engine.authorize(self.user, first)
+        cabinet.close()
+        self.engine.report(self.user, first, True)
+
+        self.machine.observation.update(machine="another-pc", boot="boot-2", reservation="foreign")
+        blocked = self.engine.check(self.user)
+        self.assertFalse(blocked["can_check"])
+        self.assertFalse(blocked["can_prepare"])
+        self.machine.observation["reservation"] = "clear"
+        second = self.review()["plan"]
+        self.assertNotEqual(first, second)
+        self.assertNotIn("受付済み", self.engine.status(self.user)["history"])
+        _, _, _, cabinet = self.engine.authorize(self.user, second)
+        cabinet.close()
+
+        self.machine.observation.update(machine="uuid", boot="boot-3", reservation="matching", power="reboot")
+        reopened = Engine(Journal(self.db.path), self.machine)
+        restored = reopened.status(self.user)
+        self.assertEqual((restored["plan"], restored["state"]), (first, "pending"))
+        self.assertEqual(self.db.active(plan_id=second)["receipt"], "unknown")
+
+        self.machine.observation.update(machine="", boot="boot-4", reservation="clear")
+        ambiguous = reopened.status(self.user)
+        self.assertFalse(ambiguous["can_check"])
+        self.assertFalse(ambiguous.get("can_replan", False))
+
+    def test_unidentified_old_operation_still_blocks_a_known_pc_until_reconciled(self):
+        self.machine.observation["machine"] = ""
+        first = self.review()["plan"]
+        _, _, _, cabinet = self.engine.authorize(self.user, first)
+        cabinet.close()
+        self.machine.observation.update(machine="another-pc", boot="boot-2")
+        view = self.engine.status(self.user)
+        self.assertEqual(view["plan"], first)
+        self.assertFalse(view["can_check"])
+
+    def test_administrator_can_resolve_sent_operation_with_unconfirmed_result(self):
+        plan = self.review()["plan"]
+        _, _, _, cabinet = self.engine.authorize(self.user, plan)
+        cabinet.close()
+        self.engine.report(self.user, plan, True)
+        actor = self.machine.actor
+        self.machine.actor = lambda sender: replace(actor(sender), uid=1001)
+        colleague = self.machine.actor(":1.3")
+        self.machine.observation.update(boot="boot-2", attempt_status=None, attempt_comparable=False)
+        self.assertTrue(self.engine.status(colleague).get("can_take_over", False))
+        self.assertFalse(self.engine.status(colleague).get("can_replan", False))
+
+        def reservation_appeared(_):
+            self.machine.observation["reservation"] = "foreign"
+
+        self.machine.require_administrator = reservation_appeared
+        with self.assertRaises(Conflict):
+            self.engine.take_over(colleague, plan)
+        self.assertIsNotNone(self.db.active(plan_id=plan))
+        self.machine.observation["reservation"] = "clear"
+        confirmations = []
+        self.machine.require_administrator = confirmations.append
+        self.assertTrue(self.engine.take_over(colleague, plan)["can_check"])
+        self.assertEqual(confirmations, [colleague])
+        self.assertIsNone(self.db.active(plan_id=plan))
         self.assertEqual(self.db.last(self.db.machine_key("uuid"), "boot-2")["outcome"], "unattributed")
 
     def test_new_boot_can_discard_an_unattributed_operation_only_after_route_clears(self):
@@ -414,6 +564,31 @@ class EngineTest(unittest.TestCase):
         new = reopened.prepare(other, reopened.check(other)["token"])
         self.assertNotEqual(new["plan"], op)
         self.assertTrue(new["can_approve"])
+
+    def test_numeric_uid_reused_by_a_new_login_does_not_own_the_saved_approval(self):
+        op = self.save_approval_for_recovery()
+        original_actor = self.machine.actor
+        self.machine.actor = lambda sender: replace(original_actor(sender), session="new-logind-session")
+        reused_uid = self.machine.actor(":1.3")
+        for boot in ("boot-1", "boot-2"):
+            with self.subTest(boot=boot):
+                self.machine.observation["boot"] = boot
+                view = self.engine.status(reused_uid)
+                self.assertFalse(view["can_approve"])
+                self.assertFalse(view["can_replan"])
+                self.assertTrue(view["can_take_over"])
+                with self.assertRaises(Conflict):
+                    self.engine.dismiss(reused_uid, op)
+                with self.assertRaises(Conflict):
+                    self.engine.replan(reused_uid, op)
+                with self.assertRaises(Conflict):
+                    self.engine.authorize(reused_uid, op)
+                self.assertEqual(self.db.approval()["id"], op)
+        admins = []
+        self.machine.require_administrator = admins.append
+        self.engine.take_over(reused_uid, op)
+        self.assertEqual(admins, [reused_uid])
+        self.assertIsNone(self.db.approval())
 
     def test_administrator_cannot_release_an_approval_after_a_reservation_appears(self):
         op = self.save_approval_for_recovery()

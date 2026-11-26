@@ -24,6 +24,9 @@ READ_ERRORS = (Hold, fw.Error, OSError, ValueError, KeyError, TypeError, subproc
 UNKNOWN = "確認できません"
 SHA256 = re.compile(r"[0-9a-f]{64}")
 UX_GUID = "3b8c8162-188c-46a4-aec9-be43f1d65697"
+# The supported fwupd Linux uefi_capsule backend obtains its device from ESRT.
+# ESRT supplies no FMP hardware instance, so its EFI update records use zero.
+ESRT_REGISTRATION_INSTANCE = 0
 
 
 def target_version_matches(plan, obs):
@@ -204,9 +207,7 @@ def _power(profile, device):
 
 
 def _physical_disk(device_number):
-    partition = (Path("/sys/dev/block") / device_number).resolve(strict=True)
-    if not partition.is_relative_to("/sys/devices") or not (partition / "partition").is_file():
-        raise Hold("ESPの物理デバイスを確認できません。")
+    partition = fw.partition_sysfs_path(device_number)
     disk = partition.parent
     # Bind the disk as well as the GPT identifier. A replacement disk may
     # acquire the very same Linux major/minor, slot and cloned partition UUID.
@@ -220,27 +221,20 @@ def _physical_disk(device_number):
     raise Hold("EFIシステム区画の物理媒体の識別情報を確認できません。")
 
 
-def _route(esp, partuuid, mount, guid, profile, secure, capability):
+def _route(esp, partuuid, mount, guid, profile, secure, capability, geometry, disk_boot):
     boot = profile.get("secure_boot", {})
     delivery = boot.get("delivery", "nvram")
     name = f"fwupd-{guid}.cap"
+    partition, start_lba, size_lba = geometry
     route = dict(esp=str(esp), partuuid=partuuid, device_number=mount.device, disk=_physical_disk(mount.device),
-                 partition=fw.partition_number(mount.device), secure_boot=secure,
+                 partition=partition, start_lba=start_lba, size_lba=size_lba, secure_boot=secure,
                  delivery=delivery, capability=list(capability) if capability else None)
     if delivery == "capsule-on-disk":
         route["file"] = f"{fw.STANDARD_CAPSULE_DIR}/{name}"
         # Bind the verified first active BootOrder entry (including arguments).
-        order = fw.efi_variable_payload("BootOrder", fw.EFI_GLOBAL)
-        if not order or len(order) % 2:
-            raise Hold("通常の次回起動先を確認できません。")
-        for index, in struct.iter_unpack("<H", order):
-            data = fw.read_efi_variable(fw.EFIVARS / f"Boot{index:04X}-{fw.EFI_GLOBAL}")
-            attributes = int.from_bytes(data[4:8], "little")
-            if attributes & 1 and not attributes & 0x1f00:
-                route["boot_entry"] = [index, hashlib.sha256(data).hexdigest()]
-                break
-        if "boot_entry" not in route:
+        if disk_boot is None:
             raise Hold("有効な通常起動項目を確認できません。")
+        route["boot_entry"] = list(disk_boot)
     elif delivery in ("nvram", "shim"):
         vendor = boot.get("esp_vendor_dir", "")
         if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]*", vendor):
@@ -274,16 +268,13 @@ def _route(esp, partuuid, mount, guid, profile, secure, capability):
 
 def _relative_file(path, route):
     """Accept only a single GPT HD() + File() on the checked physical ESP."""
-    expected = route["partuuid"], route["partition"], True
-    if fw.boot_disk_partition(path) != expected or path[:4] != b"\x04\x01\x2a\x00":
+    expected = fw.BootPartition(route["partuuid"], route["partition"], route["start_lba"], route["size_lba"], True)
+    if fw.boot_disk_partition(path) != expected:
         raise Hold("EFIデバイスパスの物理区画を承認したESPに照合できません。")
-    node = path[42:-4]
-    if len(node) < 8 or node[:2] != b"\x04\x04" or int.from_bytes(node[2:4], "little") != len(node):
+    name = fw.short_efi_file(path)
+    if name is None:
         raise Hold("EFIデバイスパスのファイル名を確認できません。")
-    name = node[4:].decode("utf-16-le")
-    if not re.fullmatch(r"\\[A-Za-z0-9_-]+(?:\\[A-Za-z0-9_.-]+)+\x00", name):
-        raise Hold("EFIのファイル名を確認できません。")
-    return name[1:-1].replace("\\", "/").casefold()
+    return name
 
 
 def _nvram_files(esp, plan, route, next_boot):
@@ -308,7 +299,7 @@ def _nvram_files(esp, plan, route, next_boot):
         raise Hold("次回の更新用ローダーのパスと引数が一致しません。")
     if fw.efi_asset_sha256(esp / route["loader"]) != route["loader_sha256"]:
         raise Hold("配置済みの更新用ローダーの内容が一致しません。")
-    guid, instance = plan["guid"], route["instance"]
+    guid, instance = plan["guid"], route["registration_instance"]
     _pending_file(f"fwupd-{guid}-{instance}", guid, instance, route, route["file"],
                   capsule_flags=route["capsule_flags"])
 
@@ -330,7 +321,7 @@ def _ux_file(esp, route):
     if not route.get("ux_hash"):
         raise Hold("表示用カプセルを機種別の配布資材に照合できません。")
     # fwupd-efi uses the display header's own flags, verified with the asset below.
-    _pending_file("fwupd-ux-capsule", UX_GUID, route.get("instance", 0), route, route["ux_file"])
+    _pending_file("fwupd-ux-capsule", UX_GUID, ESRT_REGISTRATION_INSTANCE, route, route["ux_file"])
     with (esp / route["ux_file"]).open("rb") as stream:
         size = os.fstat(stream.fileno()).st_size
         if not 98 <= size <= 32 * 1024 * 1024:
@@ -365,9 +356,10 @@ def _matches_file(esp, plan, route):
 
 def _bound_route(esp, partuuid, mounts, plan, profile, capability, capsule_flags):
     mount = mounts[str(esp)]
-    secure = fw.check_boot_delivery(esp, partuuid, mount.device, profile,
-                                    bootloader_capability=capability)
-    route = _route(esp, partuuid, mount, plan["guid"], profile, secure, capability)
+    geometry = fw.partition_geometry(mount.device)
+    secure, disk_boot = fw.check_boot_delivery(esp, partuuid, mount.device, profile,
+                                               bootloader_capability=capability, geometry=geometry)
+    route = _route(esp, partuuid, mount, plan["guid"], profile, secure, capability, geometry, disk_boot)
     route["power_action"] = "shutdown" if plan.get("shutdown") else "reboot"
     route["power_rule"] = profile.get("power", {})
     if route["delivery"] != "capsule-on-disk":
@@ -376,19 +368,12 @@ def _bound_route(esp, partuuid, mounts, plan, profile, capability, capsule_flags
         # fwupd 2.0.20 on x86_64 adds both reset flags only when neither was set in ESRT.
         reset_flags = 0x10000 | 0x40000  # PERSIST_ACROSS_RESET | INITIATE_RESET
         route["capsule_flags"] = capsule_flags if capsule_flags & reset_flags else capsule_flags | reset_flags
-        instance = profile.get("fmp", {}).get("hardware_instance", 0)
+        fmp = profile.get("fmp", {})
+        instance = fmp.get("hardware_instance", 0) if isinstance(fmp, dict) else None
         if type(instance) is not int or not 0 <= instance < 2**64:
             raise Hold("BIOS資源のハードウェアインスタンスを確認できません。")
-        route["instance"] = instance
+        route.update(fmp_instance=instance, registration_instance=ESRT_REGISTRATION_INSTANCE)
     return route
-
-
-def _indications():
-    value = fw.efi_variable_payload("OsIndications", fw.EFI_GLOBAL, size=8)
-    flags = int.from_bytes(value, "little") if value else 0
-    if flags & ~4:
-        raise Hold("OsIndicationsに別の起動・復旧指示があります。")
-    return bool(flags & 4)
 
 
 def _esp_reservation(plan, obs, waiting, device, profile, facts):
@@ -408,19 +393,31 @@ def _esp_reservation(plan, obs, waiting, device, profile, facts):
     if not binding:
         return ("foreign", "。".join(evidence)) if evidence else ("clear", "")
     mount = mounts[str(esp)]
+    partition, start_lba, size_lba = fw.partition_geometry(mount.device)
     if ((binding.get("partuuid"), binding.get("esp"), binding.get("disk"), binding.get("partition"))
-            != (partuuid, str(esp), _physical_disk(mount.device), fw.partition_number(mount.device))):
+            != (partuuid, str(esp), _physical_disk(mount.device), partition)):
         raise Hold("現在の配送区画が承認した区画と異なります。")
+    if "start_lba" not in binding and "size_lba" not in binding:
+        # Legacy plans omitted geometry. Any active route must still verify its live EFI paths.
+        binding = dict(binding, start_lba=start_lba, size_lba=size_lba)
+    if (binding.get("start_lba"), binding.get("size_lba")) != (start_lba, size_lba):
+        raise Hold("現在の配送区画の位置・長さが承認した区画と異なります。")
     if not evidence:
         return "clear", ""
     if (obs["guid"] != plan.get("guid") or device.get("DeviceId") != plan.get("device")
             or not profile or dell or waiting - {plan.get("device")}):
         return "foreign", "。".join(evidence)
     route = _bound_route(esp, partuuid, mounts, plan, profile, capability, obs["capsule_flags"])
+    if "instance" in binding and "fmp_instance" not in binding and "registration_instance" not in binding:
+        binding = dict(binding, registration_instance=ESRT_REGISTRATION_INSTANCE)
+        binding["fmp_instance"] = binding.pop("instance")
     if "capsule_flags" in route and "capsule_flags" not in binding:
         # Older pending plans bound the loader and all other route fields. The
         # actual registration must still match this device's live ESRT flags.
         binding = dict(binding, capsule_flags=route["capsule_flags"])
+    if obs["boot"] and plan.get("boot") and obs["boot"] != plan["boot"] and "device_number" in binding:
+        # The disk, GPT geometry and verified boot entry stay bound across Linux boots.
+        binding = dict(binding, device_number=mount.device)
     if route != binding:
         raise Hold("物理区画・起動先・配送方式が承認した内容と一致しません。")
     display = pending.count(UX_GUID) == 1
@@ -473,7 +470,7 @@ def _reservation(plan, obs, device, profile, waiting):
     if not errors:
         nvram = read("fwupd-efi", fw.fwupd_efi_state)
         next_boot = read("次回起動先", fw.boot_next)
-        cod = read("ディスク配送指示", _indications)
+        cod = read("ディスク配送指示", fw.disk_delivery_requested)
     volume = read("EFIシステム区画", fw.find_esp, mounts)
     standard = dell = None
     if volume is not None:
@@ -765,7 +762,7 @@ def preflight(plan):
         if _daemon_busy():
             raise Hold("fwupdが別の処理を実行中です。")
         esp, partuuid, secure, capability = fw.check_ready(device, devices, history, profile)
-        if _indications():
+        if fw.disk_delivery_requested():
             raise Hold("既存のディスク経由カプセル配送指示があります。")
         mounts = fw.mount_points()
         if fw.find_esp(mounts) != (esp, partuuid) or mounts[str(esp)].read_only:

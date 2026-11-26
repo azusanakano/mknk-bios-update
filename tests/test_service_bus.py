@@ -110,11 +110,14 @@ class ServiceBusTest(unittest.TestCase):
                     with self.assertRaises(GLib.Error):
                         call("ReportRejection", "(s)", operation, connection=other)
                     self.assertEqual(engine.db.active()["receipt"], "unknown")
-                    self.assertEqual(call("ReportRejection", "(s)", operation)["state"], "hold")
-                    self.assertIsNone(engine.db.active())
-                    self.assertIsNone(engine.platform.marker)
+                    self.assertEqual(call("ReportRejection", "(s)", operation), {"recorded": True})
+                    self.assertEqual(engine.db.active()["receipt"], "rejected")
+                    with self.assertRaises(GLib.Error):
+                        call("Status")
                     engine.platform.session_active = True
                     self.assertTrue(call("Status")["can_check"])
+                    self.assertIsNone(engine.db.active())
+                    self.assertIsNone(engine.platform.marker)
                     return
                 if decline:
                     with self.assertRaises(GLib.Error):
@@ -141,7 +144,13 @@ class ServiceBusTest(unittest.TestCase):
                     self.assertEqual(engine.db.active()["power_id"], request)
                     call("ReplyPower", "(sb)", request, True)
                     self.assertIsNone(engine.db.active()["power_id"])
-                self.assertEqual(call("Report", "(sb)", operation, True)["state"], "issuing")
+                reported = call("Report", "(sb)", operation, True)
+                if switch_user:
+                    self.assertEqual(reported, {"recorded": True})
+                    with self.assertRaises(GLib.Error):
+                        call("Status")
+                else:
+                    self.assertEqual(reported["state"], "issuing")
                 self.assertEqual(engine.db.active()["receipt"], "accepted")
                 with self.assertRaises(GLib.Error):
                     call("Authorize", "(s)", review["plan"])

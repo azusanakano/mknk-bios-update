@@ -5,4 +5,4 @@ export MKNK_REQUIRE_GUI_SMOKE = 1
 	dh $@ --buildsystem=meson
 
 override_dh_installsystemd:
-	dh_installsystemd --no-start --no-enable
+	dh_installsystemd --no-enable

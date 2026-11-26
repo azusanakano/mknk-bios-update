@@ -15,6 +15,9 @@ class Conflict(Exception):
     """An observation or a concurrent operation prevents this action."""
 
 
+METADATA_PENDING = "先のカタログ取り込み結果を確認中です。"
+
+
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -25,6 +28,16 @@ OPERATION_TABLE = """CREATE TABLE IF NOT EXISTS operation (
     issued TEXT NOT NULL, receipt TEXT NOT NULL DEFAULT 'unknown',
     active INTEGER NOT NULL DEFAULT 1, outcome TEXT, observed TEXT, ended TEXT,
     power_id TEXT, power_sender TEXT, power_bus TEXT, observed_boot TEXT, power_boot TEXT)"""
+
+APPROVAL_TABLE = """CREATE TABLE IF NOT EXISTS approval (
+    id TEXT PRIMARY KEY, boot TEXT NOT NULL, machine TEXT NOT NULL, plan TEXT NOT NULL)"""
+
+# Only exclude records when both PCs are identified and the boots are distinct.
+RELEVANT_PC = "(?='' OR machine='' OR boot='' OR machine=? OR ?='' OR boot=?)"
+
+
+def pc_scope(machine, boot):
+    return machine, machine, boot, boot
 
 
 class Journal:
@@ -45,11 +58,21 @@ class Journal:
                 db.execute(f"INSERT INTO operation (rowid,{columns}) "
                            f"SELECT rowid,{columns} FROM operation_with_unique_boot")
                 db.execute("DROP TABLE operation_with_unique_boot")
-            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS single_pending ON operation(active) WHERE active=1")
+            db.execute("DROP INDEX IF EXISTS single_pending")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS pending_per_pc ON operation(machine) WHERE active=1")
             db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS single_issue_per_boot ON operation(boot)
                           WHERE outcome IS NOT 'rejected'""")
             db.execute("CREATE TABLE IF NOT EXISTS setting (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            db.execute("CREATE TABLE IF NOT EXISTS approval (slot INTEGER PRIMARY KEY CHECK(slot=1), id TEXT, plan TEXT)")
+            if any(row["name"] == "slot" for row in db.execute("PRAGMA table_info(approval)")):
+                db.execute("ALTER TABLE approval RENAME TO singleton_approval")
+                db.execute(APPROVAL_TABLE)
+                for row in db.execute("SELECT id,plan FROM singleton_approval"):
+                    plan = json.loads(row["plan"])
+                    db.execute("INSERT INTO approval VALUES (?,?,?,?)",
+                               (row["id"], plan.get("boot") or "", plan.get("machine") or "", row["plan"]))
+                db.execute("DROP TABLE singleton_approval")
+            else:
+                db.execute(APPROVAL_TABLE)
             db.execute("INSERT OR IGNORE INTO setting VALUES ('identity-key', ?)", (secrets.token_hex(32),))
 
     @contextmanager
@@ -81,9 +104,17 @@ class Journal:
         plan = json.loads(obj.pop("plan"))
         return {**plan, **obj}
 
-    def active(self):
+    def active(self, *, plan_id=None, power_id=None):
         with self.transaction() as db:
-            return self.unpack(db.execute("SELECT * FROM operation WHERE active=1").fetchone())
+            return self.unpack(db.execute(
+                """SELECT * FROM operation WHERE active=1 AND (? IS NULL OR id=?)
+                   AND (? IS NULL OR power_id=?) ORDER BY rowid DESC LIMIT 1""",
+                (plan_id, plan_id, power_id, power_id)).fetchone())
+
+    def pending_operations(self, machine, boot):
+        with self.transaction() as db:
+            return [self.unpack(row) for row in db.execute(
+                "SELECT * FROM operation WHERE active=1 AND " + RELEVANT_PC, pc_scope(machine, boot))]
 
     def last(self, machine, boot):
         with self.transaction() as db:
@@ -92,17 +123,26 @@ class Journal:
                    OR (outcome='unattributed' AND observed_boot=?) ORDER BY rowid DESC LIMIT 1""",
                 (machine, boot, boot)).fetchone())
 
-    def approval(self):
+    def approval(self, *, plan_id=None):
         with self.transaction() as db:
-            row = db.execute("SELECT plan FROM approval WHERE slot=1").fetchone()
+            row = db.execute("SELECT plan FROM approval WHERE ? IS NULL OR id=? ORDER BY rowid DESC LIMIT 1",
+                             (plan_id, plan_id)).fetchone()
             return json.loads(row[0]) if row else None
+
+    def pending_approvals(self, machine, boot):
+        with self.transaction() as db:
+            return [json.loads(row["plan"]) for row in db.execute(
+                "SELECT plan FROM approval WHERE " + RELEVANT_PC, pc_scope(machine, boot))]
 
     def approve(self, plan):
         with self.transaction() as db:
-            row = db.execute("SELECT id FROM approval").fetchone()
-            if (row and row["id"] != plan["id"]) or db.execute("SELECT 1 FROM operation WHERE active=1").fetchone():
+            scope = pc_scope(plan["machine"], plan["boot"])
+            competing = db.execute("SELECT 1 FROM approval WHERE id<>? AND " + RELEVANT_PC, (plan["id"], *scope))
+            active = db.execute("SELECT 1 FROM operation WHERE active=1 AND " + RELEVANT_PC, scope)
+            if competing.fetchone() or active.fetchone():
                 raise Conflict("別の計画の承認または送信を確認中です。")
-            db.execute("INSERT OR IGNORE INTO approval VALUES (1,?,?)", (plan["id"], json.dumps(plan)))
+            db.execute("INSERT OR IGNORE INTO approval VALUES (?,?,?,?)",
+                       (plan["id"], plan["boot"], plan["machine"], json.dumps(plan)))
 
     def cancel_approval(self, plan_id):
         with self.transaction() as db:
@@ -111,6 +151,9 @@ class Journal:
     def issue(self, plan, sender, daemon, bus, *, from_approval=False):
         try:
             with self.transaction() as db:
+                scope = pc_scope(plan["machine"], plan["boot"])
+                if db.execute("SELECT 1 FROM operation WHERE active=1 AND " + RELEVANT_PC, scope).fetchone():
+                    raise Conflict("別の計画の承認または送信を確認中です。")
                 if from_approval and not db.execute("DELETE FROM approval WHERE id=?", (plan["id"],)).rowcount:
                     raise Conflict("準備前の承認が取り消されました。")
                 db.execute("""INSERT INTO operation(id,boot,machine,plan,sender,daemon,bus,issued)
@@ -237,3 +280,19 @@ class Journal:
                 db.execute("INSERT OR REPLACE INTO setting VALUES (?,?)", (name, json.dumps(value)))
             row = db.execute("SELECT value FROM setting WHERE name=?", (name,)).fetchone()
             return json.loads(row[0]) if row else None
+
+    def begin_metadata_request(self, request):
+        with self.transaction() as db:
+            row = db.execute("SELECT value FROM setting WHERE name='metadata-request'").fetchone()
+            if row and json.loads(row[0]):
+                raise Conflict(METADATA_PENDING)
+            db.execute("INSERT OR REPLACE INTO setting VALUES ('metadata-request',?)", (json.dumps(request),))
+
+    def end_metadata_request(self, expected):
+        with self.transaction() as db:
+            row = db.execute("SELECT value FROM setting WHERE name='metadata-request'").fetchone()
+            # Compare the complete legacy record too, for upgrades without a request ID.
+            if not row or json.loads(row[0]) != expected:
+                return False
+            db.execute("DELETE FROM setting WHERE name='metadata-request'")
+            return True

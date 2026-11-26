@@ -2,6 +2,7 @@
 """Build the x86_64 AppImage from this checkout and distribution libraries."""
 import argparse
 import hashlib
+import json
 import os
 from pathlib import Path
 import platform
@@ -162,8 +163,12 @@ def build(args):
     if not (args.build_dir / "meson-private/coredata.dat").exists():
         run(["meson", "setup", str(args.build_dir), str(ROOT), "--buildtype=release", "--prefix=/usr", "--sysconfdir=/etc"])
     run(["meson", "compile", "-C", str(args.build_dir), "mknk-bios-update"])
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".appimage-", dir=args.output.parent) as tmp:
+    image_path = args.output
+    if image_path is None:
+        project = json.loads(output(["meson", "introspect", "--projectinfo", str(args.build_dir)]))
+        image_path = ROOT / "dist" / f"mknk-bios-update-{project['version']}-x86_64.AppImage"
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".appimage-", dir=image_path.parent) as tmp:
         work = Path(tmp)
         app = work / "AppDir"
         lib = app / "usr/lib"
@@ -186,8 +191,8 @@ def build(args):
         with fs.open("rb") as src, image.open("ab") as out:
             shutil.copyfileobj(src, out)
         image.chmod(0o755)
-        image.replace(args.output)
-    print(args.output, flush=True)
+        image.replace(image_path)
+    print(image_path, flush=True)
 
 
 if __name__ == "__main__":
@@ -197,5 +202,5 @@ if __name__ == "__main__":
     parser.add_argument("--runtime-sha256", default=RUNTIME_SHA256)
     parser.add_argument("--jobs", type=int, default=1, choices=range(1, 65), metavar="1-64")
     parser.add_argument("--build-dir", type=Path, default=ROOT / "build/appimage-native")
-    parser.add_argument("--output", type=Path, default=ROOT / "dist/mknk-bios-update-0.1.0-x86_64.AppImage")
+    parser.add_argument("--output", type=Path, help="default: dist/mknk-bios-update-<version>-x86_64.AppImage")
     build(parser.parse_args())

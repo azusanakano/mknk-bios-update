@@ -75,7 +75,7 @@ class CatalogTests(unittest.TestCase):
         self.enterContext(patch.object(catalog, "Session", return_value=self.session))
         self.enterContext(patch.object(fw, "read_settings", return_value={}))
         self.enterContext(patch.object(catalog, "download", side_effect=self.pair))
-        self.enterContext(patch.object(catalog, "signing_time", side_effect=lambda md, sig: int(sig)))
+        self.enterContext(patch.object(catalog, "signing_time", side_effect=lambda md, sig, **kwargs: int(sig)))
         self.enterContext(patch.object(catalog, "cache_pair", side_effect=self.cache))
 
     def pair(self, remote, settings=None, session=None):
@@ -104,6 +104,14 @@ class CatalogTests(unittest.TestCase):
         self.assertTrue(all(args == (DEVICE,) for op, args in self.queries if op != "get_devices"))
         self.assertNotIn("checksum", report)
         self.assertEqual(report["token"], catalog.query("check", GUID)["token"])
+
+    def test_current_daemon_policy_is_used_for_download_and_cache_signatures(self):
+        self.session.version = "2.1.1"
+        self.cached = lzma.compress(self.xml), b"35"
+        verify = Mock(return_value=50)
+        with patch.object(catalog, "signing_time", verify):
+            self.assertEqual(catalog.query("check", GUID)["state"], "available")
+        self.assertEqual([call.kwargs.get("daemon_version") for call in verify.call_args_list], ["2.1.1", "2.1.1"])
 
     def test_current_requires_both_model_and_index(self):
         self.set_current_release()
@@ -394,12 +402,25 @@ class DaemonVersionTests(unittest.TestCase):
                                 FeatureFlags=SimpleNamespace(NONE=0))
         glib = Mock()
         gio = Mock()
-        gio.bus_get_sync.return_value.call_sync.return_value.unpack.return_value = (":1.4",)
+        self.bus = gio.bus_get_sync.return_value
+        self.daemon_version = "2.0.20"
+
+        def bus_call(name, path, iface, method, *_):
+            reply = Mock()
+            if method == "Get":
+                self.assertEqual((name, path, iface), (":1.4", "/", "org.freedesktop.DBus.Properties"))
+                reply.unpack.return_value = (self.daemon_version,)
+            else:
+                self.assertEqual(method, "GetNameOwner")
+                reply.unpack.return_value = (":1.4",)
+            return reply
+
+        self.bus.call_sync.side_effect = bus_call
         self.enterContext(patch.object(fw, "fwupd_bindings", return_value=(fwupd, glib)))
         self.enterContext(patch.dict(sys.modules, {"gi.repository": SimpleNamespace(Gio=gio)}))
 
     def test_old_connected_daemon_cannot_check_or_prepare(self):
-        self.client.get_daemon_version.return_value = "2.0.19"
+        self.daemon_version = "2.0.19"
         device = dict(DeviceId=DEVICE, Version="1", VersionFormat="number", Guid=[GUID],
                       Flags=["internal", "updatable"], Protocols=[fw.PROTOCOL], Plugin="uefi_capsule")
         with (patch.object(fw, "read_settings", return_value={}),
@@ -417,11 +438,51 @@ class DaemonVersionTests(unittest.TestCase):
     def test_running_daemon_version_is_compared_numerically(self):
         for version in ("2.0.20", "2.0.100", "2.1.0"):
             with self.subTest(version=version):
-                self.client.get_daemon_version.return_value = version
+                self.daemon_version = version
+                self.client.get_daemon_version.return_value = "2.0.19"
                 self.assertEqual(catalog.Session().version, version)
-        self.client.get_daemon_version.return_value = "9.0.invalid"
+        self.daemon_version = "9.0.invalid"
         with self.assertRaisesRegex(fw.Hold, "版を確認できません"):
             catalog.Session()
+
+
+class SignaturePolicyTest(unittest.TestCase):
+    def test_daemon_version_limits_signature_kinds_and_their_generation(self):
+        kinds = SimpleNamespace(SHA256=1, SHA512=2, PKCS7=3, GPG=4)
+        context = Mock()
+        allowed = []
+        context.blob_kind_allow.side_effect = allowed.append
+        results = {
+            kinds.PKCS7: Mock(get_timestamp=Mock(return_value=100), get_method=Mock(return_value=1)),
+            kinds.GPG: Mock(get_timestamp=Mock(return_value=200), get_method=Mock(return_value=1)),
+        }
+        supplied = [kinds.PKCS7, kinds.GPG]
+
+        def verify(*_):
+            verified = [results[kind] for kind in supplied if kind in allowed]
+            if not verified:
+                raise fw.Hold("fixture had no permitted signature")
+            return verified
+
+        context.verify_item.side_effect = verify
+        jcat = SimpleNamespace(BlobKind=kinds, Context=SimpleNamespace(new=lambda: context),
+                               File=SimpleNamespace(new=Mock()), ImportFlags=SimpleNamespace(NONE=0),
+                               BlobMethod=SimpleNamespace(SIGNATURE=1),
+                               VerifyFlags=SimpleNamespace(REQUIRE_CHECKSUM=1, REQUIRE_SIGNATURE=2))
+        glib = SimpleNamespace(Bytes=SimpleNamespace(new=lambda value: value))
+        modules = {"gi": SimpleNamespace(require_version=Mock()),
+                   "gi.repository": SimpleNamespace(GLib=glib, Jcat=jcat)}
+        with patch.dict(sys.modules, modules), patch.dict(os.environ, {"MKNK_FWUPD_ONLY_PQ": "0"}):
+            for version, expected in (("2.0.20", 200), ("2.1.1", 100), ("2.1.10", 100)):
+                with self.subTest(version=version):
+                    allowed.clear()
+                    self.assertEqual(catalog.signing_time(b"payload", gzip.compress(b"{}"),
+                                                         daemon_version=version), expected)
+                    self.assertIn(kinds.PKCS7, allowed)
+            allowed.clear()
+            supplied[:] = [kinds.GPG]
+            with self.assertRaises(fw.Hold):
+                catalog.signing_time(b"payload", gzip.compress(b"{}"), daemon_version="2.1.1")
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "Ubuntu system GI libraries")
@@ -459,7 +520,7 @@ class NativeCatalogTests(unittest.TestCase):
             signature = jcat([checksum, pkcs7])
             with patch.object(catalog, "TRUST_DIRECTORIES", (str(trust),)), patch.dict(
                     os.environ, {"MKNK_FWUPD_ONLY_PQ": "0"}):
-                components, identity = catalog.authenticated(payload, signature, {GUID})
+                components, identity = catalog.authenticated(payload, signature, {GUID}, daemon_version="2.0.20")
                 self.assertEqual(len(components), 1)
                 self.assertEqual(identity["catalog_sha256"], hashlib.sha256(xml).hexdigest())
                 self.assertGreater(identity["signed_timestamp"], 1)
@@ -467,12 +528,12 @@ class NativeCatalogTests(unittest.TestCase):
                 changed = lzma.compress(metadata("3"))
                 tampered = jcat([dict(checksum, Data=hashlib.sha256(changed).hexdigest()), pkcs7])
                 with self.assertRaises(fw.Hold):
-                    catalog.authenticated(changed, tampered, {GUID})
+                    catalog.authenticated(changed, tampered, {GUID}, daemon_version="2.0.20")
                 for untrusted in (jcat([checksum]), jcat([pkcs7])):
                     with self.assertRaises(fw.Hold):
-                        catalog.authenticated(payload, untrusted, {GUID})
+                        catalog.authenticated(payload, untrusted, {GUID}, daemon_version="2.0.20")
                 with patch.object(catalog, "TRUST_DIRECTORIES", ()), self.assertRaises(fw.Hold):
-                    catalog.authenticated(payload, signature, {GUID})
+                    catalog.authenticated(payload, signature, {GUID}, daemon_version="2.0.20")
 
             # Decode the genuine GetRemotes row type and exercise public Remote methods
             # without a system bus or a firmware daemon.

@@ -85,12 +85,43 @@ class JournalTest(unittest.TestCase):
         self.assertEqual(Journal(legacy).active()["id"], "plan-b")
         self.assertIn("配置なしを確認", reopened.history("pc", "boot-a"))
 
+    def test_migrates_singleton_approval_without_discarding_it_on_a_different_pc(self):
+        legacy = self.path.with_name("old-approval.db")
+        with closing(sqlite3.connect(legacy)) as conn:
+            conn.execute("CREATE TABLE approval(slot INTEGER PRIMARY KEY CHECK(slot=1), id TEXT, plan TEXT)")
+            conn.execute("INSERT INTO approval VALUES (1,?,?)", (self.plan["id"], json.dumps(self.plan)))
+            conn.commit()
+        journal = Journal(legacy)
+        self.assertEqual(journal.pending_approvals("pc", "new-boot"), [self.plan])
+        self.assertEqual(journal.pending_approvals("other-pc", "boot-b"), [])
+        moved = dict(self.plan, id="plan-b", machine="other-pc", boot="boot-b")
+        journal.approve(moved)
+        self.assertEqual(journal.approval(plan_id=self.plan["id"]), self.plan)
+        self.assertEqual(journal.pending_approvals("other-pc", "boot-b"), [moved])
+        with self.assertRaises(Conflict):
+            journal.approve(dict(self.plan, id="unidentified", machine="", boot="boot-c"))
+
     def test_catalog_generation_persists_across_mirrors(self):
         self.db.catalog_generation(20, "a" * 64)
         self.db.catalog_generation(18, "a" * 64)
         with self.assertRaises(Conflict):
             Journal(self.path).catalog_generation(19, "b" * 64)
         self.db.catalog_generation(21, "b" * 64)
+
+    def test_metadata_release_only_removes_the_record_that_was_read(self):
+        old = {"boot": "old-boot", "pid": 123}
+        self.db.setting("metadata-request", old)  # A record written by the previous release.
+        reader = Journal(self.path)
+        earlier = reader.setting("metadata-request")
+        self.assertTrue(self.db.end_metadata_request(old))
+        new = {"id": "new-request", "boot": "new-boot", "pid": 456}
+        self.db.begin_metadata_request(new)
+        self.assertFalse(reader.end_metadata_request(earlier))
+        self.assertEqual(reader.setting("metadata-request"), new)
+        with self.assertRaises(Conflict):
+            reader.begin_metadata_request(dict(new, id="another-request"))
+        self.assertTrue(self.db.end_metadata_request(new))
+        self.assertIsNone(reader.setting("metadata-request"))
 
     def test_identity_is_private_stable_and_blank_stays_unknown(self):
         raw = "private-host-uuid"

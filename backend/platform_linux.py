@@ -3,6 +3,7 @@ import json
 import os
 import pwd
 import subprocess
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +14,7 @@ import hardware
 from catalog import read_trust_policy
 from engine import Actor
 from firmware_api import fw
-from journal import Conflict
+from journal import Conflict, METADATA_PENDING
 
 
 DBUS = "org.freedesktop.DBus"
@@ -127,16 +128,16 @@ class Platform:
         if self.portable:
             # Portable mode uses the OS's built-in administrator challenge.
             action = "org.freedesktop.policykit.exec"
-            details["polkit.message"] = "別の利用者が承認した未送信の BIOS 更新計画を解除します。"
+            details["polkit.message"] = "元の承認者を確認できない BIOS 更新計画を整理します。"
         params = GLib.Variant("((sa{sv})sa{ss}us)", (subject, action, details, 1, ""))
         try:
             reply = self.bus.call_sync(authority, "/org/freedesktop/PolicyKit1/Authority", authority + ".Authority",
                                        "CheckAuthorization", params, GLib.VariantType.new("((bba{ss}))"),
                                        Gio.DBusCallFlags.NONE, 120000, None)
         except GLib.Error as exc:
-            raise Conflict("承認の解除に必要な管理者認証を完了できませんでした。") from exc
+            raise Conflict("更新計画の整理に必要な管理者認証を完了できませんでした。") from exc
         if reply.unpack()[0][0] is not True:
-            raise Conflict("承認の解除に必要な管理者認証を完了できませんでした。")
+            raise Conflict("更新計画の整理に必要な管理者認証を完了できませんでした。")
 
     @contextmanager
     def claim(self, plan):
@@ -230,29 +231,37 @@ class Platform:
                                      user=account.pw_uid, group=account.pw_gid, extra_groups=[], cwd="/", env=env)
         if result.returncode or len(result.stdout) > 256 * 1024:
             raise Conflict("配布情報の検証プロセスを完了できません。")
-        if self.portable and args["profile"] != fw.read_settings():
-            raise Conflict("検証中に機種別の設定が変化しました。配布情報を再確認してください。")
         data = json.loads(result.stdout)
         if not isinstance(data, dict):
             raise Conflict("配布情報の検証結果を確認できません。")
+        if self.portable:
+            try:
+                same_profile = args["profile"] == fw.read_settings()
+            except (fw.Hold, OSError):
+                same_profile = False
+            if not same_profile:
+                detail = "検証中に機種別の設定が変化しました。配布情報を再確認してください。"
+                if mode == "import":
+                    # The snapshot can invalidate the result without changing whether the call ended.
+                    return dict(terminal=data.get("terminal") is True, ok=False, detail=detail)
+                raise Conflict(detail)
         return data
 
     def worker(self, mode, guid, cabinet=None):
         return self.run_worker(mode, guid, () if cabinet is None else (cabinet,))
 
     def metadata_clear(self, db):
-        pending = db.setting("metadata-request")
-        if not pending:
-            return
-        if pending["boot"] == fw.BOOT_ID.read_text().strip():
-            pid = pending["pid"]
-            try:
-                current = (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[19]
-            except FileNotFoundError:
-                current = None
-            if current == pending["start"]:
-                raise Conflict("先のカタログ取り込み結果を確認中です。")
-        db.setting("metadata-request", {})
+        while pending := db.setting("metadata-request"):
+            if pending["boot"] == fw.BOOT_ID.read_text().strip():
+                pid = pending["pid"]
+                try:
+                    current = (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[19]
+                except FileNotFoundError:
+                    current = None
+                if current == pending["start"]:
+                    raise Conflict(METADATA_PENDING)
+            if db.end_metadata_request(pending):
+                return
 
     def refresh(self, guid, db, check_caller):
         self.metadata_clear(db)
@@ -268,20 +277,23 @@ class Platform:
             for stream in (xml, sig):
                 stream.seek(0)
 
+            request = dict(id=uuid.uuid4().hex, boot=fw.BOOT_ID.read_text().strip(), pid=pid, start=start,
+                           bus=self.bus_id, owner=owner, digest=item["catalog_sha256"])
+
             def record_import():
                 check_caller()
                 self.confirm_owner(owner)
-                db.setting("metadata-request", dict(boot=fw.BOOT_ID.read_text().strip(), pid=pid, start=start,
-                                                   bus=self.bus_id, owner=owner, digest=item["catalog_sha256"]))
+                db.begin_metadata_request(request)
 
             try:
                 response = self.run_worker("import", guid, (xml, sig), before_start=record_import, owner=owner,
                                            remote=item["remote_id"], settings_fingerprint=item["settings_fingerprint"],
                                            remote_fingerprint=item["remote_fingerprint"])
             except WorkerNotStarted:
-                db.setting("metadata-request", {})
+                db.end_metadata_request(request)
                 raise
-            if response.get("terminal"):
-                db.setting("metadata-request", {})
-            if not response.get("ok"):
+            terminal = response.get("terminal") is True
+            if terminal:
+                db.end_metadata_request(request)
+            if not terminal or response.get("ok") is not True:
                 raise Conflict(response.get("detail") or "カタログの取り込み応答が未確定です。")

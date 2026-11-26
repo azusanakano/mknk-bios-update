@@ -16,6 +16,7 @@
 
 import argparse
 import ctypes
+from fnmatch import fnmatchcase
 from functools import cache, reduce
 import gzip
 import hashlib
@@ -65,6 +66,7 @@ UDISKS = "org.freedesktop.UDisks2"
 FMP_CAPSULE = uuid.UUID("6dcbd5ed-e82d-4c44-bda1-7194199ad92a").bytes_le
 PROTOCOL = "org.uefi.capsule"
 FWUPD_ID = "org.freedesktop.fwupd"
+ID_REQUIREMENT_GLOB = "id-requirement-glob"
 CLIENT_FEATURES = ("requests", "requests-non-generic", "detach-action", "update-action",
                    "allow-authentication", "fde-warning", "show-problems")
 UNSUPPORTED_CLIENT_FEATURES = {"switch-branch", "community-text", "can-report", "none"}
@@ -613,13 +615,54 @@ def firmware_guid_present(text, devices):
     return False if complete else None
 
 
+def supports_id_requirement_glob(daemon_version):
+    return (isinstance(daemon_version, str)
+            and re.fullmatch(r"[0-9]{1,9}(?:\.[0-9]{1,9}){2}", daemon_version) is not None
+            and version_key(daemon_version, None) >= version_key("2.0.20", None))
+
+
+def daemon_id_branches_match(compare, version, required, version_pattern):
+    if not supports_id_requirement_glob(version) or len(required) > 1024:
+        return None
+    alternatives = required.split("|")
+    branches = []
+    for index, alternative in enumerate(alternatives):
+        pattern, separator, threshold = alternative.partition("=")
+        if separator:
+            if not re.fullmatch(r"[0-9.*?]{1,128}", pattern):
+                return None
+        else:
+            if index != len(alternatives) - 1:
+                return None
+            pattern, threshold = None, pattern
+        if len(threshold) > 128 or not re.fullmatch(version_pattern, threshold):
+            return None
+        branches.append((pattern, threshold))
+    # fwupd uses the first matching selector, with an optional unconditional fallback.
+    for pattern, threshold in branches:
+        if pattern is None or fnmatchcase(version, pattern):
+            return compare(version_key(version, None), version_key(threshold, None))
+    return True  # An unmatched selector without a fallback imposes no version condition.
+
+
+def client_requirements(node):
+    if node.tag == "client" and not node.attrib and not len(node):
+        return (node.text or "").strip().split("|")
+    return ()
+
+
 def catalog_requirement_matches(node, device, devices, daemon_version, client_features=CLIENT_FEATURES):
     """評価できない必須条件には None を返す。"""
     if len(node):
         return None
     text = (node.text or "").strip()
     if node.tag == "client" and not node.attrib:
-        return True if set(text.split("|")).issubset(client_features) else None
+        features = set(client_requirements(node))
+        if ID_REQUIREMENT_GLOB in features:
+            if not supports_id_requirement_glob(daemon_version):
+                return None
+            features.remove(ID_REQUIREMENT_GLOB)
+        return True if features.issubset(client_features) else None
     if node.tag == "firmware" and text and not node.attrib:
         return firmware_guid_present(text, devices)
     compare = VERSION_COMPARISONS.get(node.get("compare"))
@@ -648,14 +691,15 @@ def catalog_requirement_matches(node, device, devices, daemon_version, client_fe
     required = node.get("version", "")
     version_pattern = (r"[A-Za-z0-9][A-Za-z0-9._+~-]{0,127}" if fmt == "plain"
                        else r"(?:[0-9]{1,18}(?:\.[0-9]{1,18})*|0x[0-9a-fA-F]{1,8})")
+    if node.tag == "id" and ("=" in required or "|" in required):
+        return daemon_id_branches_match(compare, actual, required, version_pattern)
     if not actual or len(required) > 128 or not re.fullmatch(version_pattern, required):
         return None
     return compare(version_key(actual, fmt), version_key(required, fmt))
 
 
 def missing_client_features(requirements, client_features=CLIENT_FEATURES):
-    return sorted({feature for node in requirements if node.tag == "client" and not node.attrib and not len(node)
-                   for feature in (node.text or "").strip().split("|")
+    return sorted({feature for node in requirements for feature in client_requirements(node)
                    if feature in UNSUPPORTED_CLIENT_FEATURES or feature in CLIENT_FEATURES and feature not in client_features})
 
 
@@ -747,6 +791,8 @@ def require_catalog_release(components, device, devices, guid, release, remote, 
             continue
         compatible = same_branch and catalog_component_compatible(component, device)
         component_requirements = catalog_requirements(component)
+        allows_id_globs = any(ID_REQUIREMENT_GLOB in client_requirements(node)
+                              for node in component.findall("requires/client"))
         missing_version_check = "version-check-required" in flags and not any(
             not node.text and not len(node) for node in component.findall("requires/firmware"))
         for entry in component.findall("releases/release"):
@@ -793,8 +839,15 @@ def require_catalog_release(components, device, devices, guid, release, remote, 
                 if report_exclusion:
                     exclusions.append((version, display_version, reason))
                 continue
-            evaluated = [(node, catalog_requirement_matches(node, device, devices, daemon_version, client_features))
-                         for node in requirements if not catalog_model_requirement(node)]
+            evaluated = []
+            for node in requirements:
+                if catalog_model_requirement(node):
+                    continue
+                if node.tag == "id" and "=" in node.get("version", "") and not allows_id_globs:
+                    result = None  # fwupd requires an explicit daemon capability marker for this syntax.
+                else:
+                    result = catalog_requirement_matches(node, device, devices, daemon_version, client_features)
+                evaluated.append((node, result))
             failed = [node for node, result in evaluated if result is False]
             if failed:
                 if match:
@@ -1099,7 +1152,7 @@ def boot_load_option(data):
     raise Hold("既存のEFI起動登録の内容を解釈できません。")
 
 
-def check_boot_entries(esp_guid, profile):
+def check_boot_entries(esp_guid, esp_device, profile):
     allowed = profile.get("boot_entry_sha256", [])
     if not isinstance(allowed, list):
         raise Hold("検証済みのEFI起動登録の一覧を読み取れません。")
@@ -1112,20 +1165,64 @@ def check_boot_entries(esp_guid, profile):
         if description not in ("Linux Firmware Updater", "Linux-Firmware-Updater"):
             continue
         # GPTの短縮HD()パスで、現物のESPと一致し、ローダーと引数を含む全バイトを照合できる場合だけ再利用する。
-        if (path[:4] != b"\x04\x01\x2a\x00" or path[40:42] != b"\x02\x02"
-                or str(uuid.UUID(bytes_le=path[24:40])) != esp_guid
+        if (boot_disk_partition(path) != BootPartition(esp_guid, *partition_geometry(esp_device), True)
+                or short_efi_file(path) is None
                 or hashlib.sha256(data).hexdigest() not in allowed):
             raise Hold(f"{variable.name[:8]} の更新用起動登録をこのOSのものと確認できません。")
 
 
-def partition_number(device):
+SYS_DEV_BLOCK = Path("/sys/dev/block")
+SYS_DEVICES = Path("/sys/devices")
+
+
+def partition_sysfs_path(device):
+    path = (SYS_DEV_BLOCK / device).resolve(strict=True)
+    if not path.is_relative_to(SYS_DEVICES) or not (path / "partition").is_file():
+        raise Hold("ESPの物理デバイスを確認できません。")
+    return path
+
+
+class PartitionGeometry(NamedTuple):
+    number: int
+    start_lba: int
+    size_lba: int
+
+
+def partition_geometry(device):
     try:
-        number = int((Path("/sys/dev/block") / device / "partition").read_text(encoding="ascii"))
+        path = partition_sysfs_path(device)
+        number, start, size = (int((path / field).read_text(encoding="ascii"))
+                               for field in ("partition", "start", "size"))
+        block = int((path.parent / "queue/logical_block_size").read_text(encoding="ascii"))
     except (OSError, ValueError) as exc:
-        raise Hold("ESPのGPT区画番号を確認できません。") from exc
-    if number < 1:
-        raise Hold("ESPのGPT区画番号を確認できません。")
-    return number
+        raise Hold("ESPのGPT区画番号・位置・長さを確認できません。") from exc
+    # sysfs reports start and size in units of 512 bytes; HD() uses device LBAs.
+    if block < 512 or block & (block - 1) or not 0 < number < 2**32:
+        raise Hold("ESPのGPT区画番号・論理ブロックサイズを確認できません。")
+    start_lba, start_remainder = divmod(start * 512, block)
+    size_lba, size_remainder = divmod(size * 512, block)
+    if (start_remainder or size_remainder or not 0 < start_lba < 2**64
+            or not 0 < size_lba < 2**64 or start_lba + size_lba > 2**64):
+        raise Hold("ESPの開始位置・長さを論理ブロックに照合できません。")
+    return PartitionGeometry(number, start_lba, size_lba)
+
+
+class BootPartition(NamedTuple):
+    guid: str
+    number: int
+    start_lba: int
+    size_lba: int
+    short_form: bool
+
+
+def efi_file_name(payload):
+    try:
+        name = payload.decode("utf-16-le")
+    except UnicodeDecodeError:
+        return None
+    if len(name) < 2 or not name.endswith("\0") or "\0" in name[:-1]:
+        return None
+    return name[:-1]
 
 
 def boot_disk_partition(path):
@@ -1141,17 +1238,34 @@ def boot_disk_partition(path):
             return partition if subtype == 0xff and length == 4 and end == len(path) else None
         if partition is not None and (kind, subtype) != (4, 4):
             return None
+        if (kind, subtype) == (4, 4) and efi_file_name(path[offset + 4:end]) is None:
+            return None
         if (kind, subtype) == (4, 1):
             if length != 42 or path[offset + 40:end] != b"\x02\x02":
                 return None
             guid = str(uuid.UUID(bytes_le=path[offset + 24:offset + 40]))
-            number = struct.unpack_from("<I", path, offset + 4)[0]
-            partition = guid, number, offset == 0
+            number, start_lba, size_lba = struct.unpack_from("<IQQ", path, offset + 4)
+            partition = BootPartition(guid, number, start_lba, size_lba, offset == 0)
         offset = end
     return None
 
 
-def check_disk_boot_target(esp_guid, esp_device):
+def short_efi_file(path):
+    """Read a single File() node following a short GPT HD() path."""
+    if path[:4] != b"\x04\x01\x2a\x00" or path[-4:] != b"\x7f\xff\x04\x00":
+        return None
+    node = path[42:-4]
+    if len(node) < 8 or node[:2] != b"\x04\x04" or int.from_bytes(node[2:4], "little") != len(node):
+        return None
+    name = efi_file_name(node[4:])
+    if name is None or not re.fullmatch(r"\\[A-Za-z0-9_-]+(?:\\[A-Za-z0-9_.-]+)+", name):
+        return None
+    return name[1:].replace("\\", "/").casefold()
+
+
+def check_disk_boot_target(esp_guid, geometry, *, skip_missing=False):
+    if type(skip_missing) is not bool:
+        raise Hold("機種別対応情報のBootOrderの欠落項目の扱いを確認できません。")
     order = efi_variable_payload("BootOrder", EFI_GLOBAL)
     if order is None or len(order) % 2:
         raise Hold("ディスク配送先を確認するためのBootOrderを読み取れません。")
@@ -1160,15 +1274,18 @@ def check_disk_boot_target(esp_guid, esp_device):
         try:
             data = read_efi_variable(EFIVARS / f"{name}-{EFI_GLOBAL}")
         except FileNotFoundError as exc:
+            if skip_missing:
+                continue  # The model profile confirms missing variables are skipped by firmware.
             raise Hold(f"BootOrderの {name} を確認できません。") from exc
-        _, path = boot_load_option(data)
+        description, path = boot_load_option(data)
         attributes = int.from_bytes(data[4:8], "little")
         if not attributes & 1 or attributes & 0x1f00:
             continue  # 無効な項目や通常起動の対象外の項目は選ばれない。
         partition = boot_disk_partition(path)
-        if partition is not None and partition[:2] == (esp_guid, partition_number(esp_device)):
-            if partition[2] or efi_variable_payload("BootCurrent", EFI_GLOBAL, size=2) == struct.pack("<H", index):
-                return
+        if (description not in ("Linux Firmware Updater", "Linux-Firmware-Updater")
+                and partition is not None and partition[:4] == (esp_guid, *geometry)):
+            if partition.short_form or efi_variable_payload("BootCurrent", EFI_GLOBAL, size=2) == struct.pack("<H", index):
+                return index, hashlib.sha256(data).hexdigest()
         raise Hold(f"BootOrderで最初に有効な {name} の起動先が配送区画に一致しません。")
     raise Hold("BootOrderに通常起動用の有効な項目がありません。")
 
@@ -1217,7 +1334,7 @@ def efi_asset_sha256(path, *, esp=None, check_application=False):
         raise Hold("ESPのshimのハッシュを確認できません。")
 
 
-def check_boot_delivery(esp, esp_guid, esp_device, profile, *, bootloader_capability):
+def check_boot_delivery(esp, esp_guid, esp_device, profile, *, bootloader_capability, geometry=None):
     try:
         secure_boot = efi_variable_payload("SecureBoot", EFI_GLOBAL, size=1)
     except OSError as exc:
@@ -1238,8 +1355,10 @@ def check_boot_delivery(esp, esp_guid, esp_device, profile, *, bootloader_capabi
         if delivery == "capsule-on-disk":
             if not disk_supported:
                 raise Hold("機種別対応情報のディスク配送方式をOsIndicationsSupportedに照合できません。")
-            check_disk_boot_target(esp_guid, esp_device)
-            return enabled
+            geometry = geometry if geometry is not None else partition_geometry(esp_device)
+            boot_entry = check_disk_boot_target(esp_guid, geometry,
+                                                skip_missing=boot.get("boot_order_skip_missing", False))
+            return enabled, boot_entry
         if disk_supported:
             raise Hold("ディスク配送に対応しています。機種別対応情報に検証済みの配送方式を指定してください。")
     if bootloader_capability is not None:
@@ -1269,7 +1388,7 @@ def check_boot_delivery(esp, esp_guid, esp_device, profile, *, bootloader_capabi
             hash_key = "fwupd_efi_sha256"
         if not loader or (hash_key in boot and loader != boot[hash_key]):
             raise Hold("NVRAM配送用のfwupdx64.efiローダーを確認できません。")
-        return enabled
+        return enabled, None
 
     vendor = boot.get("esp_vendor_dir")
     if not isinstance(vendor, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", vendor):
@@ -1289,7 +1408,7 @@ def check_boot_delivery(esp, esp_guid, esp_device, profile, *, bootloader_capabi
         digest = hashlib.sha256(sbat).hexdigest() if sbat is not None else None
         if "shim_copy_sbat_sha256" not in boot or digest != boot["shim_copy_sbat_sha256"]:
             raise Hold("shimのコピー先で検証したSBAT設定を現在のSbatLevelRTに照合できません。")
-    return enabled
+    return enabled, None
 
 
 def valid_update_device_path(path):
@@ -1310,13 +1429,7 @@ def valid_update_device_path(path):
             file_path = False
         elif (kind, subtype) == (4, 4):
             name = path[offset + 4:end]
-            if not 6 < len(name) <= 2048:
-                return False
-            try:
-                decoded = name.decode("utf-16-le")
-            except UnicodeDecodeError:
-                return False
-            if len(decoded) < 2 or not decoded.endswith("\0") or "\0" in decoded[:-1]:
+            if not 6 < len(name) <= 2048 or efi_file_name(name) is None:
                 return False
             file_path = True
         offset = end
@@ -1370,14 +1483,16 @@ def boot_next():
     return int.from_bytes(data[4:], "little")
 
 
+def os_indications():
+    data = efi_variable_payload("OsIndications", EFI_GLOBAL, size=8)
+    return int.from_bytes(data, "little") if data else 0
+
+
 def disk_delivery_requested():
-    try:
-        data = read_efi_variable(EFIVARS / f"OsIndications-{EFI_GLOBAL}")
-    except FileNotFoundError:
-        return False
-    if len(data) != 12:
-        raise Hold("ディスク経由カプセルの配送指示（OsIndications）を解釈できません。")
-    return bool(int.from_bytes(data[4:], "little") & 4)
+    flags = os_indications()
+    if flags & ~4:
+        raise Hold("OsIndicationsに別の起動・復旧指示があります。")
+    return bool(flags & 4)
 
 
 def check_ready(device, devices, history, settings):
@@ -1406,11 +1521,13 @@ def check_ready(device, devices, history, settings):
         raise Hold("fwupd-efiに実行待ちの更新登録があります。")
     if boot_next() is not None:
         raise Hold("別の次回起動先（BootNext）が設定されています。その用途を確認してください。")
-    check_boot_entries(esp_guid, settings)
     if disk_delivery_requested():
         raise Hold("既存のディスク経由カプセル配送指示があります。")
-    secure_boot = check_boot_delivery(esp, esp_guid, mounts[str(esp)].device, settings,
-                                      bootloader_capability=bootloader_capability)
+    esp_device = mounts[str(esp)].device
+    secure_boot, disk_boot = check_boot_delivery(esp, esp_guid, esp_device, settings,
+                                                 bootloader_capability=bootloader_capability)
+    if disk_boot is None:
+        check_boot_entries(esp_guid, esp_device, settings)
     check_power()
     return esp, esp_guid, secure_boot, bootloader_capability
 
@@ -1893,8 +2010,10 @@ def show_efi_variables(guid):
         print("次回起動先  確認不能", visible(exc))
 
     try:
-        delivery = disk_delivery_requested()
-        print("ディスク配送 ", "配送指示あり" if delivery else "標準の配送指示なし")
+        flags = os_indications()
+        print("ディスク配送 ", "配送指示あり" if flags & 4 else "標準の配送指示なし")
+        if flags & ~4:
+            print("OsIndicationsに別の起動・復旧指示があります。")
     except (Hold, OSError) as exc:
         print("ディスク配送  確認不能", visible(exc))
 

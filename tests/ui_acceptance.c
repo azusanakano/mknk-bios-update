@@ -19,36 +19,35 @@ static void call_with_fds(GDBusConnection *connection, const char *bus_name, con
 #undef g_dbus_connection_call_with_unix_fd_list
 #include <sys/mman.h>
 
-static const char *mock_state = "idle", *mock_desktop = "gnome", *mock_power = "reboot";
+static const char *mock_state = "idle", *mock_power = "reboot";
 static gboolean allowed = TRUE, withhold, hold_prepare, logout_block, ac = TRUE, fail_install;
-static gboolean delay_authorize, hold_status, hold_authorize, hold_install, hold_recheck, result_this_boot;
-static gboolean hold_candidates;
-static gboolean hold_power, hold_power_reply;
-static gboolean slow_query, takeover_view;
+static gboolean delay_authorize, hold_status, hold_authorize, hold_install, result_this_boot;
+static gboolean hold_candidates, takeover_view;
 static guint rejections, takeovers;
 static char *dismissed_plan;
 static const char *install_error, *install_detail;
-static const char *desktop_error, *mock_plan = "plan-1", *mock_recovery_detail = "";
+static const char *mock_plan = "plan-1", *mock_recovery_detail = "";
 enum { VALID_SHA512, CONFLICTING_DIGESTS, WRONG_REMOTE, WRONG_COMPONENT, VALID_BOTH };
 static guint release_mode;
 static gboolean can_replan_test, swapped_operation;
 static const char *help_url = "", *recovery_url = "";
-static guint checks_sent, prepares, permits, installs, reports, powers, desktop_calls;
-static guint rechecks, cancelled, responses, stopped, declined;
-static gboolean last_response;
-static GDBusMethodInvocation *held_check, *held_prepare, *held_status, *held_authorize, *held_install, *held_recheck;
-static GDBusMethodInvocation *held_power, *held_power_reply;
+static guint checks_sent, prepares, permits, installs, reports, declined;
+static guint power_checks, legacy_power_calls, desktop_calls;
+static GDBusMethodInvocation *held_check, *held_prepare, *held_status, *held_authorize, *held_install;
+static gboolean hold_power_check;
+static GDBusMethodInvocation *held_power_check;
 static GDBusMethodInvocation *held_candidates, *held_decline;
-static GDBusConnection *service, *fwupd, *desktop;
+static GDBusConnection *service, *fwupd;
 static GDBusConnection *peer_service;
 static GDBusServer *peer_server;
 static guint helper_starts, status_calls;
 static gboolean deny_helper;
-static char *permit_sender, *client_sender, *reader;
+static char *permit_sender, *reader;
 static const char device_id[] = "0123456789012345678901234567890123456789";
 #define DIGEST256 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 #define HALF512 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 #define DIGEST512 HALF512 HALF512
+static const char *mock_checksum = DIGEST256;
 static const char mock_xml[] =
     "<node><interface name='" BIOS_BUS "'>"
     "<method name='Status'><arg type='s' direction='out'/></method>"
@@ -64,6 +63,7 @@ static const char mock_xml[] =
     "<method name='Report'><arg type='s' direction='in'/><arg type='b' direction='in'/>"
     "<arg type='s' direction='out'/></method><method name='Power'><arg type='s' direction='in'/>"
     "<arg type='s' direction='out'/><arg type='s' direction='out'/><arg type='s' direction='out'/></method>"
+    "<method name='CheckPower'><arg type='s' direction='in'/><arg type='s' direction='out'/></method>"
     "<method name='RecheckPower'><arg type='s' direction='in'/></method>"
     "<method name='ReplyPower'><arg type='s' direction='in'/><arg type='b' direction='in'/></method>"
     "<signal name='Changed'/></interface>"
@@ -71,11 +71,17 @@ static const char mock_xml[] =
     "<arg type='aa{sv}' direction='out'/></method><method name='Install'><arg type='s' direction='in'/>"
     "<arg type='h' direction='in'/><arg type='a{sv}' direction='in'/></method></interface>"
     "<interface name='org.freedesktop.login1.Manager'>"
+    "<method name='Reboot'><arg type='b' direction='in'/></method>"
+    "<method name='PowerOff'><arg type='b' direction='in'/></method>"
+    "<method name='Inhibit'><arg type='s' direction='in'/><arg type='s' direction='in'/>"
+    "<arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='h' direction='out'/></method>"
     "<method name='GetSessionByPID'><arg type='u' direction='in'/><arg type='o' direction='out'/></method>"
     "<method name='CanReboot'><arg type='s' direction='out'/></method>"
     "<method name='CanPowerOff'><arg type='s' direction='out'/></method>"
     "<method name='ListInhibitors'><arg type='a(ssssuu)' direction='out'/></method></interface>"
     "<interface name='org.gnome.SessionManager'>"
+    "<method name='Inhibit'><arg type='s' direction='in'/><arg type='u' direction='in'/>"
+    "<arg type='s' direction='in'/><arg type='u' direction='in'/><arg type='u' direction='out'/></method>"
     "<method name='RegisterClient'><arg type='s' direction='in'/><arg type='s' direction='in'/>"
     "<arg type='o' direction='out'/></method><method name='UnregisterClient'><arg type='o' direction='in'/></method>"
     "<method name='IsInhibited'><arg type='u' direction='in'/><arg type='b' direction='out'/></method>"
@@ -97,13 +103,13 @@ static void return_view(GDBusMethodInvocation *inv, const char *s)
         "\"target\":\"1.24\",\"source\":\"LVFS 安定版\",\"scope\":\"システム BIOS\","
         "\"checked\":\"2026年11月21日 10時32分\",\"changes\":\"スリープ復帰時の画面表示を修正\","
         "\"plan\":\"%s\",\"token\":\"candidate-1\",\"power\":\"%s\",\"daemon_owner\":\"%s\",\"device\":\"%s\","
-        "\"checksum\":\"" DIGEST256 "\",\"cab_sha512\":\"" DIGEST512 "\","
+        "\"checksum\":\"%s\",\"cab_sha512\":\"" DIGEST512 "\","
         "\"remote_id\":\"lvfs\",\"appstream_id\":\"com.example.Bios\",\"can_replan\":%s,"
         "\"support_url\":\"%s\",\"recovery_url\":\"%s\","
         "\"recovery_required\":true,\"recovery_detail\":\"%s\",\"can_check\":%s,\"can_prepare\":true,"
         "\"prepared_draft\":\"%s\",\"can_take_over\":%s,\"can_approve\":%s,\"can_power\":%s,\"result_this_boot\":%s}", s, title,
         planless ? "" : mock_plan,
-        mock_power, g_dbus_connection_get_unique_name(fwupd), device_id,
+        mock_power, g_dbus_connection_get_unique_name(fwupd), device_id, mock_checksum,
         can_replan_test ? "true" : "false",
         help_url, recovery_url, mock_recovery_detail,
         g_str_equal(s, "pending") ? "false" : "true",
@@ -111,12 +117,6 @@ static void return_view(GDBusMethodInvocation *inv, const char *s)
         takeover_view ? "true" : "false", takeover_view ? "false" : "true",
         allowed ? "true" : "false", result_this_boot ? "true" : "false");
     g_dbus_method_invocation_return_value(inv, g_variant_new("(s)", text));
-}
-
-static void client_signal(const char *name, GVariant *args)
-{
-    g_assert_true(g_dbus_connection_emit_signal(desktop, client_sender, "/test/client",
-                                                "org.gnome.SessionManager.ClientPrivate", name, args, NULL));
 }
 
 static void call_with_fds(GDBusConnection *connection, const char *bus_name, const char *path,
@@ -147,15 +147,6 @@ static gboolean grant_authorization(gpointer data)
     g_dbus_method_invocation_return_value_with_unix_fd_list(inv,
         g_variant_new("(sssh)", swapped_operation ? "other-plan" : "plan-1",
                       g_dbus_connection_get_unique_name(fwupd), device_id, 0), fds);
-    return G_SOURCE_REMOVE;
-}
-
-static gboolean delayed_session_lookup(gpointer data)
-{
-    GDBusMethodInvocation *inv = data;
-    gboolean session = g_str_equal(g_dbus_method_invocation_get_method_name(inv), "GetSessionByPID");
-    g_dbus_method_invocation_return_value(inv, session ? g_variant_new("(o)", "/test/session")
-                                                      : g_variant_new("(s)", "yes"));
     return G_SOURCE_REMOVE;
 }
 
@@ -301,76 +292,35 @@ static void method_call(GDBusConnection *bus, const char *sender, const char *pa
         g_assert_cmpint(accepted, ==, !fail_install && !install_error);
         reports++;
         mock_state = accepted ? "pending" : "uncertain";
-    } else if (g_str_equal(method, "Power")) {
-        powers++;
-        if (hold_power) {
-            held_power = g_object_ref(inv);
+    } else if (g_str_equal(method, "CheckPower")) {
+        const char *plan;
+        g_variant_get(args, "(&s)", &plan);
+        g_assert_cmpstr(plan, ==, mock_plan);
+        power_checks++;
+        if (hold_power_check) {
+            held_power_check = g_object_ref(inv);
             return;
         }
-        result = g_variant_new("(sss)", "request-1", mock_desktop, mock_power);
-    } else if (g_str_equal(method, "RecheckPower")) {
-        rechecks++;
-        if (hold_recheck) {
-            held_recheck = g_object_ref(inv);
+        if (!ac || logout_block) {
+            g_dbus_method_invocation_return_dbus_error(inv, BIOS_BUS ".Hold",
+                ac ? "別の作業が終了を保留しています。" : "AC を接続してください。");
             return;
         }
-        if (!ac) {
-            g_dbus_method_invocation_return_dbus_error(inv, BIOS_BUS ".Hold", "AC を接続してください。");
-            return;
-        }
-    } else if (g_str_equal(method, "ReplyPower")) {
-        const char *id;
-        gboolean definitely_cancelled;
-        g_variant_get(args, "(&sb)", &id, &definitely_cancelled);
-        g_assert_cmpstr(id, ==, "request-1");
-        if (definitely_cancelled) cancelled++;
-        else stopped++;
-        if (held_recheck) {
-            /* The remote check may still finish after its caller cancels. */
-            g_dbus_method_invocation_return_value(held_recheck, NULL);
-            g_clear_object(&held_recheck);
-        }
-        if (hold_power_reply) {
-            held_power_reply = g_object_ref(inv);
-            return;
-        }
-    } else if (g_str_equal(method, "RegisterClient")) {
-        g_free(client_sender);
-        client_sender = g_strdup(sender);
-        result = g_variant_new("(o)", "/test/client");
-    } else if (slow_query && (g_str_equal(method, "GetSessionByPID") || g_str_equal(method, "CanReboot"))) {
-        /* Three successful 3s calls put the last hardware check across the 10s query deadline. */
-        g_timeout_add_full(G_PRIORITY_DEFAULT, 3000, delayed_session_lookup, g_object_ref(inv), g_object_unref);
+        g_dbus_method_invocation_return_value(inv, g_variant_new("(s)", mock_power));
         return;
-    } else if (g_str_equal(method, "CanReboot") || g_str_equal(method, "CanPowerOff")) {
-        g_assert_cmpstr(method, ==, g_str_equal(mock_power, "reboot") ? "CanReboot" : "CanPowerOff");
-        result = g_variant_new("(s)", "yes");
-    } else if (g_str_equal(method, "GetSessionByPID")) {
-        result = g_variant_new("(o)", "/test/session");
-    } else if (g_str_equal(method, "IsInhibited")) {
-        result = g_variant_new("(b)", logout_block);
-    } else if (g_str_equal(method, "ListInhibitors")) {
-        GVariantBuilder locks;
-        g_variant_builder_init(&locks, G_VARIANT_TYPE("a(ssssuu)"));
-        result = g_variant_new("(a(ssssuu))", &locks);
-    } else if (g_str_equal(method, "Reboot") || g_str_equal(method, "RequestReboot") ||
-               g_str_equal(method, "Shutdown") || g_str_equal(method, "RequestShutdown")) {
+    } else if (g_str_equal(method, "Power") || g_str_equal(method, "RecheckPower") ||
+               g_str_equal(method, "ReplyPower")) {
+        legacy_power_calls++;
+        g_dbus_method_invocation_return_dbus_error(inv, BIOS_BUS ".Unexpected", "legacy power request");
+        return;
+    } else if (g_str_equal(interface, "org.gnome.SessionManager") ||
+               g_str_equal(interface, "org.gnome.SessionManager.ClientPrivate") ||
+               g_str_equal(interface, "org.freedesktop.login1.Manager")) {
         desktop_calls++;
-        gboolean gnome = g_str_equal(mock_desktop, "gnome");
-        const char *expected = g_str_equal(mock_power, "reboot") ? (gnome ? "Reboot" : "RequestReboot")
-                                                                 : (gnome ? "Shutdown" : "RequestShutdown");
-        g_assert_cmpstr(method, ==, expected);
-        if (desktop_error) {
-            g_dbus_method_invocation_return_dbus_error(inv, desktop_error, "simulated session manager error");
-            return;
-        }
-    } else if (g_str_equal(method, "EndSessionResponse")) {
-        const char *reason;
-        g_variant_get(args, "(b&s)", &last_response, &reason);
-        responses++;
+        g_dbus_method_invocation_return_dbus_error(inv, "io.github.mknk.Test.Unexpected", "desktop method call");
+        return;
     }
-    if (g_str_equal(interface, BIOS_BUS) &&
-        !g_str_equal(method, "Power") && !g_str_equal(method, "ReplyPower") && !g_str_equal(method, "RecheckPower")) {
+    if (g_str_equal(interface, BIOS_BUS)) {
         return_view(inv, mock_state);
         return;
     }
@@ -468,18 +418,6 @@ static void advance(const char *s)
     WAIT_FOR(state(s) && writable() && !ui.timer);
 }
 
-static void review_power(const char *action, const char *confirmation)
-{
-    guint service_calls = powers, session_calls = desktop_calls;
-    click(action);
-    while (g_main_context_iteration(NULL, FALSE)) {}
-    g_assert_cmpuint(powers, ==, service_calls);
-    g_assert_cmpuint(desktop_calls, ==, session_calls);
-    g_assert_nonnull(action_button(confirmation));
-    g_assert_nonnull(action_button("キャンセル"));
-    g_assert_true(gtk_window_get_focus(ui.window) == action_button("キャンセル"));
-}
-
 static void notify_change(const char *s)
 {
     guint before = status_calls;
@@ -489,12 +427,91 @@ static void notify_change(const char *s)
     advance(s);
 }
 
+static gboolean has_label(GtkWidget *root, const char *text)
+{
+    if (GTK_IS_LABEL(root) && strstr(gtk_label_get_text(GTK_LABEL(root)), text)) return TRUE;
+    for (GtkWidget *w = gtk_widget_get_first_child(root); w; w = gtk_widget_get_next_sibling(w)) {
+        if (has_label(w, text)) return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean complete_slow_power_check(gpointer data)
+{
+    (void) data;
+    g_assert_nonnull(held_power_check);
+    g_assert_cmpuint(desktop_calls, ==, 0);
+    g_dbus_method_invocation_return_value(held_power_check, g_variant_new("(s)", "reboot"));
+    g_clear_object(&held_power_check);
+    return G_SOURCE_REMOVE;
+}
+
+static void test_manual_power(void)
+{
+    static const char ready[] = "給電条件と起動予約を確認しました。";
+    advance("pending");
+    g_assert_false(has_label(ui.page, ready));
+    hold_power_check = TRUE;
+    click("起動条件を確認");
+    WAIT_FOR(held_power_check != NULL);
+    g_timeout_add(1200, complete_slow_power_check, NULL);
+    advance("pending");
+    hold_power_check = FALSE;
+    g_assert_true(has_label(ui.page, ready));
+    g_assert_true(has_label(ui.page, "デスクトップのメニューから再起動"));
+
+    ac = FALSE;
+    notify_change("pending");
+    g_assert_false(has_label(ui.page, ready));
+    click("起動条件を確認");
+    advance("pending");
+    g_assert_false(has_label(ui.page, ready));
+    g_assert_true(has_label(ui.notice, "AC を接続してください。"));
+
+    ac = TRUE;
+    logout_block = TRUE;
+    click("起動条件を確認");
+    advance("pending");
+    g_assert_false(has_label(ui.page, ready));
+    g_assert_true(has_label(ui.notice, "別の作業が終了を保留しています。"));
+    logout_block = FALSE;
+
+    hold_power_check = TRUE;
+    click("起動条件を確認");
+    WAIT_FOR(held_power_check != NULL);
+    guint before = status_calls;
+    ac = FALSE;
+    g_assert_true(g_dbus_connection_emit_signal(ui.portable ? peer_service : service, NULL, BIOS_PATH,
+                                               BIOS_BUS, "Changed", NULL, NULL));
+    WAIT_FOR(status_calls > before && ui.fresh);
+    g_dbus_method_invocation_return_value(held_power_check, g_variant_new("(s)", "reboot"));
+    g_clear_object(&held_power_check);
+    hold_power_check = FALSE;
+    advance("pending");
+    g_assert_false(has_label(ui.page, ready));
+
+    ac = TRUE;
+    mock_power = "shutdown";
+    notify_change("pending");
+    click("起動条件を確認");
+    advance("pending");
+    g_assert_true(has_label(ui.page, ready));
+    g_assert_true(has_label(ui.page, "デスクトップのメニューから電源を切り"));
+    g_assert_true(has_label(ui.page, "次に電源を入れ"));
+    click("状態を再確認");
+    advance("pending");
+    g_assert_false(has_label(ui.page, ready));
+    g_assert_cmpuint(power_checks, ==, 5);
+    g_assert_cmpuint(legacy_power_calls, ==, 0);
+    g_assert_cmpuint(desktop_calls, ==, 0);
+}
+
 static void test_pending_focus(void)
 {
     advance("pending");
-    g_assert_true(gtk_widget_grab_focus(action_button("再起動する")));
+    g_assert_true(gtk_widget_grab_focus(action_button("起動条件を確認")));
     notify_change("pending");
-    g_assert_true(gtk_window_get_focus(ui.window) == action_button("再起動する"));
+    g_assert_true(gtk_window_get_focus(ui.window) == action_button("起動条件を確認"));
 
     GtkToggleButton *history = GTK_TOGGLE_BUTTON(find_button(GTK_WIDGET(ui.window), "履歴"));
     gtk_toggle_button_set_active(history, TRUE);
@@ -502,83 +519,14 @@ static void test_pending_focus(void)
     g_assert_true(gtk_window_get_focus(ui.window) == ui.history_text);
     gtk_toggle_button_set_active(history, FALSE);
 
-    review_power("再起動する", "再起動を続ける");
-    g_assert_true(gtk_widget_grab_focus(action_button("再起動を続ける")));
-    notify_change("pending");
-    g_assert_true(gtk_window_get_focus(ui.window) == action_button("再起動を続ける"));
+    g_assert_true(gtk_widget_grab_focus(action_button("起動条件を確認")));
     mock_plan = "replacement";
     notify_change("pending");
-    g_assert_null(action_button("再起動を続ける"));
     g_assert_true(gtk_window_get_focus(ui.window) == action_button("あとで"));
-    g_assert_true(gtk_widget_grab_focus(action_button("再起動する")));
+    g_assert_true(gtk_widget_grab_focus(action_button("起動条件を確認")));
     mock_power = "shutdown";
     notify_change("pending");
     g_assert_true(gtk_window_get_focus(ui.window) == action_button("あとで"));
-}
-
-static gboolean finish_recheck(gpointer data)
-{
-    (void) data;
-    g_assert_nonnull(held_recheck);
-    g_dbus_method_invocation_return_value(held_recheck, NULL);
-    g_clear_object(&held_recheck);
-    return G_SOURCE_REMOVE;
-}
-
-static void test_slow_power(gboolean late_query)
-{
-    advance("pending");
-    hold_recheck = !late_query;
-    review_power("再起動する", "再起動を続ける");
-    click("再起動を続ける");
-    if (!late_query) {
-        WAIT_FOR(held_recheck);
-        g_timeout_add(4500, finish_recheck, NULL);
-        WAIT_FOR(desktop_calls || cancelled);
-        g_assert_cmpuint(desktop_calls, ==, 1);
-    } else {
-        WAIT_FOR(desktop_calls == 1);
-        hold_recheck = slow_query = TRUE;
-        client_signal("QueryEndSession", g_variant_new("(u)", 0u));
-        WAIT_WITHIN(held_recheck && responses == 1, 17);
-        g_assert_false(last_response);
-        finish_recheck(NULL);
-        WAIT_FOR(responses == 2);
-        g_assert_true(last_response);
-
-        slow_query = FALSE;
-        client_signal("QueryEndSession", g_variant_new("(u)", 0u));
-        WAIT_FOR(held_recheck);
-        g_autoptr(GDBusMethodInvocation) obsolete = g_steal_pointer(&held_recheck);
-        client_signal("QueryEndSession", g_variant_new("(u)", 0u));
-        WAIT_FOR(held_recheck);
-        g_dbus_method_invocation_return_value(obsolete, NULL);
-        g_dbus_method_invocation_return_dbus_error(held_recheck, BIOS_BUS ".Hold", "AC");
-        g_clear_object(&held_recheck);
-        WAIT_FOR(responses == 3);
-        g_assert_false(last_response);
-        client_signal("EndSession", g_variant_new("(u)", 0u));
-        WAIT_FOR(responses == 4);
-        g_assert_false(last_response);
-    }
-    client_signal("CancelEndSession", NULL);
-    WAIT_FOR(cancelled == 1);
-    advance("pending");
-    if (late_query) {
-        hold_recheck = FALSE;
-        review_power("再起動する", "再起動を続ける");
-        click("再起動を続ける");
-        WAIT_FOR(desktop_calls == 2);
-        hold_recheck = TRUE;
-        client_signal("QueryEndSession", g_variant_new("(u)", 0u));
-        WAIT_FOR(held_recheck);
-        g_autoptr(GDBusMethodInvocation) abandoned = g_steal_pointer(&held_recheck);
-        client_signal("CancelEndSession", NULL);
-        WAIT_FOR(cancelled == 2);
-        g_dbus_method_invocation_return_value(abandoned, NULL);
-        advance("pending");
-        g_assert_cmpuint(responses, ==, 4);
-    }
 }
 
 static void test_abandon_own_draft(void)
@@ -610,6 +558,13 @@ static void test_takeover(void)
     click("管理者として承認を解除");
     advance("idle");
     g_assert_cmpuint(takeovers, ==, 1);
+    takeover_view = TRUE;
+    mock_state = "hold";
+    notify_change("hold");
+    g_assert_null(action_button("管理者として承認を解除"));
+    click("管理者として前回の記録を整理");
+    advance("idle");
+    g_assert_cmpuint(takeovers, ==, 2);
     g_assert_cmpuint(checks_sent, ==, 0);
     g_assert_cmpuint(permits, ==, 0);
     g_assert_cmpuint(installs, ==, 0);
@@ -629,8 +584,16 @@ static gboolean bus_has_name(const char *name)
 
 static void test_install_rejections(void)
 {
+    g_autoptr(GDBusMessage) response = g_dbus_message_new();
+    g_dbus_message_set_message_type(response, G_DBUS_MESSAGE_TYPE_ERROR);
+    g_dbus_message_set_error_name(response, FWUPD ".AuthFailed");
+    g_dbus_message_set_sender(response, ":1.2");
+    g_dbus_message_set_body(response, g_variant_new("(s)", "Failed to obtain auth as not trusted user"));
+    g_assert_false(install_definitely_rejected(response, ":1.3"));
     const struct { const char *name, *detail; gboolean rejected; } replies[] = {
         {FWUPD ".AuthFailed", "Failed to obtain auth", TRUE},
+        {FWUPD ".AuthFailed", "Failed to obtain auth as not trusted user", TRUE},
+        {FWUPD ".AuthFailed", "Failed to obtain auth as not trusted user during install", FALSE},
         {FWUPD ".AuthFailed", "different stage", FALSE},
         {"org.freedesktop.DBus.Error.ServiceUnknown", "daemon returned this name", FALSE},
         {"org.freedesktop.DBus.Error.NoReply", "no known outcome", FALSE},
@@ -672,6 +635,32 @@ static GtkExpander *details_expander(void)
     g_assert_not_reached();
 }
 
+static void test_pending_details(void)
+{
+    advance("pending");
+    gtk_window_set_default_size(ui.window, 680, 540);
+    GtkWidget *scroll = gtk_widget_get_ancestor(ui.page, GTK_TYPE_SCROLLED_WINDOW);
+    g_assert_nonnull(scroll);
+    GtkAdjustment *adjustment = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(scroll));
+    gtk_expander_set_expanded(details_expander(), TRUE);
+    g_assert_true(gtk_widget_grab_focus(GTK_WIDGET(details_expander())));
+    WAIT_FOR(gtk_adjustment_get_upper(adjustment) - gtk_adjustment_get_page_size(adjustment) > 100);
+    gtk_adjustment_set_value(adjustment, 80);
+
+    notify_change("pending");
+    g_assert_true(gtk_expander_get_expanded(details_expander()));
+    g_assert_true(gtk_window_get_focus(ui.window) == GTK_WIDGET(details_expander()));
+    g_assert_cmpfloat(gtk_adjustment_get_value(adjustment), ==, 80);
+
+    mock_checksum = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    notify_change("pending");
+    g_assert_false(gtk_expander_get_expanded(details_expander()));
+    gtk_expander_set_expanded(details_expander(), TRUE);
+    mock_plan = "replacement";
+    notify_change("pending");
+    g_assert_false(gtk_expander_get_expanded(details_expander()));
+}
+
 static void test_review_refresh(void)
 {
     gtk_expander_set_expanded(details_expander(), TRUE);
@@ -702,34 +691,6 @@ static void test_review_refresh(void)
     notify_change("review");
 }
 
-static void test_desktop_replies(void)
-{
-    mock_desktop = "gnome";
-    const char *rejections[] = {"org.gnome.SessionManager.LockedDown", "org.gnome.SessionManager.NotInRunning"};
-    for (guint i = 0; i < G_N_ELEMENTS(rejections); i++) {
-        guint before = cancelled;
-        desktop_error = rejections[i];
-        review_power("電源を切る", "電源を切る操作を続ける");
-        click("電源を切る操作を続ける");
-        WAIT_FOR(cancelled == before + 1);
-        advance("pending");
-    }
-    guint before = cancelled, response_count = responses;
-    desktop_error = "org.freedesktop.DBus.Error.NoReply";
-    review_power("電源を切る", "電源を切る操作を続ける");
-    click("電源を切る操作を続ける");
-    WAIT_FOR(strstr(gtk_label_get_text(GTK_LABEL(ui.notice)), "受付結果が未確定") != NULL);
-    g_assert_cmpuint(cancelled, ==, before);
-    g_assert_true(ui.busy);
-    client_signal("QueryEndSession", g_variant_new("(u)", 0u));
-    WAIT_FOR(responses == response_count + 1);
-    g_assert_true(last_response);
-    client_signal("CancelEndSession", NULL);
-    WAIT_FOR(cancelled == before + 1);
-    advance("pending");
-    desktop_error = NULL;
-}
-
 static void test_portable_close(const char *operation)
 {
     advance("available");
@@ -745,16 +706,13 @@ static void test_portable_close(const char *operation)
         hold_prepare = TRUE;
         click("更新する");
         WAIT_FOR(held_prepare);
-    } else if (g_str_equal(operation, "power") || g_str_equal(operation, "power-request")) {
+    } else if (g_str_equal(operation, "power")) {
         mock_state = "pending";
         click("状態を再確認");
         advance("pending");
-        hold_power = g_str_equal(operation, "power-request");
-        hold_recheck = !hold_power;
-        hold_power_reply = TRUE;
-        review_power("再起動する", "再起動を続ける");
-        click("再起動を続ける");
-        WAIT_FOR(held_recheck || held_power);
+        hold_power_check = TRUE;
+        click("起動条件を確認");
+        WAIT_FOR(held_power_check != NULL);
     } else {
         click("更新する");
         advance("review");
@@ -770,17 +728,6 @@ static void test_portable_close(const char *operation)
     }
     gint64 closed_at = g_get_monotonic_time();
     gtk_window_close(ui.window);
-    if (held_power) {
-        g_assert_false(g_dbus_connection_is_closed(peer_service));
-        g_dbus_method_invocation_return_value(held_power, g_variant_new("(sss)", "request-1", mock_desktop, mock_power));
-        g_clear_object(&held_power);
-    }
-    if (hold_power_reply) {
-        WAIT_FOR(held_power_reply);
-        g_assert_false(g_dbus_connection_is_closed(peer_service));
-        g_dbus_method_invocation_return_value(held_power_reply, NULL);
-        g_clear_object(&held_power_reply);
-    }
     if (held_authorize) {
         g_assert_nonnull(ui.control);
         g_assert_false(g_dbus_connection_is_closed(peer_service));
@@ -800,8 +747,9 @@ static void test_portable_close(const char *operation)
     }
     WAIT_FOR(g_dbus_connection_is_closed(peer_service));
     g_assert_true(g_get_monotonic_time() - closed_at < 2 * G_TIME_SPAN_SECOND);
-    g_assert_cmpuint(cancelled, ==, hold_power_reply ? 1 : 0);
-    g_assert_cmpuint(rechecks, ==, hold_recheck ? 1 : 0);
+    g_clear_object(&held_power_check);
+    g_assert_cmpuint(power_checks, ==, hold_power_check ? 1 : 0);
+    g_assert_cmpuint(legacy_power_calls, ==, 0);
     g_assert_cmpuint(desktop_calls, ==, 0);
     g_assert_cmpuint(permits, ==, hold_authorize || hold_install ? 1 : 0);
     g_assert_cmpuint(declined, ==, hold_authorize ? 1 : 0);
@@ -880,10 +828,12 @@ int main(int argc, char **argv)
                          "--test-login-installed", "--test-login-unapplied", "--test-login-old-result",
                          "--test-portable-status", "--test-portable-plan", "--test-portable-close-status",
                          "--test-portable-close-check", "--test-portable-close-prepare", "--test-portable-close-power",
-                         "--test-portable-close-power-request", "--test-portable-close-candidates",
+                         "--test-portable-close-candidates",
                          "--test-portable-close-authorize", "--test-portable-close-install",
-                         "--test-native-slow-preflight", "--test-native-late-query", "--test-native-bus-restart",
-                         "--test-native-pending-focus", "--test-native-historical", "--test-native-readonly-historical",
+                         "--test-native-bus-restart",
+                         "--test-native-manual-power",
+                         "--test-native-pending-focus", "--test-native-pending-details",
+                         "--test-native-historical", "--test-native-readonly-historical",
                          "--test-native-this-boot", "--test-portable-historical", "--test-portable-this-boot",
                          "--test-native-abandon-draft", "--test-native-install-rejections", "--test-native-takeover"};
         for (guint i = 0; i < G_N_ELEMENTS(modes); i++) {
@@ -910,7 +860,7 @@ int main(int argc, char **argv)
     g_setenv("GSETTINGS_BACKEND", "memory", TRUE);
     service = mock_connection(system_address, BIOS_BUS);
     fwupd = mock_connection(system_address, FWUPD);
-    desktop = mock_connection(address, "org.gnome.SessionManager");
+    GDBusConnection *desktop = mock_connection(address, "org.gnome.SessionManager");
     GDBusConnection *login = mock_connection(system_address, "org.freedesktop.login1");
     g_autoptr(GDBusNodeInfo) node = g_dbus_node_info_new_for_xml(mock_xml, NULL);
     expose(service, node, BIOS_PATH, BIOS_BUS);
@@ -1002,8 +952,8 @@ int main(int argc, char **argv)
             advance("available");
             g_assert_false(g_dbus_connection_is_closed(ui.bus));
         } else if (g_str_equal(native, "pending-focus")) test_pending_focus();
-        else if (g_str_equal(native, "slow-preflight")) test_slow_power(FALSE);
-        else if (g_str_equal(native, "late-query")) test_slow_power(TRUE);
+        else if (g_str_equal(native, "pending-details")) test_pending_details();
+        else if (g_str_equal(native, "manual-power")) test_manual_power();
         else if (g_str_equal(native, "abandon-draft")) test_abandon_own_draft();
         else if (g_str_equal(native, "install-rejections")) test_install_rejections();
         else if (g_str_equal(native, "takeover")) test_takeover();
@@ -1015,7 +965,7 @@ int main(int argc, char **argv)
         WAIT_FOR(ui.fresh && !ui.busy && !ui.reading);
         g_assert_cmpuint(checks_sent, ==, 0);
         g_assert_cmpuint(installs, ==, 0);
-        g_assert_cmpuint(powers, ==, 0);
+        g_assert_cmpuint(legacy_power_calls, ==, 0);
         g_assert_nonnull(action_button("状態を再確認"));
         if (pending_start) g_assert_true(state("pending"));
         if (status_start || login_start) g_assert_null(action_button("配布情報を再確認"));
@@ -1066,66 +1016,16 @@ int main(int argc, char **argv)
     g_assert_cmpuint(reports, ==, 1);
     g_assert_true(gtk_window_get_focus(ui.window) == action_button("あとで"));
     click("あとで");
-    g_assert_cmpuint(powers, ==, 0);
+    g_assert_cmpuint(power_checks, ==, 0);
     allowed = FALSE;
     click("起動操作を表示");
     advance("pending");
-    g_assert_null(action_button("再起動する"));
+    g_assert_null(action_button("起動条件を確認"));
     allowed = TRUE;
     click("状態を再確認");
     advance("pending");
-    review_power("再起動する", "再起動を続ける");
-    mock_power = "shutdown";
-    notify_change("pending");
-    g_assert_null(action_button("再起動を続ける"));
-    g_assert_cmpuint(powers, ==, 0);
-    mock_power = "reboot";
-    notify_change("pending");
-    logout_block = TRUE;
-    review_power("再起動する", "再起動を続ける");
-    click("再起動を続ける");
-    WAIT_FOR(cancelled == 1);
-    advance("pending");
-    g_assert_cmpuint(desktop_calls, ==, 0);
-    logout_block = FALSE;
-    for (guint i = 0; i < 2; i++) {
-        mock_desktop = i ? "cinnamon" : "gnome";
-        guint service_calls = powers, session_calls = desktop_calls;
-        review_power("再起動する", "再起動を続ける");
-        click("キャンセル");
-        while (g_main_context_iteration(NULL, FALSE)) {}
-        g_assert_cmpuint(powers, ==, service_calls);
-        g_assert_cmpuint(desktop_calls, ==, session_calls);
-        review_power("再起動する", "再起動を続ける");
-        click("再起動を続ける");
-        WAIT_FOR(desktop_calls == i + 1);
-        ac = i != 0;
-        client_signal("QueryEndSession", g_variant_new("(u)", 0u));
-        WAIT_FOR(responses == i + 1);
-        g_assert_cmpint(last_response, ==, ac);
-        client_signal("CancelEndSession", NULL);
-        WAIT_FOR(cancelled == i + 2);
-        advance("pending");
-        ac = TRUE;
-    }
-    g_assert_cmpuint(rechecks, ==, 4);
-    mock_power = "shutdown";
-    click("状態を再確認");
-    advance("pending");
-    g_assert_null(action_button("再起動する"));
-    review_power("電源を切る", "電源を切る操作を続ける");
-    click("電源を切る操作を続ける");
-    WAIT_FOR(desktop_calls == 3);
-    client_signal("QueryEndSession", g_variant_new("(u)", 0u));
-    WAIT_FOR(responses == 3);
-    g_assert_true(last_response);
-    client_signal("EndSession", g_variant_new("(u)", 0u));
-    WAIT_FOR(responses == 4);
-    g_assert_true(last_response);
-    client_signal("Stop", NULL);
-    WAIT_FOR(stopped == 1);
-    advance("pending");
-    test_desktop_replies();
+    g_assert_nonnull(action_button("起動条件を確認"));
+    test_manual_power();
     mock_power = "reboot";
     g_assert_cmpuint(installs, ==, 1);
     mock_state = "idle";

@@ -11,36 +11,45 @@ import catalog
 from firmware_api import fw
 
 
-def import_metadata(request, files):
-    import fcntl
-    from gi.repository import Gio, GLib
-    owner, remote = request["owner"], request["remote"]
-    if not Gio.dbus_is_unique_name(owner) or not re.fullmatch(r"[A-Za-z0-9._-]+", remote):
-        raise ValueError("invalid destination")
-    settings = fw.read_settings()
-    session = catalog.Session()
-    live = session.remote(settings)
-    if (catalog.fingerprint(settings) != request["settings_fingerprint"] or session.current_owner() != owner
-            or live["Id"] != remote or catalog.remote_fingerprint(live) != request["remote_fingerprint"]):
-        return dict(terminal=True, ok=False, detail="取り込み前に配布設定が変わりました。")
-    fds = Gio.UnixFDList.new()
-    for stream in files:
-        required = fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SEAL
-        if fcntl.fcntl(stream.fileno(), fcntl.F_GET_SEALS) & required != required:
-            raise ValueError("unsealed metadata")
-        stream.seek(0)
-        fds.append(stream.fileno())
-    bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+def import_metadata(request):
     try:
-        bus.call_with_unix_fd_list_sync(owner, "/", "org.freedesktop.fwupd", "UpdateMetadata",
-                                        GLib.Variant("(shh)", (remote, 0, 1)), None, Gio.DBusCallFlags.NO_AUTO_START,
+        import fcntl
+        from gi.repository import Gio, GLib
+        owner, remote = request["owner"], request["remote"]
+        if not Gio.dbus_is_unique_name(owner) or not re.fullmatch(r"[A-Za-z0-9._-]+", remote):
+            raise ValueError("invalid destination")
+        settings = fw.read_settings()
+        session = catalog.Session()
+        live = session.remote(settings)
+        if (catalog.fingerprint(settings) != request["settings_fingerprint"] or session.current_owner() != owner
+                or live["Id"] != remote or catalog.remote_fingerprint(live) != request["remote_fingerprint"]):
+            return dict(terminal=True, ok=False, detail="取り込み前に配布設定が変わりました。")
+        if len(request["fds"]) != 2:
+            raise ValueError("expected two metadata files")
+        fds = Gio.UnixFDList.new()
+        required = fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SEAL
+        for fd in request["fds"]:
+            if fcntl.fcntl(fd, fcntl.F_GET_SEALS) & required != required:
+                raise ValueError("unsealed metadata")
+            os.lseek(fd, 0, os.SEEK_SET)
+            fds.append(fd)
+        bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        params = GLib.Variant("(shh)", (remote, 0, 1))
+    except Exception:
+        # No UpdateMetadata call has started. Suppress details that may contain URLs or credentials.
+        return dict(terminal=True, ok=False, detail="取り込み前に配布設定または署名済みファイルを確認できませんでした。")
+
+    try:
+        bus.call_with_unix_fd_list_sync(owner, "/", "org.freedesktop.fwupd", "UpdateMetadata", params,
+                                        None, Gio.DBusCallFlags.NO_AUTO_START,
                                         120000, fds, None)
         return dict(terminal=True, ok=True)
     except GLib.Error as exc:
         error = Gio.DBusError.get_remote_error(exc) or ""
         return dict(terminal=error.startswith("org.freedesktop.fwupd.") or
                     error == "org.freedesktop.DBus.Error.ServiceUnknown",
-                    ok=error.endswith(".NothingToDo"), detail="fwupd が配布情報の取り込みを完了できませんでした。")
+                    ok=error == "org.freedesktop.fwupd.NothingToDo",
+                    detail="fwupd が配布情報の取り込みを完了できませんでした。")
 
 
 def main():
@@ -55,12 +64,13 @@ def main():
             raise ValueError("invalid device profile")
         fw.read_settings = lambda: profile
     mode = request["mode"]
+    if mode == "import":
+        json.dump(import_metadata(request), sys.stdout, ensure_ascii=True)
+        return
     with ExitStack() as stack:
         files = [stack.enter_context(os.fdopen(f, "r+b")) for f in request["fds"]]
         if mode == "metadata":
             result = catalog.fetch_metadata(request["guid"], *files)
-        elif mode == "import":
-            result = import_metadata(request, files)
         elif mode in ("check", "prepare", "revalidate"):
             result = catalog.query(mode, request["guid"], *files)
         else:

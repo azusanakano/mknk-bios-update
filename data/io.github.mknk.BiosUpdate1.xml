@@ -14,6 +14,7 @@
     <method name="DeclineAuthorization"><arg name="operation" type="s" direction="in"/></method>
     <method name="Report"><arg name="operation" type="s" direction="in"/><arg name="accepted" type="b" direction="in"/><arg name="view" type="s" direction="out"/></method>
     <method name="ReportRejection"><arg name="operation" type="s" direction="in"/><arg name="view" type="s" direction="out"/></method>
+    <method name="CheckPower"><arg name="plan" type="s" direction="in"/><arg name="action" type="s" direction="out"/></method>
     <method name="Power">
       <arg name="plan" type="s" direction="in"/><arg name="request" type="s" direction="out"/>
       <arg name="desktop" type="s" direction="out"/><arg name="action" type="s" direction="out"/>

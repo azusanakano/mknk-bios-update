@@ -36,6 +36,7 @@ RESULTS = {
     "unattributed": ("hold", "以前の更新の結果を確定できませんでした。現在版から再照会できます。"),
     "rejected": ("hold", "更新依頼の未送達または配置前の拒否と、起動予約がないことを確認しました。現在版から再照会できます。"),
 }
+ATTEMPT_FAILED = "対象版への新しい試行失敗があります。作業者による確認が必要です。"
 
 
 def same_target(plan, obs):
@@ -53,6 +54,12 @@ def settled_after_boot(plan, obs, *, allow_unidentified=False):
     return bool(obs["boot"] and plan["boot"] and plan["boot"] != obs["boot"]
                 and same_machine and same_target(plan, obs)
                 and plan.get("version_format") == obs["version_format"] and free(obs))
+
+
+def owns_approval(plan, actor, obs):
+    return bool(actor.session and actor.bus and obs["boot"] and plan["uid"] == actor.uid
+                and plan["boot"] == obs["boot"] and plan["machine"] == obs["machine"]
+                and plan.get("approval_session") == actor.session and plan.get("approval_bus") == actor.bus)
 
 
 class Engine:
@@ -86,6 +93,17 @@ class Engine:
         obs["machine"] = self.db.machine_key(obs["machine"])
         return obs
 
+    def current_operation(self):
+        obs = self.observation()
+        pending = self.db.pending_operations(obs["machine"], obs["boot"])
+        if len(pending) != 1:
+            return None, obs, bool(pending)
+        plan = pending[0]
+        bound = self.observation(plan)
+        if (obs["machine"], obs["boot"]) != (bound["machine"], bound["boot"]):
+            return None, bound, True
+        return plan, bound, False
+
     def required(self, actor):
         if not actor.writable or self.platform.actor(actor.sender) != actor:
             raise Conflict("アクティブなローカル画面で「更新計画を開く」を選んでください。")
@@ -102,6 +120,7 @@ class Engine:
 
     def verified(self, result):
         if "signed_timestamp" in result:
+            self.platform.confirm_owner(result["daemon_owner"])
             self.db.catalog_generation(result["signed_timestamp"], result["catalog_sha256"])
             timestamp = result.get("download_signed_timestamp", result["signed_timestamp"])
             result["signed"] = datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
@@ -110,12 +129,17 @@ class Engine:
     def read_catalog(self, actor, mode, guid, cabinet=None):
         # Serialize authenticated metadata imports and reads of the distribution's shared index.
         with self.catalog_lock:
+            if mode != "check":
+                self.platform.metadata_clear(self.db)
             result = self.verified(self.platform.worker(mode, guid, cabinet))
             if mode == "check" and result.get("refresh_required"):
                 self.required(actor)
                 self.platform.refresh(guid, self.db, lambda: self.required(actor))
                 result = self.verified(self.platform.worker(mode, guid))
             return result
+
+    def failed_attempt(self, plan, obs):
+        return obs["new_failure"] or bool(self.db.setting("failure-" + plan["id"]))
 
     def reconcile(self, plan, obs):
         same_boot = bool(obs["boot"] and obs["boot"] == plan["boot"])
@@ -131,8 +155,8 @@ class Engine:
             return "hold", "更新依頼の未送達または配置前の拒否を記録しました。既存の予約と進行中の処理を確認しています。"
         if obs["new_failure"] and not self.db.setting("failure-" + plan["id"]):
             self.db.setting("failure-" + plan["id"], {"current": obs["current"], "status": obs["attempt_status"]})
-        if self.db.setting("failure-" + plan["id"]):
-            return "hold", "対象版への新しい試行失敗があります。作業者による確認が必要です。"
+        if self.failed_attempt(plan, obs):
+            return "hold", ATTEMPT_FAILED
         if obs["reservation"] == "matching":
             if not same_boot and not obs["attempt_comparable"]:
                 return "hold", "予約は残っていますが、起動後の実機の試行結果を承認した更新に照合できません。"
@@ -153,15 +177,16 @@ class Engine:
     def status(self, actor):
         # The journal can change while reading hardware. Never render a permission from an obsolete read.
         with self.lock:
-            plan = self.db.active()
-            obs = self.observation(plan)
+            plan, obs, ambiguous = self.current_operation()
             v = dict(model=obs["model"], current=obs["current"],
                      state="idle", detail=obs["detail"], can_check=actor.writable and obs["can_identify"],
                      can_prepare=False, can_approve=False, can_power=False, plan="", power="")
             v.update({k: obs[k] for k in ("support_url", "recovery_url") if obs.get(k)})
-            if plan:
+            if ambiguous:
+                v.update(state="hold", can_check=False, detail="未解決の操作と今回の PC を一意に照合できません。")
+            elif plan:
                 state, reason = self.reconcile(plan, obs)
-                active = self.db.active() is not None
+                active = self.db.active(plan_id=plan["id"]) is not None
                 v.update({k: plan[k] for k in DISPLAY if k in plan})
                 v.update(state=state, plan=plan["id"], detail="\n".join(filter(None, (reason, obs["detail"]))),
                          can_check=bool(actor.writable and not active and obs["can_identify"]),
@@ -177,9 +202,12 @@ class Engine:
                     v["detail"] += "\nデスクトップへの終了要求の結果を確認中です。"
                 elif state == "pending" and actor.writable and not actor.desktop:
                     v["detail"] += "\nこのデスクトップの終了操作を照合できません。予約は保持されています。"
-                v["can_replan"] = bool(state == "hold" and active and actor.writable
-                                       and plan["uid"] == actor.uid
-                                       and settled_after_boot(plan, obs, allow_unidentified=True))
+                can_resolve = (state == "hold" and active and actor.writable
+                               and settled_after_boot(plan, obs, allow_unidentified=True))
+                v["can_replan"] = can_resolve and plan["uid"] == actor.uid
+                v["can_take_over"] = can_resolve and plan["uid"] != actor.uid
+                if v["can_take_over"]:
+                    v["detail"] += "\n管理者は前回の記録を整理して、現在版から再計画できます。"
             elif not obs["can_identify"] or not free(obs):
                 v.update(state="hold", can_check=False,
                          detail=obs["detail"] or "実機の更新対象または既存予約を確認できません。")
@@ -201,15 +229,24 @@ class Engine:
         draft = self.drafts.get(actor.sender)
         prepare_block = obs.get("prepare_block")
         if draft and (prepare_block or draft[0] != actor or not same_target(draft[1], obs)
-                      or draft[1]["current"] != obs["current"]):
+                      or any(draft[1][key] != obs[key] for key in ("current", "machine", "boot"))):
             self.drop_draft(actor.sender)
             draft = None
-        saved = self.db.approval()
+        try:
+            self.platform.metadata_clear(self.db)
+            import_block = ""
+        except Conflict as exc:
+            import_block = str(exc)
+        prepare_block = prepare_block or import_block
+        approvals = self.db.pending_approvals(obs["machine"], obs["boot"])
+        if len(approvals) > 1:
+            v.update(state="hold", can_check=False, detail="保存済みの承認と今回の PC を一意に照合できません。")
+            return
+        saved = approvals[0] if approvals else None
         if draft or saved:
             p = saved or draft[1]
-            can_resume = (not prepare_block and actor.writable and p["uid"] == actor.uid and same_target(p, obs) and
-                          p["current"] == obs["current"] and p["machine"] == obs["machine"] and
-                          p["boot"] == obs["boot"])
+            own = owns_approval(p, actor, obs)
+            can_resume = not prepare_block and actor.writable and own and same_target(p, obs) and p["current"] == obs["current"]
             v.update({k: p[k] for k in DISPLAY if k in p})
             v.update(state="review", plan=p["id"], device=p["device"], daemon_owner=p["daemon_owner"],
                      can_approve=can_resume, can_check=False, cab_sha512=p.get("cab_sha512", ""),
@@ -219,10 +256,10 @@ class Engine:
                      power="shutdown" if p["shutdown"] else "reboot", detail="対象・配布ファイル・起動先を照合しました。")
             if saved:
                 v["detail"] = "前回の承認は記録済みです。送信前の計画を再確認してください。"
-                v["can_replan"] = bool(actor.writable and p["uid"] == actor.uid and free(obs))
-                v["can_take_over"] = bool(actor.writable and p["uid"] != actor.uid and free(obs))
+                v["can_replan"] = actor.writable and own and free(obs)
+                v["can_take_over"] = actor.writable and not own and free(obs)
                 if v["can_take_over"]:
-                    v["detail"] = "別の利用者が承認した未送信の計画です。管理者は承認を解除できます。"
+                    v["detail"] = "元の承認者をこのログインで確認できません。管理者は未送信の承認を解除できます。"
             if p.get("higher_release_detail"):
                 v["detail"] += "\n" + p["higher_release_detail"]
             if prepare_block:
@@ -263,11 +300,13 @@ class Engine:
             v["detail"] = "前回確認した配布情報です。現在の候補は再照会して確認します。"
         elif not v["detail"]:
             v["detail"] = "この PC の BIOS に適用できる安定版を確認します。"
+        if import_block:
+            v.update(state="hold", detail=import_block)
 
     def check(self, actor):
         self.required(actor)
         obs = self.observation()
-        if self.db.active() or not obs["can_identify"] or not free(obs):
+        if not obs["can_identify"] or not free(obs) or self.db.pending_operations(obs["machine"], obs["boot"]):
             return self.status(actor)
         with self.lock:
             if actor.sender in self.drafts:
@@ -306,9 +345,10 @@ class Engine:
             if not same_target(p, obs) or p["current"] != obs["current"] or not obs["boot"] or not free(obs):
                 raise Conflict("検証中に実機の対象、現在版または予約が変わりました。")
             p.update({k: obs[k] for k in ("boot", "machine", "attempt_version", "attempt_status")})
-            p.update(id=str(uuid.uuid4()), uid=actor.uid)
+            p.update(id=str(uuid.uuid4()), uid=actor.uid, approval_session=actor.session, approval_bus=actor.bus)
             with self.lock:
-                if self.db.active() or self.candidates.get(actor.sender) is not candidate:
+                if (self.db.pending_operations(obs["machine"], obs["boot"])
+                        or self.candidates.get(actor.sender) is not candidate):
                     raise Conflict("別の操作が進んでいます。現在の状態を確認してください。")
                 self.drop_draft(actor.sender)
                 self.drafts[actor.sender] = (actor, p, cab)
@@ -331,12 +371,13 @@ class Engine:
         self.required(actor)
         with self.lock:
             draft = self.drafts.get(actor.sender)
-            saved = self.db.approval()
-            own_saved = saved and saved["id"] == plan_id and saved["uid"] == actor.uid
-            if not own_saved and (not draft or draft[0] != actor or draft[1]["id"] != plan_id):
+            saved = self.db.approval(plan_id=plan_id)
+            owns_plan = (owns_approval(saved, actor, self.observation()) if saved else
+                         draft and draft[0] == actor and draft[1]["id"] == plan_id)
+            if not owns_plan:
                 raise Conflict("この接続で表示した計画を確認できません。")
             self.drop_draft(actor.sender)
-            if own_saved:
+            if saved:
                 self.db.cancel_approval(plan_id)
         return self.status(actor)
 
@@ -344,20 +385,18 @@ class Engine:
         self.required(actor)
         with self.lock:
             draft = self.drafts.get(actor.sender)
-            saved = self.db.approval()
-            if self.db.active() or (saved and saved["id"] != plan_id):
-                raise Conflict("この画面で承認できる更新計画を確認できません。")
             if draft and draft[0] == actor and draft[1]["id"] == plan_id:
                 p = draft[1]
                 cabinet = os.fdopen(os.dup(draft[2].fileno()), "rb")
                 mode = "revalidate"
-            elif saved and saved["uid"] == actor.uid and self.status(actor)["can_approve"]:
-                p = saved
+            else:
+                p = self.db.approval(plan_id=plan_id)
+                view = self.status(actor)
+                if not p or view["plan"] != plan_id or not view["can_approve"]:
+                    raise Conflict("この画面で承認できる更新計画を確認できません。")
                 cabinet = self.platform.cabinet()
                 mode = "prepare"
                 draft = None
-            else:
-                raise Conflict("この画面で承認できる更新計画を確認できません。")
             try:
                 self.db.approve(p)
             except BaseException:
@@ -374,8 +413,6 @@ class Engine:
                     raise Conflict("計画が変更されました。")
                 # The catalog lock may have been held by another network request.
                 # Read hardware and power after that wait, before issuing permission.
-                if self.platform.recovery_required(dict(p)) and not p.get("recovery_required"):
-                    raise Conflict("暗号化の回復手段を確認してから再承認してください。")
                 if self.platform.preflight(p) != p["binding"]:
                     raise Conflict("承認後に起動先が変わりました。")
                 obs = self.observation()
@@ -383,6 +420,11 @@ class Engine:
                         any(obs.get(k) != p.get(k) for k in
                             ("boot", "machine", "current", "attempt_version", "attempt_status"))):
                     raise Conflict("承認後に機器の状態が変わりました。")
+                recovery = dict(p)
+                recovery_required = self.platform.recovery_required(recovery)
+                if (recovery_required != p["recovery_required"]
+                        or recovery.get("recovery_detail", "") != p.get("recovery_detail", "")):
+                    raise Conflict("暗号化の照合結果が変わりました。回復手段を確認してから再承認してください。")
                 self.verified(updated)
                 self.platform.confirm_owner(p["daemon_owner"])
                 self.required(actor)
@@ -400,14 +442,20 @@ class Engine:
                     self.candidates.pop(actor.sender, None)
             raise
 
+    def record_receipt(self, sender, bus, operation, accepted=None):
+        with self.lock:
+            if accepted is None:
+                self.db.report_rejection(operation, sender, bus)
+            else:
+                self.db.report(operation, sender, bus, accepted)
+
     def report(self, actor, operation, accepted):
-        self.db.report(operation, actor.sender, actor.bus, accepted)
+        self.record_receipt(actor.sender, actor.bus, operation, accepted)
         return self.status(actor)
 
     def report_rejection(self, actor, operation):
-        with self.lock:
-            self.db.report_rejection(operation, actor.sender, actor.bus)
-            return self.status(actor)
+        self.record_receipt(actor.sender, actor.bus, operation)
+        return self.status(actor)
 
     def decline_authorization(self, sender, operation):
         with self.lock:
@@ -417,19 +465,32 @@ class Engine:
         self.required(actor)
         view = self.status(actor)
         if view["plan"] != plan_id or not view.get("can_take_over"):
-            raise Conflict("解除できる未送信の承認を確認できません。")
+            raise Conflict("管理者が整理できる計画を確認できません。")
         self.platform.require_administrator(actor)
         with self.lock:
             self.required(actor)
             view = self.status(actor)
             if view["plan"] != plan_id or not view.get("can_take_over"):
                 raise Conflict("管理者認証中に計画または予約が変わりました。")
-            self.db.cancel_approval(plan_id)
+            p = self.db.active(plan_id=plan_id)
+            if p:
+                self.finish_for_replan(p)
+            else:
+                self.db.cancel_approval(plan_id)
             for sender, (_, draft, _) in list(self.drafts.items()):
                 if draft["id"] == plan_id:
                     self.drop_draft(sender)
             self.candidates.clear()
             return self.status(actor)
+
+    def finish_for_replan(self, p):
+        obs = self.observation(p)
+        if not settled_after_boot(p, obs, allow_unidentified=True):
+            raise Conflict("以前の依頼、予約または機器との一致を確認できません。")
+        failed = (bool(obs["machine"]) and p["machine"] == obs["machine"]
+                  and self.db.setting("failure-" + p["id"]))
+        self.db.finish(p["id"], "failed" if failed else "unattributed", obs["current"], observed_boot=obs["boot"])
+        self.candidates.clear()
 
     def replan(self, actor, plan_id):
         self.required(actor)
@@ -437,15 +498,9 @@ class Engine:
             view = self.status(actor)
             if view.get("plan") != plan_id or not view.get("can_replan"):
                 raise Conflict("以前の依頼・予約の解消を確認できません。")
-            p = self.db.active()
+            p = self.db.active(plan_id=plan_id)
             if p:
-                obs = self.observation(p)
-                if not settled_after_boot(p, obs, allow_unidentified=True):
-                    raise Conflict("以前の依頼、予約または機器との一致を確認できません。")
-                failed = (bool(obs["machine"]) and p["machine"] == obs["machine"]
-                          and self.db.setting("failure-" + p["id"]))
-                self.db.finish(p["id"], "failed" if failed else "unattributed", obs["current"], observed_boot=obs["boot"])
-                self.candidates.clear()
+                self.finish_for_replan(p)
             else:
                 self.db.cancel_approval(plan_id)
             self.disconnect(actor.sender)
@@ -456,21 +511,35 @@ class Engine:
         if not p or p["uid"] != actor.uid:
             raise Conflict("この利用者の予約を確認できません。")
         obs = self.observation(p)
+        if self.failed_attempt(p, obs):
+            raise Conflict(ATTEMPT_FAILED)
+        if p["receipt"] == "rejected":
+            raise Conflict("配置前の拒否を記録した計画のため、起動操作を確認できません。")
         action = self.platform.check_power_action(p, obs)
         self.platform.power_allowed(actor, action)
+        self.required(actor)
         return action, obs["boot"]
+
+    def check_power(self, actor, plan_id):
+        """Check the reservation for the user's manual shutdown or restart."""
+        with self.lock:
+            p = self.db.active(plan_id=plan_id)
+            if not p:
+                raise Conflict("予約を確認できません。")
+            action, _ = self.power_check(actor, p)
+            return action
 
     def power(self, actor, plan_id):
         with self.lock:
-            p = self.db.active()
-            if not p or p["id"] != plan_id:
+            p = self.db.active(plan_id=plan_id)
+            if not p:
                 raise Conflict("予約を確認できません。")
             action, boot = self.power_check(actor, p)
             return self.db.power(plan_id, actor.sender, actor.bus, boot), actor.desktop, action
 
     def recheck_power(self, actor, request):
         with self.lock:
-            p = self.db.active()
+            p = self.db.active(power_id=request)
             if not p or (p["power_id"], p["power_sender"], p["power_bus"]) != (request, actor.sender, actor.bus):
                 raise Conflict("照合中の起動操作が変わりました。")
             _, boot = self.power_check(actor, p)
